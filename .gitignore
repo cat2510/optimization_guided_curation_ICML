@@ -1,0 +1,12 @@
+# --- Common structured data ---
+*.csv
+*.tsv
+*.xls
+*.xlsx
+*.ods
+*.parquet
+*.log
+*.out
+*.dat
+*.json
+*.png
