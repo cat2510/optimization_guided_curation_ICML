@@ -131,7 +131,7 @@ def train_oct_with_feature_names(X_train, y_train,
 
 
 import itertools
-from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score, precision_recall_curve
 
 def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
                  depths=[5, 7,9],
@@ -212,12 +212,14 @@ def evaluate_binary_oct(iai_model,X_test_df,y_test, preprocessor, feature_names)
     try:
         # Transform full dataset using the same preprocessor
         X_test_processed = preprocessor.transform(X_test_df)
-        print(f"✓ Test data preprocessing completed: {X_test_processed.shape}")
         print(f"✓ Feature names: {feature_names}")
         # Create DataFrame for leaf assignment
         X_test_processed = pd.DataFrame(X_test_processed, columns=feature_names)
         # Get multi-class predictions (cost strata)
         y_pred = iai_model.predict(X_test_processed)
+        # Predicted probabilities for PR-AUC and calibration-style metrics
+        y_proba = iai_model.predict_proba(X_test_processed).iloc[:, 1]
+        X_test_processed['predicted_proba'] = y_proba
         leaf_assignments = iai_model.apply(X_test_processed)
         print(f"✓ Cost stratum test predictions completed")
     except Exception as e:
@@ -228,18 +230,59 @@ def evaluate_binary_oct(iai_model,X_test_df,y_test, preprocessor, feature_names)
     X_test_processed['predicted_cost_stratum'] = y_pred
     
     # Metrics
-    auc = iai_model.score(X_test_processed, y_test, criterion='auc')
-    misclassification_score= iai_model.score(X_test_processed, y_test, criterion='misclassification')
+    # Ensure alignment of indices for downstream per-leaf metrics
+    y_test_series = pd.Series(y_test).reset_index(drop=True)
+    auc = iai_model.score(X_test_processed, y_test_series, criterion='auc')
 
-    tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+    tn, fp, fn, tp = confusion_matrix(y_test_series, y_pred).ravel()
     sensitivity = tp / (tp + fn) if (tp + fn) else 0
     specificity = tn / (tn + fp) if (tn + fp) else 0
 
     print(f"AUC score: {auc:.3f}")
-    print(f"Misclassification score: {misclassification_score:.3f}")
     print(f"Sensitivity (Recall): {sensitivity:.3f}")
     print(f"Specificity: {specificity:.3f}")
-    print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
+    print("Confusion Matrix:\n", confusion_matrix(y_test_series, y_pred))
+    pr_auc = average_precision_score(y_test_series, y_proba)
+    print(f"PR-AUC (Average Precision): {pr_auc:.3f}")
+
+    # Per-leaf metrics
+    try:
+        leaf_metrics_rows = []
+        for leaf_id, idxs in X_test_processed.groupby('leaf_assignment').groups.items():
+            idx_array = list(idxs)
+            y_true_leaf = y_test_series.iloc[idx_array]
+            y_pred_leaf = pd.Series(y_pred).iloc[idx_array]
+            n = len(idx_array)
+            num_pos = int((y_true_leaf == 1).sum())
+            num_pred_pos = int((y_pred_leaf == 1).sum())
+            # Confusion components
+            tp_l = int(((y_true_leaf == 1) & (y_pred_leaf == 1)).sum())
+            tn_l = int(((y_true_leaf == 0) & (y_pred_leaf == 0)).sum())
+            fp_l = int(((y_true_leaf == 0) & (y_pred_leaf == 1)).sum())
+            fn_l = int(((y_true_leaf == 1) & (y_pred_leaf == 0)).sum())
+            accuracy_l = (tp_l + tn_l) / n if n else 0.0
+            precision_l = tp_l / (tp_l + fp_l) if (tp_l + fp_l) else 0.0
+            recall_l = tp_l / (tp_l + fn_l) if (tp_l + fn_l) else 0.0
+            f1_l = (2 * precision_l * recall_l / (precision_l + recall_l)) if (precision_l + recall_l) else 0.0
+            leaf_metrics_rows.append({
+                'leaf_id': leaf_id,
+                'n': n,
+                'accuracy': accuracy_l,
+                'precision': precision_l,
+                'recall': recall_l,
+                'f1': f1_l,
+            })
+        leaf_metrics_df = pd.DataFrame(leaf_metrics_rows).sort_values(['f1', 'accuracy'], ascending=False)
+        # Attach to dataframe attrs for retrieval without breaking return signature
+        X_test_processed.attrs['leaf_metrics'] = leaf_metrics_df
+        print("Per-leaf metrics (top 10 by F1):")
+        try:
+            print(leaf_metrics_df.head(10))
+        except Exception:
+            pass
+    except Exception as _:
+        # If anything goes wrong, continue without per-leaf metrics
+        pass
     #display(iai_model.ROCCurve(X_test_processed, y_test,positive_label=1))
 
     return X_test_processed
@@ -309,7 +352,7 @@ def train_and_evaluate_for_w(
     accuracy = (tp + tn) / (tp + tn + fp + fn)
     
     # AUC (get from model score)
-    auc = model.score(X_test_processed.drop(columns=['leaf_assignment', 'predicted_cost_stratum']), 
+    auc = model.score(X_test_processed.drop(columns=['leaf_assignment', 'predicted_cost_stratum', 'predicted_proba'], errors='ignore'), 
                       y_test, criterion='auc')
     
     return {
