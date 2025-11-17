@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix,precision_recall_curve
+from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix,precision_recall_curve,average_precision_score
 
 def get_bin_flag_columns(df):
     return [col for col in df.columns if col.startswith("has_") or "THRCLS" in col.upper()
@@ -254,6 +254,9 @@ def evaluate_model_auc(clf, X_test, y_test, optimal_threshold=True):
     
     auc = roc_auc_score(y_test, y_proba)
     print(f"Binary AUC: {auc:.3f}")
+    pr_auc = average_precision_score(y_test, y_proba)
+    print(f"PR-AUC (Average Precision): {pr_auc:.3f}")
+
 
     # classification report and confusion matrix
     print("Classification Report:")

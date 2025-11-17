@@ -205,91 +205,100 @@ def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
 
     return best_model, best_params, results_df,preprocessor, feature_names
 
-def evaluate_binary_oct(iai_model,X_test_df,y_test, preprocessor, feature_names):
-    
+def evaluate_binary_oct(iai_model, X_test_df, y_test, preprocessor, feature_names):
+
     print(f"Test dataset for OCT application: {len(X_test_df):,} samples")
-    
+
     try:
-        # Transform full dataset using the same preprocessor
+        # Transform using preprocessor
         X_test_processed = preprocessor.transform(X_test_df)
-        print(f"✓ Feature names: {feature_names}")
-        # Create DataFrame for leaf assignment
         X_test_processed = pd.DataFrame(X_test_processed, columns=feature_names)
-        # Get multi-class predictions (cost strata)
+
+        # Predictions
         y_pred = iai_model.predict(X_test_processed)
-        # Predicted probabilities for PR-AUC and calibration-style metrics
         y_proba = iai_model.predict_proba(X_test_processed).iloc[:, 1]
+
         X_test_processed['predicted_proba'] = y_proba
         leaf_assignments = iai_model.apply(X_test_processed)
-        print(f"✓ Cost stratum test predictions completed")
+        print(f"✓ Predictions completed")
+
     except Exception as e:
-        print(f"✗ Error applying OCT to test dataset: {e}")
+        print(f"✗ Error applying OCT: {e}")
         raise e
 
     X_test_processed['leaf_assignment'] = leaf_assignments
     X_test_processed['predicted_cost_stratum'] = y_pred
-    
-    # Metrics
-    # Ensure alignment of indices for downstream per-leaf metrics
+
+    # Align y_test
     y_test_series = pd.Series(y_test).reset_index(drop=True)
+
+    # --- Metrics ---
     auc = iai_model.score(X_test_processed, y_test_series, criterion='auc')
 
     tn, fp, fn, tp = confusion_matrix(y_test_series, y_pred).ravel()
-    sensitivity = tp / (tp + fn) if (tp + fn) else 0
-    specificity = tn / (tn + fp) if (tn + fp) else 0
+    sensitivity = tp / (tp + fn) if (tp + fn) else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) else 0.0
+    pr_auc = average_precision_score(y_test_series, y_proba)
 
     print(f"AUC score: {auc:.3f}")
     print(f"Sensitivity (Recall): {sensitivity:.3f}")
     print(f"Specificity: {specificity:.3f}")
     print("Confusion Matrix:\n", confusion_matrix(y_test_series, y_pred))
-    pr_auc = average_precision_score(y_test_series, y_proba)
     print(f"PR-AUC (Average Precision): {pr_auc:.3f}")
 
-    # Per-leaf metrics
+    # --- Per-leaf performance ---
+    leaf_metrics_df = None
     try:
-        leaf_metrics_rows = []
+        rows = []
         for leaf_id, idxs in X_test_processed.groupby('leaf_assignment').groups.items():
-            idx_array = list(idxs)
-            y_true_leaf = y_test_series.iloc[idx_array]
-            y_pred_leaf = pd.Series(y_pred).iloc[idx_array]
-            n = len(idx_array)
-            num_pos = int((y_true_leaf == 1).sum())
-            num_pred_pos = int((y_pred_leaf == 1).sum())
-            # Confusion components
+            idxs = list(idxs)
+            y_true_leaf = y_test_series.iloc[idxs]
+            y_pred_leaf = pd.Series(y_pred).iloc[idxs]
+
             tp_l = int(((y_true_leaf == 1) & (y_pred_leaf == 1)).sum())
             tn_l = int(((y_true_leaf == 0) & (y_pred_leaf == 0)).sum())
             fp_l = int(((y_true_leaf == 0) & (y_pred_leaf == 1)).sum())
             fn_l = int(((y_true_leaf == 1) & (y_pred_leaf == 0)).sum())
-            accuracy_l = (tp_l + tn_l) / n if n else 0.0
+            n = len(idxs)
+
             precision_l = tp_l / (tp_l + fp_l) if (tp_l + fp_l) else 0.0
             recall_l = tp_l / (tp_l + fn_l) if (tp_l + fn_l) else 0.0
             f1_l = (2 * precision_l * recall_l / (precision_l + recall_l)) if (precision_l + recall_l) else 0.0
-            leaf_metrics_rows.append({
-                'leaf_id': leaf_id,
-                'n': n,
-                'accuracy': accuracy_l,
-                'precision': precision_l,
-                'recall': recall_l,
-                'f1': f1_l,
-            })
-        leaf_metrics_df = pd.DataFrame(leaf_metrics_rows).sort_values(['f1', 'accuracy'], ascending=False)
-        # Attach to dataframe attrs for retrieval without breaking return signature
-        X_test_processed.attrs['leaf_metrics'] = leaf_metrics_df
-        print("Per-leaf metrics (top 10 by F1):")
-        try:
-            print(leaf_metrics_df.head(10))
-        except Exception:
-            pass
-    except Exception as _:
-        # If anything goes wrong, continue without per-leaf metrics
-        pass
-    #display(iai_model.ROCCurve(X_test_processed, y_test,positive_label=1))
+            accuracy_l = (tp_l + tn_l) / n if n else 0.0
 
-    return X_test_processed
+            rows.append({
+                "leaf_id": leaf_id,
+                "n": n,
+                "accuracy": accuracy_l,
+                "precision": precision_l,
+                "recall": recall_l,
+                "f1": f1_l,
+            })
+
+        leaf_metrics_df = pd.DataFrame(rows).sort_values("f1", ascending=False)
+        print("Per-leaf metrics (top 10):")
+        print(leaf_metrics_df.head(10))
+
+    except Exception as _:  # keep things robust
+        print("⚠️ Per-leaf metric computation failed")
+
+    # --- Return dictionary ---
+    return {
+        "auc": auc,
+        "pr_auc": pr_auc,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+        "leaf_metrics": leaf_metrics_df,
+    }
 
 
 def train_and_evaluate_for_w(
-    matched_df,
+    matched_df, 
+    X_val, y_val,
     X_test,
     y_test,
     feature_cols,
@@ -301,7 +310,7 @@ def train_and_evaluate_for_w(
     depths=[5, 7, 9],
     verbose=True
 ):
-    """Train model on matched_df and evaluate using your evaluate_binary_oct function"""
+    """ DANGEROUS: X_val should be from imbalanced data not balanced!!
     
     # Split matched data
     _, _, train_df, val_df = train_test_split_enrol(
@@ -314,8 +323,9 @@ def train_and_evaluate_for_w(
     X_train = train_df[feature_cols]
     y_train = train_df[target_col]
     X_val = val_df[feature_cols]
-    y_val = val_df[target_col]
-    
+    y_val = val_df[target_col]"""
+    X_train = matched_df[feature_cols]
+    y_train = matched_df[target_col]
     if verbose:
         print(f"Training: {len(X_train):,}, Validation: {len(X_val):,}")
     

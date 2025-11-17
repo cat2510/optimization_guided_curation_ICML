@@ -88,107 +88,26 @@ class LexicographicCaseControlResampler:
         self.matching_method = matching_method  # "optimization", "ortools", or "knn"
         self.solver = solver
 
-    def _solve_optimization_with_pairs(self, dfA, dfB, candidate_pairs, distances_dict, 
-                                    target_controls, target_cases, max_controls_per_case, verbose,inverse_matching=False):
-        
-        # Create optimization model
-        solver = pywraplp.Solver.CreateSolver('SCIP')
-        z = {}
-        for i, j in candidate_pairs:
-            z[i, j] = solver.BoolVar(f'z_{i}_{j}')
-        
-        # Extract cases and controls that appear in candidate pairs
-        cases_in_candidates = set(i for i, j in candidate_pairs)
-        controls_in_candidates = set(j for i, j in candidate_pairs)
-        
-        if verbose:
-            print(f"Optimization scope: {len(cases_in_candidates)} cases, {len(controls_in_candidates)} controls")
-        
-        # OPTIMIZED CONSTRAINTS - only for entities in candidate set
-        
-        
-        # Control uniqueness - only for controls in candidates  
-        for j in controls_in_candidates:
-            control_matches = [z[i, j] for i, j_var in candidate_pairs if j_var == j]
-            if control_matches:
-                solver.Add(solver.Sum(control_matches) <= 1)
-        
-        # degrees per case (how many candidate controls per case)
-        deg_case = {i: 0 for i in cases_in_candidates}
-        for i, j in candidate_pairs:
-            deg_case[i] += 1
-            
-        # how many controls can we ever pick at most?
-        # - not more than one per control
-        # - not more than max_controls_per_case per case
-        # - not more than the candidate edges
-        feasible_from_cases = sum(min(deg_case[i], max_controls_per_case) for i in cases_in_candidates)
-        feasible_from_controls = len(controls_in_candidates)  # <= 1 per control
-        feasible_from_edges = len(candidate_pairs)
-
-        feasible_cap = min(feasible_from_cases, feasible_from_controls, feasible_from_edges)
-
-        # desired per-case (e.g., 2 for 1:2)
-        desired_per_case = int(round(target_controls / max(1, len(cases_in_candidates))))
-        desired_per_case = min(desired_per_case, max_controls_per_case)
-
-        # set case lower-bounds up to what's possible
-        for i in cases_in_candidates:
-            deg_i = deg_case[i]
-            if deg_i == 0:
-                continue  # skip cases with no feasible controls
-            lb_i = min(desired_per_case, deg_i)  # target 2 if possible
-            solver.Add(solver.Sum(z[i, j] for (ii, j) in candidate_pairs if ii == i) >= lb_i)
-            solver.Add(solver.Sum(z[i, j] for (ii, j) in candidate_pairs if ii == i) <= max_controls_per_case)
-
-        # total matches must equal an achievable target
-        target_total = min(target_controls, feasible_cap)
-        solver.Add(solver.Sum(z.values()) == target_total)
-        print("min(target_controls, len(candidate_pairs))): ", target_controls, len(candidate_pairs))
-        
-        # Objective: minimize total distance
-        objective_terms = [distances_dict[(i, j)] * z[i, j] for i, j in candidate_pairs]
-        
-        if inverse_matching:
-            print("Maximizing distance objective")
-            solver.Maximize(solver.Sum(objective_terms))
-        else:
-            print("Minimizing distance objective")
-
-            solver.Minimize(solver.Sum(objective_terms))
-        # Solve
-        solver.SetTimeLimit(300000)
-        status = solver.Solve()
-        
-        if status in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
-            # Extract solution
-            matched_case_indices = set()
-            matched_control_indices = set()
-            
-            for i, j in z:
-                if z[i, j].solution_value() > 0.5:
-                    matched_case_indices.add(i)
-                    matched_control_indices.add(j)
-            
-            matched_cases = dfA.iloc[list(matched_case_indices)]
-            matched_controls = dfB.iloc[list(matched_control_indices)]
-            matched = pd.concat([matched_cases, matched_controls], ignore_index=True)
-            
-            if verbose:
-                obj_value = sum(distances_dict[(i, j)] * z[i, j].solution_value() for i, j in z)
-                print(f"Optimization successful: {len(matched_cases)} cases, {len(matched_controls)} controls")
-                print(f"Objective value: {obj_value:.3f}")
-            
-            return matched
-        
-        else:
-            raise RuntimeError(f"Optimization failed with status {status}")
-    
-    def _solve_optimization_with_pairs(self, dfA, dfB, candidate_pairs, distances_dict, 
-                                   target_controls, target_cases, max_controls_per_case,
-                                   verbose, inverse_matching=False):
+    def _solve_optimization_with_pairs(
+        self, dfA, dfB,
+        candidate_pairs,
+        distances_dict,
+        target_controls,
+        target_cases,
+        max_controls_per_case,
+        verbose,
+        inverse_matching=False
+    ):
+        """
+        Returns:
+            matched_df : pd.DataFrame
+            match_map  : dict control_uid -> case_uid
+            match_idx  : dict control_index -> case_index
+        """
 
         solver = pywraplp.Solver.CreateSolver('SCIP')
+
+        # Variables
         z = { (i, j): solver.BoolVar(f"z_{i}_{j}") for (i, j) in candidate_pairs }
 
         cases_in_candidates = set(i for i, _ in candidate_pairs)
@@ -196,74 +115,99 @@ class LexicographicCaseControlResampler:
 
         if verbose:
             print(f"Optimization scope: {len(cases_in_candidates)} cases, "
-                f"{len(controls_in_candidates)} controls, {len(candidate_pairs)} pairs")
+                f"{len(controls_in_candidates)} controls, "
+                f"{len(candidate_pairs)} pairs")
 
         # Control uniqueness
         for j in controls_in_candidates:
-            control_matches = [z[i, j] for (i, jj) in candidate_pairs if jj == j]
-            if control_matches:
-                solver.Add(solver.Sum(control_matches) <= 1)
+            solver.Add(
+                solver.Sum(z[i, j] for (i, jj) in candidate_pairs if jj == j) <= 1
+            )
 
-        # Degrees per case
-        deg_case = {i: 0 for i in cases_in_candidates}
-        for (i, j) in candidate_pairs:
+        # Case degrees
+        deg_case = { i:0 for i in cases_in_candidates }
+        for (i, _) in candidate_pairs:
             deg_case[i] += 1
 
-        # Feasible cap
         feasible_from_cases = sum(min(deg_case[i], max_controls_per_case) for i in cases_in_candidates)
         feasible_from_controls = len(controls_in_candidates)
         feasible_from_edges = len(candidate_pairs)
+
         feasible_cap = min(feasible_from_cases, feasible_from_controls, feasible_from_edges)
 
-        # Desired per-case (e.g., 2 for 1:2)
+        # per-case target
         n_cases = max(1, len(cases_in_candidates))
-        desired_per_case = int(round(target_controls / n_cases))
-        desired_per_case = min(desired_per_case, max_controls_per_case)
+        desired_per_case = min(
+            max_controls_per_case,
+            int(round(target_controls / n_cases))
+        )
 
-        # Per-case bounds (replace any earlier ≥1 bounds)
+        # Bounds for each case
         for i in cases_in_candidates:
             if deg_case[i] == 0:
                 continue
-            lb_i = min(desired_per_case, deg_case[i])
-            solver.Add(solver.Sum(z[i, j] for (ii, j) in candidate_pairs if ii == i) >= lb_i)
-            solver.Add(solver.Sum(z[i, j] for (ii, j) in candidate_pairs if ii == i) <= max_controls_per_case)
+            solver.Add(
+                solver.Sum(z[i, j] for (ii, j) in candidate_pairs if ii == i) >= min(desired_per_case, deg_case[i])
+            )
+            solver.Add(
+                solver.Sum(z[i, j] for (ii, j) in candidate_pairs if ii == i) <= max_controls_per_case
+            )
 
-        # Total matches = achievable target
+        # Total matches
         target_total = min(target_controls, feasible_cap)
         solver.Add(solver.Sum(z.values()) == target_total)
 
         # Objective
-        objective_terms = [distances_dict[(i, j)] * z[i, j] for (i, j) in candidate_pairs]
+        obj_terms = [distances_dict[(i, j)] * z[(i, j)] for (i, j) in candidate_pairs]
+
         if inverse_matching:
             if verbose: print("Maximizing distance objective")
-            solver.Maximize(solver.Sum(objective_terms))
+            solver.Maximize(solver.Sum(obj_terms))
         else:
             if verbose: print("Minimizing distance objective")
-            solver.Minimize(solver.Sum(objective_terms))
+            solver.Minimize(solver.Sum(obj_terms))
 
         solver.SetTimeLimit(300000)
         status = solver.Solve()
 
-        if status in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
-            matched_case_indices = set()
-            matched_control_indices = set()
-            for (i, j), var in z.items():
-                if var.solution_value() > 0.5:
-                    matched_case_indices.add(i)
-                    matched_control_indices.add(j)
+        if status not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
+            raise RuntimeError(f"Optimization failed, status = {status}")
 
-            matched_cases = dfA.iloc[list(matched_case_indices)]
-            matched_controls = dfB.iloc[list(matched_control_indices)]
-            matched = pd.concat([matched_cases, matched_controls], ignore_index=True)
+        # --------------------------
+        # Extract matches (NEW!)
+        # --------------------------
+        match_map = {}      # control_uid  -> case_uid
+        match_map_idx = {}  # control_j    -> case_i
 
-            if verbose:
-                obj_value = sum(distances_dict[(i, j)] * z[i, j].solution_value() for (i, j) in z)
-                print(f"Optimization successful: {len(matched_cases)} cases, "
-                    f"{len(matched_controls)} controls; objective={obj_value:.3f}")
+        matched_cases = set()
+        matched_controls = set()
 
-            return matched
+        for (i, j), var in z.items():
+            if var.solution_value() > 0.5:
+                matched_cases.add(i)
+                matched_controls.add(j)
+                match_map_idx[j] = i
 
-        raise RuntimeError(f"Optimization failed with status {status}")
+        # Build match_map with UIDs
+        for ctrl_j, case_i in match_map_idx.items():
+            case_uid = dfA.iloc[case_i][self.uid_col]
+            ctrl_uid = dfB.iloc[ctrl_j][self.uid_col]
+            match_map[ctrl_uid] = case_uid
+
+        # Build final DF
+        df_cases_matched = dfA.iloc[list(matched_cases)]
+        df_controls_matched = dfB.iloc[list(matched_controls)]
+
+        matched_df = pd.concat([df_cases_matched, df_controls_matched], ignore_index=True)
+
+        if verbose:
+            obj_val = sum(distances_dict[(i,j)] * z[(i,j)].solution_value()
+                        for (i,j) in candidate_pairs)
+            print(f"Optimization successful: {len(matched_cases)} cases, "
+                f"{len(matched_controls)} controls; objective={obj_val:.3f}")
+
+        return matched_df, match_map, match_map_idx
+
 
     def get_preprocessed_control_case_features(
         self,
