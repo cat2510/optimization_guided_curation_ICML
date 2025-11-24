@@ -2,6 +2,17 @@ import model_IAI
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from itertools import product
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    roc_auc_score,
+    classification_report
+)
+import time
+import warnings
+
 def create_cost_strata_(df_prebalanced, n_strata=8, stratifier_stage_cutoff=3):
     """
     Steps 3-4: Create cost strata and train OCT model following your pipeline.
@@ -200,19 +211,6 @@ best_params = None):
     
     return results
 
-
-import numpy as np
-import pandas as pd
-from itertools import product
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    roc_auc_score,
-    classification_report
-)
-import time
-import warnings
 
 # -----------------------------------------------------------
 # Utility: Evaluate multi-class predictions

@@ -26,77 +26,7 @@ class BilevelResampler(LexicographicCaseControlResampler):
     Two-stage undersampling:
       1) Inner: minimize distance between majority and minority sets (select K candidate negatives)
       2) Outer: maximize diversity among those K candidates (select final k subset)
-    """
-
-    # -------------------------------------------------------------
-    # Inner problem: distance-based candidate selection (p-median)
-    # -------------------------------------------------------------
-    def _solve_dist_preserving_inner_pmedian(
-        self,
-        X_cases,
-        X_controls,
-        D,
-        candidate_pairs,
-        candidate_ctrls_set,
-        df_controls,
-        K,
-        orig_dist,
-        verbose=True,
-    ):
-        strata = df_controls["cost_stratum_2018"].values
-        solver = pywraplp.Solver.CreateSolver("SCIP")
-
-        # y_j: whether control j selected
-        y = {j: solver.BoolVar(f"y_{j}") for j in candidate_ctrls_set}
-
-        # z_ij assignment variables for candidate pairs
-        z = {(i, j): solver.NumVar(0, 1, f"z_{i}_{j}") for (i, j) in candidate_pairs}
-
-        # case → exactly one selected control
-        for i in range(X_cases.shape[0]):
-            pairs_i = [(ii, j) for (ii, j) in candidate_pairs if ii == i]
-            solver.Add(solver.Sum(z[i, j] for (_, j) in pairs_i) == 1)
-            for (_, j) in pairs_i:
-                solver.Add(z[i, j] <= y[j])
-
-        # ------------------------------------------------------------------
-        # Distribution-preserving constraints
-        # ------------------------------------------------------------------
-        desired_count = {c: int(round(orig_dist[c] * K)) for c in orig_dist}
-
-        # fix feasibility if rare strata too small
-        for c in desired_count:
-            candidate_ctrls_in_c = [j for j in candidate_ctrls_set if strata[j] == c]
-            desired_count[c] = min(desired_count[c], len(candidate_ctrls_in_c))
-
-        # sum to K
-        total = sum(desired_count.values())
-        if total != K:
-            # redistribute missing to largest strata
-            remainder = K - total
-            largest = max(desired_count, key=lambda c: desired_count[c])
-            desired_count[largest] += remainder
-
-        # enforce exact counts
-        for c in desired_count:
-            ctrl_list = [j for j in candidate_ctrls_set if strata[j] == c]
-            solver.Add(solver.Sum(y[j] for j in ctrl_list) == desired_count[c])
-
-        # objective
-        solver.Minimize(
-            solver.Sum(D[i, j] * z[i, j] for (i, j) in candidate_pairs)
-        )
-
-        solver.SetTimeLimit(300000)
-        status = solver.Solve()
-
-        selected_ctrls = [j for j in candidate_ctrls_set if y[j].solution_value() > 0.5]
-        assignments = [(i, j) for (i, j), var in z.items() if var.solution_value() > 0.5]
-
-        return selected_ctrls, assignments
-
-    
-    
+    """   
     def select_candidate_controls(
         self,
         X_cases,
@@ -332,53 +262,67 @@ class BilevelResampler(LexicographicCaseControlResampler):
     
 
     def prune_nodes_distance_stratified(
-        self, X_cases, X_controls, df_controls,
+        self, 
+        X_cases, 
+        X_controls, 
+        df_controls,
         top_k_per_case=50,
         K_outer=2000,
-        target_strata_proportions=None,
+        stratified=False,       # <-- NEW flag
     ):
-        # ---- Step 1: Case→Control expansion ----
+        """
+        Distance-based node pruning.
+        If stratified=True, we preserve approximate global proportions of strata.
+        If stratified=False, we return the K_outer closest nodes overall.
+        """
+        # ---- Step 1: Case→Control expansion (top-k per case) ----
         D = cdist(X_cases, X_controls)
         nearest = np.argpartition(D, top_k_per_case, axis=1)[:, :top_k_per_case]
-        candidate_indices = sorted(set(nearest.flatten()))
+        candidate_indices = sorted(set(nearest.flatten()))  # list of original control indices
         
-        # ---- Step 2: Compute minimal distance score ----
+        # ---- Step 2: Compute minimal distance score for these candidates ----
         D_sub = cdist(X_cases, X_controls[candidate_indices])
         min_dist = D_sub.min(axis=0)
-        
-       # Step 3: build dfC with RESET INDEX
+
+        # ---- Step 3: Build dfC with RESET INDEX ----
         dfC = df_controls.iloc[candidate_indices].copy()
-        dfC = dfC.reset_index(drop=False)   # "index" column stores original row number
+        dfC = dfC.reset_index(drop=False)  # keep original index
         dfC["min_dist"] = min_dist
 
-            # ---- Step 4: Determine stratum proportions ----
-        if target_strata_proportions is None:
-            # use global proportions
-            p = dfC["cost_stratum_2018"].value_counts(normalize=True).to_dict()
-        else:
-            p = target_strata_proportions
-        
-        # enforce quotas summing to K_outer
-        strata = sorted(p.keys())
-        quota = {s: int(round(p[s] * K_outer)) for s in strata}
-        
-        # adjust rounding drift
-        drift = K_outer - sum(quota.values())
-        if drift != 0:
-            # fix drift in largest stratum
-            s0 = max(quota, key=lambda s: quota[s])
-            quota[s0] += drift
-        
-        # ---- Step 5: Stratified distance-min sorting ----
-        selected = []
-        for s, g in dfC.groupby("cost_stratum_2018"):
-            q = quota.get(s, 0)
-            g_sorted = g.sort_values("min_dist")
-            q = min(q, len(g_sorted))        # cannot exceed available
-            selected.extend(g_sorted.iloc[:q].index.tolist())
-        
-        return selected
+        # ==========================================
+        # OPTIONAL STRATIFIED PRUNING
+        # ==========================================
 
+        if stratified:
+            # ---- Step 4: Compute proportional quotas from the candidate pool ----
+            p = dfC["cost_stratum_2018"].value_counts(normalize=True).to_dict()
+            strata = sorted(p.keys())
+
+            # Quotas sum to K_outer
+            quota = {s: int(round(p[s] * K_outer)) for s in strata}
+
+            # Fix rounding drift
+            drift = K_outer - sum(quota.values())
+            if drift != 0:
+                s0 = max(quota, key=lambda s: quota[s])
+                quota[s0] += drift
+            selected = []
+            # ---- Step 5: Stratified minimal-distance selection ----
+            for s, g in dfC.groupby("cost_stratum_2018"):
+                q = quota.get(s, 0)
+                g_sorted = g.sort_values("min_dist")
+                q = min(q, len(g_sorted))   # cannot exceed available in this stratum
+                selected.extend(g_sorted.iloc[:q]["index"].tolist())  # original indices
+
+        # ==========================================
+        # NON-STRATIFIED PRUNING
+        # ==========================================
+        else:
+            # Sort all candidates purely by minimal distance
+            df_sorted = dfC.sort_values("min_dist")
+            K_eff = min(K_outer, len(df_sorted))
+            selected = dfC.nsmallest(K_eff, "min_dist").index.tolist()
+        return selected
     def _topk_prune_control_to_control(self,X_C, L):
         """
         Returns list:
@@ -407,7 +351,9 @@ class BilevelResampler(LexicographicCaseControlResampler):
 
         return NN_case, D
 
-    def unified_tradeoff_selector_distance(
+
+
+    def optimize_double_facility(
         self,
         X_cases,
         X_controls,
@@ -417,6 +363,7 @@ class BilevelResampler(LexicographicCaseControlResampler):
         w: float = 0.5,
         top_k_case_ctrl: int = 20,
         top_k_ctrl_ctrl: int = 50,
+        stratified = False,
         verbose: bool = True,
     ):
         X_C = X_controls[candidate_indices]
@@ -433,6 +380,10 @@ class BilevelResampler(LexicographicCaseControlResampler):
 
         # --- Control→Control pruning
         NN_ctrl, D_nn = self._topk_prune_control_to_control(X_C, top_k_ctrl_ctrl)
+
+        # Similarity matrix for facility-location coverage
+        sigma = D_nn.std() + 1e-8
+        S_nn = np.exp(-D_nn / sigma)   # shape (C, C)
 
         # --- Build solver and variables
         solver = pywraplp.Solver.CreateSolver("SCIP")
@@ -468,41 +419,69 @@ class BilevelResampler(LexicographicCaseControlResampler):
                 solver.Add(r[c][j] <= s[j])
 
         # ---- Stratum quota constraints (upper bounds only, from full df_controls) ----
-        full_strata = df_controls["cost_stratum_2018"].values
-        unique_full, counts_full = np.unique(full_strata, return_counts=True)
-        p = {u: counts_full[i] / len(full_strata) for i, u in enumerate(unique_full)}
-        target = {s_key: int(round(p[s_key] * k)) for s_key in p}
+        if stratified:
+            full_strata = df_controls["cost_stratum_2018"].values
+            unique_full, counts_full = np.unique(full_strata, return_counts=True)
+            p = {u: counts_full[i] / len(full_strata) for i, u in enumerate(unique_full)}
+            target = {s_key: int(round(p[s_key] * k)) for s_key in p}
 
-        if verbose:
-            print("Global stratum proportions:", p)
-            print("Quota targets (approx counts among k):", target)
+            if verbose:
+                print("Global stratum proportions:", p)
+                print("Quota targets (approx counts among k):", target)
 
-        # Build index sets per stratum within candidate pool
-        strata_pruned = df_controls.iloc[candidate_indices]["cost_stratum_2018"].values
-        stratum_sets = {s_key: [] for s_key in target}
-        for j in range(C):
-            s_val = strata_pruned[j]
-            if s_val in stratum_sets:
-                stratum_sets[s_val].append(j)
+            # Build index sets per stratum within candidate pool
+            strata_pruned = df_controls.iloc[candidate_indices]["cost_stratum_2018"].values
+            stratum_sets = {s_key: [] for s_key in target}
+            for j in range(C):
+                s_val = strata_pruned[j]
+                if s_val in stratum_sets:
+                    stratum_sets[s_val].append(j)
 
-        # Add only UPPER-BOUND constraints if stratum exists in candidates
-        band = 1.2  # +20% slack
-        for s_key, tgt in target.items():
-            if len(stratum_sets[s_key]) == 0:
-                continue  # nothing of that stratum in candidate pool
-            ub = int(band * tgt)
-            ub = min(ub, len(stratum_sets[s_key]))  # cannot select more than available
-            solver.Add(sum(s[j] for j in stratum_sets[s_key]) <= ub)
+            # Add only UPPER-BOUND constraints if stratum exists in candidates
+            band = 1.2  # +20% slack
+            for s_key, tgt in target.items():
+                if len(stratum_sets[s_key]) == 0:
+                    continue  # nothing of that stratum in candidate pool
+                ub = int(band * tgt)
+                ub = min(ub, len(stratum_sets[s_key]))  # cannot select more than available
+                solver.Add(sum(s[j] for j in stratum_sets[s_key]) <= ub)
+            
 
-        if verbose:
-            print("Candidate counts per stratum:",
-                {s_key: len(stratum_sets[s_key]) for s_key in target})
+            if verbose:
+                print("Candidate counts per stratum:",
+                    {s_key: len(stratum_sets[s_key]) for s_key in target})
 
-        # Objective
-        obj = (
-            w     * solver.Sum(D_pn[i, j] * a[i][j] for i in range(P) for j in NN_case[i]) +
-            (1 - w) * solver.Sum(D_nn[c, j] * r[c][j] for c in range(C) for j in NN_ctrl[c])
+        # CASE – CONTROL CLOSENESS
+        term_cases = solver.Sum(
+            D_pn[i,j] * a[i][j]
+            for i in range(P)
+            for j in NN_case[i]
         )
+
+        # CONTROL – CONTROL COVERAGE (SIMILARITY)
+        term_coverage = solver.Sum(
+            S_nn[c,j] * r[c][j]
+            for c in range(C)
+            for j in NN_ctrl[c]
+        )
+        # ================================
+        # SCALE THE TWO TERMS TO SAME ORDER
+        # ================================
+
+        # number of case–control terms contributing
+        scale_cases = 1.0 / max(P, 1)
+
+        # number of control–control similarity terms contributing
+        # total number of (c,j) edges used in coverage
+        total_edges = sum(len(NN_ctrl[c]) for c in range(C))
+        scale_coverage = 1.0 / max(total_edges, 1)
+
+        term_cases_scaled     = scale_cases    * term_cases
+        term_coverage_scaled  = scale_coverage * term_coverage
+
+        obj = w * term_cases_scaled - (1 - w) * term_coverage_scaled
+        solver.Minimize(obj)
+
         solver.Minimize(obj)
         status = solver.Solve()
 
@@ -512,22 +491,36 @@ class BilevelResampler(LexicographicCaseControlResampler):
         if status not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
             raise RuntimeError(f"Unified MILP failed with status {status}")
 
-        if verbose:
-            print("[MILP] Variables:", solver.NumVariables())
-            print("[MILP] Constraints:", solver.NumConstraints())
-             # Quick check on upper bounds
+        if stratified:
             print("Candidate counts per stratum:", {s_key: len(stratum_sets[s_key]) for s_key in target})
-
 
         solver.SetTimeLimit(300_000)  # 300 seconds
 
         if status not in (solver.OPTIMAL, solver.FEASIBLE):
             raise RuntimeError("Unified MILP failed")
+        if verbose:
+            raw_cases = 0.0
+            for i in range(P):
+                for j in NN_case[i]:
+                    raw_cases += D_pn[i,j] * a[i][j].solution_value()
+
+            raw_cov = 0.0
+            for c in range(C):
+                for j in NN_ctrl[c]:
+                    raw_cov += S_nn[c,j] * r[c][j].solution_value()
+
+            print("[Objective decomposition]")
+            print(f"  term_cases_raw    = {raw_cases:.4f}")
+            print(f"  term_coverage_raw = {raw_cov:.4f}")
+            print(f"  term_cases_scaled = {scale_cases*raw_cases:.4f}")
+            print(f"  term_cov_scaled   = {scale_coverage*raw_cov:.4f}")
+            print(f"  weighted_obj      = {solver.Objective().Value():.4f}")
+
 
         return [candidate_indices[j] for j in range(C) if s[j].solution_value() > 0.5]
 
 
-    def unified_undersample_wrapper_new(
+    def biobjective_double_facility_wrapper(
         self,
         df_cases,
         df_controls,
@@ -537,7 +530,8 @@ class BilevelResampler(LexicographicCaseControlResampler):
         top_k_case_ctrl=20,
         top_k_ctrl_ctrl=20,
         K_factor=3.0,        # INNER PRUNING size
-        verbose=True,
+        stratified=False,
+        verbose=True
     ):
 
         # 1. Preprocessing
@@ -557,8 +551,7 @@ class BilevelResampler(LexicographicCaseControlResampler):
             print(f"[INNER] Selecting {K_outer} candidate controls out of {X_controls.shape[0]}")
 
         candidate_indices = self.prune_nodes_distance_stratified(
-           X_cases, X_controls, df_controls,top_k_per_case=50
-)
+           X_cases, X_controls, df_controls, top_k_per_case=50, stratified=stratified)
         candidate_indices = list(map(int, candidate_indices))
         if verbose:
             print(f"[INNER] → Kept {len(candidate_indices)} controls")
@@ -566,7 +559,7 @@ class BilevelResampler(LexicographicCaseControlResampler):
         # ---------------------------------------------------
         # 3. OUTER PRUNING + Unified MILP
         # ---------------------------------------------------
-        selected_ctrls = self.unified_tradeoff_selector_distance(
+        selected_ctrls = self.optimize_double_facility(
             X_cases,
             X_controls,
             df_controls,
@@ -575,8 +568,266 @@ class BilevelResampler(LexicographicCaseControlResampler):
             w=w,
             top_k_case_ctrl=top_k_case_ctrl,
             top_k_ctrl_ctrl=top_k_ctrl_ctrl,
+            stratified=stratified,
             verbose=verbose
         )
 
         return pd.concat(
             [df_cases, df_controls.iloc[selected_ctrls]], ignore_index=True)
+
+
+    def _topk_farthest_control_pairs(self, X_C, L_pairs=20, verbose=True):
+        """
+        For dispersion: build a sparse set of FAR pairs (j,k) among controls.
+
+        Parameters
+        ----------
+        X_C : np.ndarray
+            Feature matrix for candidate controls (C x d)
+        L_pairs : int
+            Number of far neighbors to keep per control.
+
+        Returns
+        -------
+        pairs : list[(int,int)]
+            Unique (j,k) index pairs with j < k.
+        D_nn : np.ndarray
+            Full control-control distance matrix (C x C).
+        """
+        from sklearn.metrics import pairwise_distances
+
+        C = X_C.shape[0]
+        D_nn = pairwise_distances(X_C, X_C, metric="euclidean")
+
+        pairs_set = set()
+        # for each control j, find L_pairs farthest others
+        for j in range(C):
+            row = D_nn[j]
+            # indices of L largest distances (excluding j itself)
+            # argpartition on -row yields largest L indices
+            L_eff = min(L_pairs, C - 1)
+            far_idx = np.argpartition(-row, L_eff)[:L_eff]
+            # drop self if present
+            far_idx = far_idx[far_idx != j]
+            for k in far_idx:
+                j_min, j_max = (j, k) if j < k else (k, j)
+                pairs_set.add((j_min, j_max))
+
+        pairs = sorted(list(pairs_set))
+        if verbose:
+            print(f"[Dispersion] Using {len(pairs)} far pairs among {C} controls (L_pairs={L_pairs})")
+
+        return pairs, D_nn
+
+
+    def optimize_push_pull(
+        self,
+        X_cases,
+        X_controls,
+        df_controls,
+        candidate_indices,
+        final_ratio: float,
+        w: float = 0.5,
+        top_k_case_ctrl: int = 20,
+        L_pairs: int = 20,
+        stratified: bool = False,
+        verbose: bool = True,
+    ):
+        """
+        Unified MILP with:
+        - Term 1: case→control distance (closeness)
+        - Term 2: pairwise control–control distance (diversity / dispersion)
+
+        We select k = final_ratio * P controls from candidate_indices.
+        """
+        from ortools.linear_solver import pywraplp
+
+        # Restrict controls to candidate pool
+        X_C = X_controls[candidate_indices]
+        P = X_cases.shape[0]
+        C = len(candidate_indices)
+
+        # Number of controls to select
+        k = int(np.clip(final_ratio * P, 1, C))
+        if verbose:
+            print(f"[Unified-Diverse] P={P}, C={C}, final_ratio={final_ratio} → k={k} controls")
+
+        # --- Case→Control: nearest neighbors for assignment a[i,j] ---
+        NN_case, D_pn = self._topk_prune_case_to_control(
+            X_cases, X_C, top_k_case_ctrl
+        )  # D_pn shape (P, C_eff == C)
+
+        # --- Control→Control: farthest pairs for z[j,k] ---
+        pairs, D_nn = self._topk_farthest_control_pairs(
+            X_C, L_pairs=L_pairs, verbose=verbose
+        )
+
+        # Build solver
+        solver = pywraplp.Solver.CreateSolver("SCIP")
+
+        # Selection vars: s[j] ∈ {0,1}
+        s = [solver.BoolVar(f"s[{j}]") for j in range(C)]
+
+        # Case assignment vars: a[i][j] ∈ [0,1] only for j in NN_case[i]
+        a = [
+            {j: solver.NumVar(0, 1, f"a[{i},{j}]") for j in NN_case[i]}
+            for i in range(P)
+        ]
+
+        # Pairwise co-selection vars: z[(j,k)] ∈ [0,1]
+        z = { (j,k): solver.NumVar(0, 1, f"z[{j},{k}]") for (j,k) in pairs }
+
+        # --- Constraints ---
+
+        # Total selected controls
+        solver.Add(sum(s) == k)
+
+        # Case coverage: each case assigned to exactly one selected control
+        for i in range(P):
+            solver.Add(sum(a[i][j] for j in NN_case[i]) == 1)
+            for j in NN_case[i]:
+                solver.Add(a[i][j] <= s[j])
+
+        # Pairwise linkage: z[j,k] ≤ s[j], z[j,k] ≤ s[k]
+        for (j, k), z_var in z.items():
+            solver.Add(z_var <= s[j])
+            solver.Add(z_var <= s[k])
+
+        # ---- Optional: Stratum quota constraints (upper bounds) ----
+        if stratified:
+            full_strata = df_controls["cost_stratum_2018"].values
+            unique_full, counts_full = np.unique(full_strata, return_counts=True)
+            p = {u: counts_full[i] / len(full_strata) for i, u in enumerate(unique_full)}
+            target = {s_key: int(round(p[s_key] * k)) for s_key in p}
+
+            if verbose:
+                print("Global stratum proportions:", p)
+                print("Quota targets (approx counts among k):", target)
+
+            strata_pruned = df_controls.iloc[candidate_indices]["cost_stratum_2018"].values
+            stratum_sets = {s_key: [] for s_key in target}
+            for j in range(C):
+                s_val = strata_pruned[j]
+                if s_val in stratum_sets:
+                    stratum_sets[s_val].append(j)
+
+            band = 1.2  # +20% slack
+            for s_key, tgt in target.items():
+                if len(stratum_sets[s_key]) == 0:
+                    continue
+                ub = int(band * tgt)
+                ub = min(ub, len(stratum_sets[s_key]))
+                solver.Add(sum(s[j] for j in stratum_sets[s_key]) <= ub)
+
+            if verbose:
+                print("Candidate counts per stratum:",
+                    {s_key: len(stratum_sets[s_key]) for s_key in target})
+
+        # --- Objective: closeness (D_pn) vs diversity (D_nn) ---
+        # Term 1: sum of case→control distances
+        raw_term_cases = solver.Sum(
+            D_pn[i, j] * a[i][j] for i in range(P) for j in NN_case[i]
+        )
+
+        # Term 2: sum of pairwise distances among selected controls
+        raw_term_pairs = solver.Sum(
+            D_nn[j, k] * z[(j, k)] for (j, k) in pairs
+        )
+
+        # ---- SIMPLE SCALING TO MATCH MAGNITUDE ----
+        # average distance per case
+        scale_cases = 1.0 / max(P, 1)
+        # average distance per pair
+        scale_pairs = 1.0 / max(len(pairs), 1)
+
+        term_cases = scale_cases * raw_term_cases
+        term_pairs = scale_pairs * raw_term_pairs
+
+        obj = w * term_cases - (1.0 - w) * term_pairs
+        solver.Minimize(obj)
+
+        if verbose:
+            print("[MILP-Diverse] Variables:", solver.NumVariables())
+            print("[MILP-Diverse] Constraints:", solver.NumConstraints())
+
+        solver.SetTimeLimit(300_000)  # 300 seconds
+        status = solver.Solve()
+
+        if status not in (solver.OPTIMAL, solver.FEASIBLE):
+            raise RuntimeError(f"Unified Diverse MILP failed with status {status}")
+
+        if verbose:
+            # ---- CASE TERM ----
+            raw_cases = 0.0
+            for i in range(P):
+                for j in NN_case[i]:
+                    raw_cases += D_pn[i, j] * a[i][j].solution_value()
+
+            # ---- DISPERSION TERM ----
+            raw_disp = 0.0
+            for (j, k) in pairs:
+                raw_disp += D_nn[j, k] * z[(j, k)].solution_value()
+
+            print("[Objective decomposition]")
+            print(f"  term_cases_raw    = {raw_cases:.4f}")
+            print(f"  term_disp_raw     = {raw_disp:.4f}")
+            print(f"  term_cases_scaled = {(scale_cases * raw_cases):.4f}")
+            print(f"  term_disp_scaled  = {(scale_pairs * raw_disp):.4f}")
+            print(f"  weighted_obj      = {solver.Objective().Value():.4f}")
+                # Return selected controls (candidate_indices indexing)
+        selected_controls = [
+            candidate_indices[j] for j in range(C) if s[j].solution_value() > 0.5
+        ]
+
+        return selected_controls
+
+
+    def biobjective_push_pull_wrapper(
+        self,
+        df_cases: pd.DataFrame,
+        df_controls: pd.DataFrame,
+        exclude_cols_matching,
+        final_ratio=1.0,
+        w=0.5,
+        top_k_case_ctrl=20,
+        L_pairs=10,
+        K_factor=3.0,   # for inner node pruning if you have it
+        stratified=False,
+        verbose=True,
+    ):
+        X_cases, X_controls = self.get_preprocessed_control_case_features(
+            df_cases, df_controls, exclude_cols_matching, verbose=verbose
+        )
+        P = X_cases.shape[0]
+
+        # Optional: inner node pruning (e.g., keep K_factor * P closest controls globally)
+        # Or use your existing prune_nodes_by_distance function
+        K_outer = int(K_factor * P)
+        K_outer = min(K_outer, X_controls.shape[0])
+        if verbose:
+            print(f"[INNER] Selecting {K_outer} candidate controls out of {X_controls.shape[0]}")
+
+        candidate_indices = self.prune_nodes_distance_stratified(
+           X_cases, X_controls, df_controls,top_k_per_case=50, stratified=stratified
+)
+        candidate_indices = list(map(int, candidate_indices))
+        if verbose:
+            print(f"[INNER] → Kept {len(candidate_indices)} controls")
+
+        selected_ctrls = self.optimize_push_pull(
+            X_cases,
+            X_controls,
+            df_controls,
+            candidate_indices,
+            final_ratio=final_ratio,
+            w=w,
+            top_k_case_ctrl=top_k_case_ctrl,
+            L_pairs=L_pairs,
+            stratified=stratified,
+            verbose=verbose,
+        )
+
+        undersampled = pd.concat(
+            [df_cases, df_controls.iloc[selected_ctrls]], ignore_index=True
+        )
+        return undersampled
