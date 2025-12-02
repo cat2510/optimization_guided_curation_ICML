@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix,precision_recall_curve,average_precision_score
+from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix,precision_recall_curve,average_precision_score,precision_score,recall_score,f1_score
 
 def get_bin_flag_columns(df):
     return [col for col in df.columns if col.startswith("has_") or "THRCLS" in col.upper()
@@ -233,33 +233,46 @@ def train_test_split_enrol(df, target_col="high_cost_2018", test_size=0.3, rando
 
 def evaluate_model_auc(clf, X_test, y_test, optimal_threshold=True):
     """
-    Evaluates a fitted classifier pipeline by printing ROC AUC.
-    Confusion matrix + classification report done with F1-optimized thresholding.
+    Evaluates a fitted classifier pipeline by printing ROC AUC
+    and returns metrics for logging.
     """
 
-    # True labels and predicted
     y_test = np.asarray(y_test)
     y_pred = clf.predict(X_test)
     y_proba = clf.predict_proba(X_test)[:, 1]
+
     if optimal_threshold:
         precision, recall, thresholds = precision_recall_curve(y_test, y_proba)
         f1_scores = 2 * recall * precision / (recall + precision + 1e-10)
         best_idx = np.argmax(f1_scores)
-        best_threshold = thresholds[best_idx]
-        threshold = best_threshold
+        threshold = thresholds[best_idx]
     else:
         threshold = 0.5
 
     y_pred = (y_proba >= threshold).astype(int)
-    
+
     auc = roc_auc_score(y_test, y_proba)
-    print(f"Binary AUC: {auc:.3f}")
     pr_auc = average_precision_score(y_test, y_proba)
+    tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+
+    # compute P/R/F1 with chosen threshold
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    specificity = tn / (tn + fp + 1e-10)   # avoid division by zero
+
+    print(f"Binary AUC: {auc:.3f}")
     print(f"PR-AUC (Average Precision): {pr_auc:.3f}")
+    #print("Classification Report:")
+   # print(classification_report(y_test, y_pred, digits=3))
 
-
-    # classification report and confusion matrix
-    print("Classification Report:")
-    print(classification_report(y_test, y_pred, digits=3))
-    print("Confusion Matrix:")
-    print(confusion_matrix(y_test, y_pred))
+    # return dictionary for logging
+    return {
+        "auc": auc,
+        "pr_auc": pr_auc,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+        "specificity": specificity,
+        "threshold": threshold,
+    }

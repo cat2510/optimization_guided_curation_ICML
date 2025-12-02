@@ -21,6 +21,80 @@ from balancing_functions.optimal_match_lexicographic import LexicographicCaseCon
 import time
 from tqdm import tqdm
 
+def compute_extreme_points_double_facility(
+        solve_fn,   # your MILP solver but without scaling or w
+        X_cases, X_controls, df_controls, candidate_indices,
+        top_k_case_ctrl, top_k_ctrl_ctrl, final_ratio,
+        stratified=False, verbose=True
+    ):
+    results = {}
+
+    # ---- 1) f1_min: minimize case-control distance (w=1, minimize)
+    sol = solve_fn(
+        X_cases, X_controls, df_controls, candidate_indices,
+        w=1.0, final_ratio=final_ratio,
+        top_k_case_ctrl=top_k_case_ctrl,
+        top_k_ctrl_ctrl=top_k_ctrl_ctrl,
+        stratified=stratified,
+        force_direction="min_f1",
+        verbose=verbose
+    )
+    results["f1_min"], _ = sol["raw"]
+
+    # ---- 2) f1_max: maximize case-control distance
+    sol = solve_fn(
+        X_cases, X_controls, df_controls, candidate_indices,
+        w=1.0, final_ratio=final_ratio,
+        top_k_case_ctrl=top_k_case_ctrl,
+        top_k_ctrl_ctrl=top_k_ctrl_ctrl,
+        stratified=stratified,
+        force_direction="max_f1",
+        verbose=verbose
+    )
+    results["f1_max"], _ = sol["raw"]
+
+    # ---- 3) f2_min: minimize coverage term (w=0)
+    sol = solve_fn(
+        X_cases, X_controls, df_controls, candidate_indices,
+        w=0.0, final_ratio=final_ratio,
+        top_k_case_ctrl=top_k_case_ctrl,
+        top_k_ctrl_ctrl=top_k_ctrl_ctrl,
+        stratified=stratified,
+        force_direction="min_f2",
+        verbose=verbose
+    )
+    _, results["f2_min"] = sol["raw"]
+
+    # ---- 4) f2_max: maximize coverage
+    sol = solve_fn(
+        X_cases, X_controls, df_controls, candidate_indices,
+        w=0.0, final_ratio=final_ratio,
+        top_k_case_ctrl=top_k_case_ctrl,
+        top_k_ctrl_ctrl=top_k_ctrl_ctrl,
+        stratified=stratified,
+        force_direction="max_f2",
+        verbose=verbose
+    )
+    _, results["f2_max"] = sol["raw"]
+
+    return results
+
+def evaluate_terms_case_and_coverage(P, C, NN_case, D_pn, a, NN_ctrl, D_nn, r):
+    """Compute raw term_1 and term_2 under the current MILP solution."""
+    # Case–control term
+    term1 = 0.0
+    for i in range(P):
+        for j in NN_case[i]:
+            term1 += D_pn[i, j] * a[i][j].solution_value()
+
+    # Coverage/diversity term
+    term2 = 0.0
+    for c in range(C):
+        for j in NN_ctrl[c]:
+            term2 += D_nn[c, j] * r[c][j].solution_value()
+
+    return term1, term2
+
 class BilevelResampler(LexicographicCaseControlResampler):
     """
     Two-stage undersampling:
@@ -363,8 +437,8 @@ class BilevelResampler(LexicographicCaseControlResampler):
         w: float = 0.5,
         top_k_case_ctrl: int = 20,
         top_k_ctrl_ctrl: int = 50,
-        stratified = False,
-        verbose: bool = True,
+        stratified=False,
+        verbose=True,
     ):
         X_C = X_controls[candidate_indices]
         P = X_cases.shape[0]
@@ -375,150 +449,83 @@ class BilevelResampler(LexicographicCaseControlResampler):
         if verbose:
             print(f"[Unified] P={P}, C={C}, final_ratio={final_ratio} → k={k} controls")
 
-        # --- Case→Control pruning
-        NN_case, D_pn = self._topk_prune_case_to_control(X_cases, X_C, top_k_case_ctrl)
+        # Pruning
+        NN_case, D_pn = self._topk_prune_case_to_control(
+            X_cases, X_C, top_k_case_ctrl
+        )
+        NN_ctrl, D_nn = self._topk_prune_control_to_control(
+            X_C, top_k_ctrl_ctrl
+        )
 
-        # --- Control→Control pruning
-        NN_ctrl, D_nn = self._topk_prune_control_to_control(X_C, top_k_ctrl_ctrl)
-
-        # Similarity matrix for facility-location coverage
+        # Facility-location similarity
         sigma = D_nn.std() + 1e-8
-        S_nn = np.exp(-D_nn / sigma)   # shape (C, C)
+        S_nn = np.exp(-D_nn / sigma)
 
-        # --- Build solver and variables
+        # Build solver
         solver = pywraplp.Solver.CreateSolver("SCIP")
 
-        # Selection vars
         s = [solver.BoolVar(f"s[{j}]") for j in range(C)]
+        a = [{j: solver.NumVar(0, 1, f"a[{i},{j}]") for j in NN_case[i]}
+            for i in range(P)]
+        r = [{j: solver.NumVar(0, 1, f"r[{c},{j}]") for j in NN_ctrl[c]}
+            for c in range(C)]
 
-        # Case assignments
-        a = [
-            {j: solver.NumVar(0, 1, f"a[{i},{j}]") for j in NN_case[i]}
-            for i in range(P)
-        ]
-
-        # Coverage assignments
-        r = [
-            {j: solver.NumVar(0, 1, f"r[{c},{j}]") for j in NN_ctrl[c]}
-            for c in range(C)
-        ]
-
-        # Total number of selected controls
+        # Constraints
         solver.Add(sum(s) == k)
 
-        # Case coverage
         for i in range(P):
             solver.Add(sum(a[i][j] for j in NN_case[i]) == 1)
             for j in NN_case[i]:
                 solver.Add(a[i][j] <= s[j])
 
-        # Control coverage
         for c in range(C):
             solver.Add(sum(r[c][j] for j in NN_ctrl[c]) == 1)
             for j in NN_ctrl[c]:
                 solver.Add(r[c][j] <= s[j])
 
-        # ---- Stratum quota constraints (upper bounds only, from full df_controls) ----
-        if stratified:
-            full_strata = df_controls["cost_stratum_2018"].values
-            unique_full, counts_full = np.unique(full_strata, return_counts=True)
-            p = {u: counts_full[i] / len(full_strata) for i, u in enumerate(unique_full)}
-            target = {s_key: int(round(p[s_key] * k)) for s_key in p}
-
-            if verbose:
-                print("Global stratum proportions:", p)
-                print("Quota targets (approx counts among k):", target)
-
-            # Build index sets per stratum within candidate pool
-            strata_pruned = df_controls.iloc[candidate_indices]["cost_stratum_2018"].values
-            stratum_sets = {s_key: [] for s_key in target}
-            for j in range(C):
-                s_val = strata_pruned[j]
-                if s_val in stratum_sets:
-                    stratum_sets[s_val].append(j)
-
-            # Add only UPPER-BOUND constraints if stratum exists in candidates
-            band = 1.2  # +20% slack
-            for s_key, tgt in target.items():
-                if len(stratum_sets[s_key]) == 0:
-                    continue  # nothing of that stratum in candidate pool
-                ub = int(band * tgt)
-                ub = min(ub, len(stratum_sets[s_key]))  # cannot select more than available
-                solver.Add(sum(s[j] for j in stratum_sets[s_key]) <= ub)
-            
-
-            if verbose:
-                print("Candidate counts per stratum:",
-                    {s_key: len(stratum_sets[s_key]) for s_key in target})
-
-        # CASE – CONTROL CLOSENESS
+        # Case/coverage terms
         term_cases = solver.Sum(
-            D_pn[i,j] * a[i][j]
-            for i in range(P)
-            for j in NN_case[i]
+            D_pn[i, j] * a[i][j] for i in range(P) for j in NN_case[i]
         )
-
-        # CONTROL – CONTROL COVERAGE (SIMILARITY)
         term_coverage = solver.Sum(
-            S_nn[c,j] * r[c][j]
-            for c in range(C)
-            for j in NN_ctrl[c]
+            S_nn[c, j] * r[c][j] for c in range(C) for j in NN_ctrl[c]
         )
-        # ================================
-        # SCALE THE TWO TERMS TO SAME ORDER
-        # ================================
 
-        # number of case–control terms contributing
+        # Scaling
         scale_cases = 1.0 / max(P, 1)
-
-        # number of control–control similarity terms contributing
-        # total number of (c,j) edges used in coverage
         total_edges = sum(len(NN_ctrl[c]) for c in range(C))
-        scale_coverage = 1.0 / max(total_edges, 1)
+        scale_cov   = 1.0 / max(total_edges, 1)
 
-        term_cases_scaled     = scale_cases    * term_cases
-        term_coverage_scaled  = scale_coverage * term_coverage
+        term_cases_scaled = scale_cases * term_cases
+        term_cov_scaled   = scale_cov   * term_coverage
 
-        obj = w * term_cases_scaled - (1 - w) * term_coverage_scaled
-        solver.Minimize(obj)
+        solver.Minimize(w * term_cases_scaled - (1 - w) * term_cov_scaled)
 
-        solver.Minimize(obj)
+        solver.SetTimeLimit(300_000)
         status = solver.Solve()
-
-        if verbose:
-            print("Solve status:", status)
-
-        if status not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
-            raise RuntimeError(f"Unified MILP failed with status {status}")
-
-        if stratified:
-            print("Candidate counts per stratum:", {s_key: len(stratum_sets[s_key]) for s_key in target})
-
-        solver.SetTimeLimit(300_000)  # 300 seconds
 
         if status not in (solver.OPTIMAL, solver.FEASIBLE):
             raise RuntimeError("Unified MILP failed")
+
+        # ----------------------------------------------------
+        # ★★★ Evaluate raw terms using your helper function ★★★
+        # ----------------------------------------------------
+        raw_cases, raw_cov = evaluate_terms_case_and_coverage(
+            P, C,
+            NN_case, D_pn, a,
+            NN_ctrl, S_nn, r
+        )
+
         if verbose:
-            raw_cases = 0.0
-            for i in range(P):
-                for j in NN_case[i]:
-                    raw_cases += D_pn[i,j] * a[i][j].solution_value()
-
-            raw_cov = 0.0
-            for c in range(C):
-                for j in NN_ctrl[c]:
-                    raw_cov += S_nn[c,j] * r[c][j].solution_value()
-
             print("[Objective decomposition]")
             print(f"  term_cases_raw    = {raw_cases:.4f}")
             print(f"  term_coverage_raw = {raw_cov:.4f}")
-            print(f"  term_cases_scaled = {scale_cases*raw_cases:.4f}")
-            print(f"  term_cov_scaled   = {scale_coverage*raw_cov:.4f}")
+            print(f"  term_cases_scaled = {scale_cases * raw_cases:.4f}")
+            print(f"  term_cov_scaled   = {scale_cov * raw_cov:.4f}")
             print(f"  weighted_obj      = {solver.Objective().Value():.4f}")
 
-
+        # Selected controls
         return [candidate_indices[j] for j in range(C) if s[j].solution_value() > 0.5]
-
 
     def biobjective_double_facility_wrapper(
         self,
