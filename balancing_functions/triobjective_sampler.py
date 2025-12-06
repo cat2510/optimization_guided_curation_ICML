@@ -21,7 +21,7 @@ from balancing_functions.optimal_match_lexicographic import LexicographicCaseCon
 import time
 from tqdm import tqdm
 
-def compute_extreme_points_double_facility(
+def compute_extreme_points(
         solve_fn,   # your MILP solver but without scaling or w
         X_cases, X_controls, candidate_indices,
         top_k_case_ctrl, top_k_ctrl_ctrl, final_ratio,
@@ -39,7 +39,7 @@ def compute_extreme_points_double_facility(
         force_direction="min_f1",
     )
     results["f1_min"], _, _ = sol["raw"]
-
+    print("Solved for F1 min")
     # ---- 2) f1_max: maximize case-control distance
     sol = solve_fn(
         X_cases, X_controls, candidate_indices,
@@ -50,6 +50,7 @@ def compute_extreme_points_double_facility(
         force_direction="max_f1",
     )
     results["f1_max"], _, _ = sol["raw"]
+    print("Solved for F1 max")
 
     # ---- 3) f2_min: minimize coverage term
     sol = solve_fn(
@@ -60,6 +61,7 @@ def compute_extreme_points_double_facility(
         force_direction="min_f2",
     )
     _, results["f2_min"], _ = sol["raw"]
+    print("Solved for F2 min")
 
     # ---- 4) f2_max: maximize coverage
     sol = solve_fn(
@@ -71,6 +73,7 @@ def compute_extreme_points_double_facility(
         force_direction="max_f2",
     )
     _, results["f2_max"], _ = sol["raw"]
+    print("Solved for F2 max")
 
     # ---- 5) f3_min: minimize pairwise diversity (minimize distances)
     sol = solve_fn(
@@ -82,6 +85,7 @@ def compute_extreme_points_double_facility(
         force_direction="min_f3",
     )
     _, _, results["f3_min"] = sol["raw"]
+    print("Solved for F3 min")
 
     # ---- 6) f3_max: maximize pairwise diversity (maximize distances)
     sol = solve_fn(
@@ -93,6 +97,7 @@ def compute_extreme_points_double_facility(
         force_direction="max_f3",
     )
     _, _, results["f3_max"] = sol["raw"]
+    print("Solved for F3 max")
 
     return results
 
@@ -260,9 +265,8 @@ class TriobjectiveSampler(LexicographicCaseControlResampler):
         pairs, D_pairs = self._topk_farthest_control_pairs(X_C, L_pairs=L_pairs, verbose=False)
 
         # --- Build MILP ---
-        solver = pywraplp.Solver.CreateSolver("SCIP")
-
-        s = [solver.BoolVar(f"s[{j}]") for j in range(C)]
+        solver = pywraplp.Solver.CreateSolver("CLP") # USE LP SOLVER FOR RELAXED EXTREME POINT OPTIMIZATION
+        s = [solver.NumVar(0,1, f"s[{j}]") for j in range(C)] # RELAXED BINARIES TO CONTINUOUS TO SPEED UP TIME
         a = [{j: solver.NumVar(0,1,f"a[{i},{j}]") for j in NN_case[i]} for i in range(P)]
         r = [{j: solver.NumVar(0,1,f"r[{c},{j}]") for j in NN_ctrl[c]} for c in range(C)]
         z = {(j, k): solver.NumVar(0, 1, f"z[{j},{k}]") for (j, k) in pairs}
@@ -306,7 +310,7 @@ class TriobjectiveSampler(LexicographicCaseControlResampler):
             raise ValueError("force_direction must be in {min_f1, max_f1, min_f2, max_f2, min_f3, max_f3}")
 
         solver.Minimize(obj)
-        solver.SetTimeLimit(3000)
+        solver.SetTimeLimit(2000)
         solver.Solve()
 
         # --- Evaluate raw f1, f2, f3 (using fixed helper) ---
@@ -317,24 +321,24 @@ class TriobjectiveSampler(LexicographicCaseControlResampler):
             pairs=pairs, D_pairs=D_pairs, z=z
         )
 
-        selected = [
-            candidate_indices[j] for j in range(C)
-            if s[j].solution_value() > 0.5
-        ]
+        #selected = [
+       #     candidate_indices[j] for j in range(C)
+       #     if s[j].solution_value() > 0.5 # MEANINGLESS IF S VARIABLES HAVE BEEN RELAXED
+       # ]
 
         return {
-            "selected": selected,
+            # "selected": selected,
             "raw": (raw_f1, raw_f2, raw_f3)
         }
 
     def solve_triobjective_MILP(
         self,
         X_cases, X_controls, candidate_indices,
-        w, final_ratio,
+        w, v,# weight for f3 (diversity): v=0 means no f3, v=1 means only f3
+        final_ratio,
         top_k_case_ctrl, top_k_ctrl_ctrl,
         ext,                    # dictionary with f1_min, f1_max, f2_min, f2_max, f3_min, f3_max
         L_pairs=20,
-        v=0.0,                  # weight for f3 (diversity): v=0 means no f3, v=1 means only f3
         verbose=True
     ):
         """
@@ -429,8 +433,22 @@ class TriobjectiveSampler(LexicographicCaseControlResampler):
         obj = (1 - v) * obj_double_facility - v * tilde_f3
         
         solver.Minimize(obj)
+        # OR-Tools wrapper time limit (ms)
+        solver.SetTimeLimit(1200000)   # 300 sec = 5 minutes
 
-        solver.SetTimeLimit(3000)
+        # SCIP internal parameters (seconds)
+        solver.SetSolverSpecificParametersAsString(r"""
+        timing/clocktype = 1
+        limits/time = 1200
+        limits/softtime = 1200
+
+        presolving/maxrounds = 0
+        presolving/maxrestarts = 0
+
+        separating/maxrounds = 0
+
+        display/verblevel = 4
+        """)
         status = solver.Solve()
 
         if verbose:
@@ -457,9 +475,10 @@ class TriobjectiveSampler(LexicographicCaseControlResampler):
         df_cases,
         df_controls,
         exclude_cols_matching,
+        results_dir,
+        w = 0.5,
+        v_values = [0.2,0.4,0.6,0.8],  # weight for f3 (diversity): v=0 means no diversity term
         final_ratio=1.0,
-        w=0.5,
-        v=0.0,                  # weight for f3 (diversity): v=0 means no diversity term
         top_k_case_ctrl=20,
         top_k_ctrl_ctrl=20,
         L_pairs=20,             # number of far pairs per control for f3
@@ -502,8 +521,8 @@ class TriobjectiveSampler(LexicographicCaseControlResampler):
         if verbose:
             print("[EXTREME POINTS] Computing f1_min, f1_max, f2_min, f2_max, f3_min, f3_max...")
 
-        ext = compute_extreme_points_double_facility(
-            solve_fn=self.solve_double_facility_raw,
+        ext = compute_extreme_points(
+            solve_fn=self.solve_triobjective_MILP_raw,
             X_cases=X_cases,
             X_controls=X_controls,
             candidate_indices=candidate_indices,
@@ -514,23 +533,36 @@ class TriobjectiveSampler(LexicographicCaseControlResampler):
         )
         if verbose:
             print("[EXTREME POINTS]: ", ext)
+        records = []  
+        for v in v_values:
+            assert v < 1.0
 
-        # ===== 4. Solve normalized objective =====
-        sol = self.solve_double_facility_normalized_MILP(
-            X_cases, X_controls, candidate_indices,
-            w=w,
-            v=v,
-            final_ratio=final_ratio,
-            top_k_case_ctrl=top_k_case_ctrl,
-            top_k_ctrl_ctrl=top_k_ctrl_ctrl,
-            L_pairs=L_pairs,
-            ext=ext,
-            verbose=verbose
-        )
-        selected = sol["selected"]
-        raw_f1, raw_f2, raw_f3 = sol["raw"]
-       
-        # ===== 5. Return training set =====
-        return pd.concat(
-            [df_cases, df_controls.iloc[selected]], ignore_index=True
-        ), {"w": w, "v": v, "f1": raw_f1, "f2": raw_f2, "f3": raw_f3}
+            print("="*40)
+            print(f" Running double-facility sampling w={w:.2f}, v={v:.2f}")
+            print("="*40)
+            # ===== 4. Solve normalized objective =====
+            sol = self.solve_triobjective_MILP(
+                X_cases, X_controls, candidate_indices,
+                w=w,
+                v=v,
+                final_ratio=final_ratio,
+                top_k_case_ctrl=top_k_case_ctrl,
+                top_k_ctrl_ctrl=top_k_ctrl_ctrl,
+                L_pairs=L_pairs,
+                ext=ext,
+                verbose=verbose
+            )
+            selected = sol["selected"]
+            raw_f1, raw_f2, raw_f3 = sol["raw"]
+            undersampled_training_data = pd.concat([df_cases, df_controls.iloc[selected]], ignore_index=True)
+
+            records.append({"w": w, "v": v, "f1": raw_f1, "f2": raw_f2, "f3": raw_f3})
+            print("Final shape at w",w, " ",undersampled_training_data.shape)
+            print(undersampled_training_data["cost_stratum_2018"].value_counts())
+            save_path = f"{results_dir}/undersampled_w_{w:.2f}_v_{v:.2f}.csv"
+            undersampled_training_data.to_csv(save_path, index=False)
+
+            print("Undersampled train data saved to", save_path)
+            
+        return pd.DataFrame(records)
+

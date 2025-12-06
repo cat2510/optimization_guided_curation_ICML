@@ -7,6 +7,10 @@ Bilevel undersampling module:
 
 Inherits from LexicographicCaseControlResampler to reuse
 all preprocessing and solver infrastructure.
+
+ADDED ALSO : 
+ - Biobjective Double Facility sampler with simple scaled objective (just 1/max(f) etc) --> for extreme point scaling see DoubleFacilitySampler
+ - Biobjective Push Pull sampler with simple scaled objective (just 1/max(f) etc)
 """
 
 import numpy as np
@@ -21,63 +25,6 @@ from balancing_functions.optimal_match_lexicographic import LexicographicCaseCon
 import time
 from tqdm import tqdm
 
-def compute_extreme_points_double_facility(
-        solve_fn,   # your MILP solver but without scaling or w
-        X_cases, X_controls, df_controls, candidate_indices,
-        top_k_case_ctrl, top_k_ctrl_ctrl, final_ratio,
-        stratified=False, verbose=True
-    ):
-    results = {}
-
-    # ---- 1) f1_min: minimize case-control distance (w=1, minimize)
-    sol = solve_fn(
-        X_cases, X_controls, df_controls, candidate_indices,
-        w=1.0, final_ratio=final_ratio,
-        top_k_case_ctrl=top_k_case_ctrl,
-        top_k_ctrl_ctrl=top_k_ctrl_ctrl,
-        stratified=stratified,
-        force_direction="min_f1",
-        verbose=verbose
-    )
-    results["f1_min"], _ = sol["raw"]
-
-    # ---- 2) f1_max: maximize case-control distance
-    sol = solve_fn(
-        X_cases, X_controls, df_controls, candidate_indices,
-        w=1.0, final_ratio=final_ratio,
-        top_k_case_ctrl=top_k_case_ctrl,
-        top_k_ctrl_ctrl=top_k_ctrl_ctrl,
-        stratified=stratified,
-        force_direction="max_f1",
-        verbose=verbose
-    )
-    results["f1_max"], _ = sol["raw"]
-
-    # ---- 3) f2_min: minimize coverage term (w=0)
-    sol = solve_fn(
-        X_cases, X_controls, df_controls, candidate_indices,
-        w=0.0, final_ratio=final_ratio,
-        top_k_case_ctrl=top_k_case_ctrl,
-        top_k_ctrl_ctrl=top_k_ctrl_ctrl,
-        stratified=stratified,
-        force_direction="min_f2",
-        verbose=verbose
-    )
-    _, results["f2_min"] = sol["raw"]
-
-    # ---- 4) f2_max: maximize coverage
-    sol = solve_fn(
-        X_cases, X_controls, df_controls, candidate_indices,
-        w=0.0, final_ratio=final_ratio,
-        top_k_case_ctrl=top_k_case_ctrl,
-        top_k_ctrl_ctrl=top_k_ctrl_ctrl,
-        stratified=stratified,
-        force_direction="max_f2",
-        verbose=verbose
-    )
-    _, results["f2_max"] = sol["raw"]
-
-    return results
 
 def evaluate_terms_case_and_coverage(P, C, NN_case, D_pn, a, NN_ctrl, D_nn, r):
     """Compute raw term_1 and term_2 under the current MILP solution."""
@@ -97,9 +44,13 @@ def evaluate_terms_case_and_coverage(P, C, NN_case, D_pn, a, NN_ctrl, D_nn, r):
 
 class BilevelResampler(LexicographicCaseControlResampler):
     """
-    Two-stage undersampling:
+    Two-stage undersampling: select_candidate_controls,select_diverse_subset,bilevel_undersample
       1) Inner: minimize distance between majority and minority sets (select K candidate negatives)
       2) Outer: maximize diversity among those K candidates (select final k subset)
+    
+    One-stage biobjective with simple scaling of cost terms (for extreme point scaling, see doublefacilitysampler .py)
+      1) Push Pull
+      2) Double Facility
     """   
     def select_candidate_controls(
         self,
@@ -270,7 +221,6 @@ class BilevelResampler(LexicographicCaseControlResampler):
         return [candidate_indices[idx] for idx in selected]
 
 
-
     def bilevel_undersample(
         self,
         df_cases: pd.DataFrame,
@@ -397,6 +347,7 @@ class BilevelResampler(LexicographicCaseControlResampler):
             K_eff = min(K_outer, len(df_sorted))
             selected = dfC.nsmallest(K_eff, "min_dist").index.tolist()
         return selected
+    
     def _topk_prune_control_to_control(self,X_C, L):
         """
         Returns list:
@@ -425,9 +376,7 @@ class BilevelResampler(LexicographicCaseControlResampler):
 
         return NN_case, D
 
-
-
-    def optimize_double_facility(
+    def optimize_double_facility_simple_scaling(
         self,
         X_cases,
         X_controls,
@@ -501,7 +450,21 @@ class BilevelResampler(LexicographicCaseControlResampler):
 
         solver.Minimize(w * term_cases_scaled - (1 - w) * term_cov_scaled)
 
-        solver.SetTimeLimit(300_000)
+        solver.SetTimeLimit(1200000)   # 300 sec = 5 minutes
+
+        # SCIP internal parameters (seconds)
+        solver.SetSolverSpecificParametersAsString(r"""
+        timing/clocktype = 1
+        limits/time = 1200
+        limits/softtime = 1200
+
+        presolving/maxrounds = 0
+        presolving/maxrestarts = 0
+
+        separating/maxrounds = 0
+
+        display/verblevel = 4
+        """)
         status = solver.Solve()
 
         if status not in (solver.OPTIMAL, solver.FEASIBLE):
@@ -527,7 +490,7 @@ class BilevelResampler(LexicographicCaseControlResampler):
         # Selected controls
         return [candidate_indices[j] for j in range(C) if s[j].solution_value() > 0.5]
 
-    def biobjective_double_facility_wrapper(
+    def double_facility_wrapper(
         self,
         df_cases,
         df_controls,
@@ -558,7 +521,7 @@ class BilevelResampler(LexicographicCaseControlResampler):
             print(f"[INNER] Selecting {K_outer} candidate controls out of {X_controls.shape[0]}")
 
         candidate_indices = self.prune_nodes_distance_stratified(
-           X_cases, X_controls, df_controls, top_k_per_case=50, stratified=stratified)
+           X_cases, X_controls, df_controls, top_k_per_case= top_k_case_ctrl,K_outer=K_outer, stratified=stratified)
         candidate_indices = list(map(int, candidate_indices))
         if verbose:
             print(f"[INNER] → Kept {len(candidate_indices)} controls")
@@ -566,7 +529,7 @@ class BilevelResampler(LexicographicCaseControlResampler):
         # ---------------------------------------------------
         # 3. OUTER PRUNING + Unified MILP
         # ---------------------------------------------------
-        selected_ctrls = self.optimize_double_facility(
+        selected_ctrls = self.optimize_double_facility_simple_scaling(
             X_cases,
             X_controls,
             df_controls,
@@ -627,7 +590,7 @@ class BilevelResampler(LexicographicCaseControlResampler):
         return pairs, D_nn
 
 
-    def optimize_push_pull(
+    def optimize_push_pull_simple_scaling(
         self,
         X_cases,
         X_controls,
@@ -757,7 +720,21 @@ class BilevelResampler(LexicographicCaseControlResampler):
             print("[MILP-Diverse] Variables:", solver.NumVariables())
             print("[MILP-Diverse] Constraints:", solver.NumConstraints())
 
-        solver.SetTimeLimit(300_000)  # 300 seconds
+        solver.SetTimeLimit(1200000)   # 300 sec = 5 minutes
+
+        # SCIP internal parameters (seconds)
+        solver.SetSolverSpecificParametersAsString(r"""
+        timing/clocktype = 1
+        limits/time = 1200
+        limits/softtime = 1200
+
+        presolving/maxrounds = 0
+        presolving/maxrestarts = 0
+
+        separating/maxrounds = 0
+
+        display/verblevel = 4
+        """)
         status = solver.Solve()
 
         if status not in (solver.OPTIMAL, solver.FEASIBLE):
@@ -815,13 +792,13 @@ class BilevelResampler(LexicographicCaseControlResampler):
             print(f"[INNER] Selecting {K_outer} candidate controls out of {X_controls.shape[0]}")
 
         candidate_indices = self.prune_nodes_distance_stratified(
-           X_cases, X_controls, df_controls,top_k_per_case=50, stratified=stratified
+           X_cases, X_controls, df_controls,top_k_per_case=top_k_case_ctrl, K_outer = K_outer, stratified=stratified
 )
         candidate_indices = list(map(int, candidate_indices))
         if verbose:
             print(f"[INNER] → Kept {len(candidate_indices)} controls")
 
-        selected_ctrls = self.optimize_push_pull(
+        selected_ctrls = self.optimize_push_pull_simple_scaling(
             X_cases,
             X_controls,
             df_controls,

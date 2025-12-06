@@ -1,17 +1,10 @@
 # -----------------------------------------------------------------------------
-# IAI OPTIMAL CLASSIFICATION TREES INTEGRATION
-# -----------------------------------------------------------------------------
-# Add to your existing model_pipeline.py file
-# -----------------------------------------------------------------------------
-
+# IAI OPTIMAL CLASSIFICATION TREES 
+import numpy as np
 import pandas as pd
-try:
-    from interpretableai import iai
-    IAI_AVAILABLE = True
-except ImportError:
-    print("Warning: interpretableai not installed. IAI models will not be available.")
-    IAI_AVAILABLE = False
-from sklearn.metrics import classification_report, confusion_matrix
+from interpretableai import iai
+import itertools
+from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score, precision_recall_curve, confusion_matrix
 from model_pipeline import get_preprocessor, train_test_split_enrol
 
 def train_opt_with_feature_names(X_train, treatments, outcomes,
@@ -130,9 +123,6 @@ def train_oct_with_feature_names(X_train, y_train,
     return iai_model, preprocessor, feature_names
 
 
-import itertools
-from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score, precision_recall_curve
-
 def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
                  depths=[5, 7,9],
                  minbuckets=[50, 100,150],
@@ -205,55 +195,87 @@ def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
 
     return best_model, best_params, results_df,preprocessor, feature_names
 
-def evaluate_binary_oct(iai_model, X_test_df, y_test, preprocessor, feature_names):
 
+
+def evaluate_binary_oct(
+    iai_model,
+    X_test_df,
+    y_test,
+    preprocessor,
+    feature_names,
+    compute_leaf_metrics=False
+):
     print(f"Test dataset for OCT application: {len(X_test_df):,} samples")
 
+    # ------------------------------------------------------------
+    # Preprocessing + OCT Predictions
+    # ------------------------------------------------------------
     try:
-        # Transform using preprocessor
         X_test_processed = preprocessor.transform(X_test_df)
         X_test_processed = pd.DataFrame(X_test_processed, columns=feature_names)
 
-        # Predictions
-        y_pred = iai_model.predict(X_test_processed)
+        # Base predictions from OCT
+        y_pred_default = iai_model.predict(X_test_processed)
         y_proba = iai_model.predict_proba(X_test_processed).iloc[:, 1]
 
-        X_test_processed['predicted_proba'] = y_proba
+        X_test_processed["predicted_proba"] = y_proba
         leaf_assignments = iai_model.apply(X_test_processed)
-        print(f"✓ Predictions completed")
+
+        print("✓ Predictions completed")
 
     except Exception as e:
         print(f"✗ Error applying OCT: {e}")
         raise e
 
-    X_test_processed['leaf_assignment'] = leaf_assignments
-    X_test_processed['predicted_cost_stratum'] = y_pred
+    X_test_processed["leaf_assignment"] = leaf_assignments
+    X_test_processed["predicted_cost_stratum_default"] = y_pred_default
 
-    # Align y_test
     y_test_series = pd.Series(y_test).reset_index(drop=True)
 
-    # --- Metrics ---
-    auc = iai_model.score(X_test_processed, y_test_series, criterion='auc')
-
-    tn, fp, fn, tp = confusion_matrix(y_test_series, y_pred).ravel()
-    sensitivity = tp / (tp + fn) if (tp + fn) else 0.0
-    specificity = tn / (tn + fp) if (tn + fp) else 0.0
+    # ------------------------------------------------------------
+    # AUC metrics (threshold-free)
+    # ------------------------------------------------------------
+    auc = iai_model.score(X_test_processed, y_test_series, criterion="auc")
     pr_auc = average_precision_score(y_test_series, y_proba)
 
+    # ------------------------------------------------------------
+    # F1-optimal thresholding
+    # ------------------------------------------------------------
+    precision_curve, recall_curve, thresholds = precision_recall_curve(y_test_series, y_proba)
+    f1_scores = 2 * precision_curve * recall_curve / (precision_curve + recall_curve + 1e-10)
+
+    best_idx = np.argmax(f1_scores)
+    best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
+
+    y_pred_opt = (y_proba >= best_threshold).astype(int)
+
+    # Confusion matrix for optimized threshold
+    tn, fp, fn, tp = confusion_matrix(y_test_series, y_pred_opt).ravel()
+
+    sensitivity = tp / (tp + fn) if (tp + fn) else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) else 0.0
+
     print(f"AUC score: {auc:.3f}")
+    print(f"PR-AUC (Average Precision): {pr_auc:.3f}")
+    print(f"Optimal-threshold F1: {f1_scores[best_idx]:.3f} at threshold={best_threshold:.3f}")
     print(f"Sensitivity (Recall): {sensitivity:.3f}")
     print(f"Specificity: {specificity:.3f}")
-    print("Confusion Matrix:\n", confusion_matrix(y_test_series, y_pred))
-    print(f"PR-AUC (Average Precision): {pr_auc:.3f}")
+    print("Confusion Matrix:\n", confusion_matrix(y_test_series, y_pred_opt))
+    print("Number of leaves:", len(pd.unique(leaf_assignments)))
 
-    # --- Per-leaf performance ---
+    # ------------------------------------------------------------
+    # Optional: Per-leaf performance (using optimized predictions)
+    # ------------------------------------------------------------
     leaf_metrics_df = None
-    try:
+    if compute_leaf_metrics:
         rows = []
-        for leaf_id, idxs in X_test_processed.groupby('leaf_assignment').groups.items():
+        y_pred_series_opt = pd.Series(y_pred_opt)
+
+        for leaf_id, idxs in X_test_processed.groupby("leaf_assignment").groups.items():
             idxs = list(idxs)
+
             y_true_leaf = y_test_series.iloc[idxs]
-            y_pred_leaf = pd.Series(y_pred).iloc[idxs]
+            y_pred_leaf = y_pred_series_opt.iloc[idxs]
 
             tp_l = int(((y_true_leaf == 1) & (y_pred_leaf == 1)).sum())
             tn_l = int(((y_true_leaf == 0) & (y_pred_leaf == 0)).sum())
@@ -279,22 +301,22 @@ def evaluate_binary_oct(iai_model, X_test_df, y_test, preprocessor, feature_name
         print("Per-leaf metrics (top 10):")
         print(leaf_metrics_df.head(10))
 
-    except Exception as _:  # keep things robust
-        print("⚠️ Per-leaf metric computation failed")
-
-    # --- Return dictionary ---
+    # ------------------------------------------------------------
+    # Return dictionary for logging
+    # ------------------------------------------------------------
     return {
         "auc": auc,
         "pr_auc": pr_auc,
+        "optimal_threshold": best_threshold,
+        "optimal_f1": f1_scores[best_idx],
         "sensitivity": sensitivity,
         "specificity": specificity,
         "tp": tp,
         "fp": fp,
         "fn": fn,
         "tn": tn,
-        "leaf_metrics": leaf_metrics_df,
+        "leaf_metrics": leaf_metrics_df if compute_leaf_metrics else None,
     }
-
 
 def train_and_evaluate_for_w(
     matched_df, 

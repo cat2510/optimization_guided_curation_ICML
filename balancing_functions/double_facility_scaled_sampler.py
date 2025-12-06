@@ -37,7 +37,8 @@ def compute_extreme_points_double_facility(
         force_direction="min_f1",
     )
     results["f1_min"], _ = sol["raw"]
-
+    print("Solved for F1 min")
+  
     # ---- 2) f1_max: maximize case-control distance
     sol = solve_fn(
         X_cases, X_controls, candidate_indices,
@@ -47,6 +48,7 @@ def compute_extreme_points_double_facility(
         force_direction="max_f1",
     )
     results["f1_max"], _ = sol["raw"]
+    print("Solved for F1 max")
 
     # ---- 3) f2_min: minimize coverage term (w=0)
     sol = solve_fn(
@@ -56,6 +58,7 @@ def compute_extreme_points_double_facility(
         force_direction="min_f2",
     )
     _, results["f2_min"] = sol["raw"]
+    print("Solved for F2 min")
 
     # ---- 4) f2_max: maximize coverage
     sol = solve_fn(
@@ -66,6 +69,7 @@ def compute_extreme_points_double_facility(
         force_direction="max_f2",
     )
     _, results["f2_max"] = sol["raw"]
+    print("Solved for F2 max")
 
     return results
 
@@ -342,9 +346,9 @@ class DoubleFacilitySampler(LexicographicCaseControlResampler):
         S_nn = np.exp(-D_nn / sigma)
 
         # --- Build MILP ---
-        solver = pywraplp.Solver.CreateSolver("SCIP")
+        solver = pywraplp.Solver.CreateSolver("CLP") # RELAXED VERSION TO SPEED UP
 
-        s = [solver.BoolVar(f"s[{j}]") for j in range(C)]
+        s = [solver.NumVar(0,1,f"s[{j}]") for j in range(C)]# RELAXED VERSION TO SPEED UP
         a = [{j: solver.NumVar(0,1,f"a[{i},{j}]") for j in NN_case[i]} for i in range(P)]
         r = [{j: solver.NumVar(0,1,f"r[{c},{j}]") for j in NN_ctrl[c]} for c in range(C)]
 
@@ -377,7 +381,9 @@ class DoubleFacilitySampler(LexicographicCaseControlResampler):
             raise ValueError("force_direction must be in {min_f1, max_f1, min_f2, max_f2}")
 
         solver.Minimize(obj)
-        solver.SetTimeLimit(3000)
+        solver.SetTimeLimit(1200000)   # 300 sec = 5 minutes 
+
+        
         solver.Solve()
 
         # --- Evaluate raw f1,f2 (using fixed helper) ---
@@ -387,13 +393,13 @@ class DoubleFacilitySampler(LexicographicCaseControlResampler):
             NN_ctrl, S_nn, r
         )
 
-        selected = [
-            candidate_indices[j] for j in range(C)
-            if s[j].solution_value() > 0.5
-        ]
+        #selected = [
+       #     candidate_indices[j] for j in range(C)
+       #     if s[j].solution_value() > 0.5
+       # ]
 
         return {
-            "selected": selected,
+            #"selected": selected,
             "raw": (raw_f1, raw_f2)
         }
 
@@ -445,8 +451,10 @@ class DoubleFacilitySampler(LexicographicCaseControlResampler):
         solver = pywraplp.Solver.CreateSolver("SCIP")
 
         s = [solver.BoolVar(f"s[{j}]") for j in range(C)]
-        a = [{j: solver.NumVar(0,1,f"a[{i},{j}]") for j in NN_case[i]} for i in range(P)]
-        r = [{j: solver.NumVar(0,1,f"r[{c},{j}]") for j in NN_ctrl[c]} for c in range(C)]
+        #a = [{j: solver.NumVar(0,1,f"a[{i},{j}]") for j in NN_case[i]} for i in range(P)]
+        #r = [{j: solver.NumVar(0,1,f"r[{c},{j}]") for j in NN_ctrl[c]} for c in range(C)]
+        a = [{j: solver.BoolVar(f"a[{i},{j}]") for j in NN_case[i]} for i in range(P)]
+        r = [{j: solver.BoolVar(f"r[{c},{j}]") for j in NN_ctrl[c]} for c in range(C)]
 
         solver.Add(sum(s) == k)
 
@@ -473,15 +481,38 @@ class DoubleFacilitySampler(LexicographicCaseControlResampler):
         tilde_f2 = (f2 - f2_min) / range_f2
 
         obj = w * tilde_f1 - (1 - w) * tilde_f2
+        # NEW: Add "tie-break" as Secondary objective: among all equivalent ones, pick the lexicographically smallest subset of controls.
+        if final_ratio==1.0:
+            print("Added tie break term into objective...")
+            epsilon = 1e-4 / C
+            tie_break = solver.Sum(j * s[j] for j in range(C))
+            obj += epsilon * tie_break
+
         solver.Minimize(obj)
 
-        solver.SetTimeLimit(3000)
+                # OR-Tools wrapper time limit (ms)
+        solver.SetTimeLimit(2400000)   # 40 min
+
+        # SCIP internal parameters (seconds)
+        solver.SetSolverSpecificParametersAsString(r"""
+        timing/clocktype = 1
+        limits/time = 2400
+        limits/softtime = 2400
+        display/verblevel = 5
+        display/freq = 1
+        """)
+        #presolving/maxrounds = 0
+        #presolving/maxrestarts = 0
+
+        #separating/maxrounds = 0
         status = solver.Solve()
 
         if verbose:
             print("Solve status:", status)
             print("Normalized objective =", solver.Objective().Value())
 
+        if status not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
+            raise RuntimeError(f"Solve failed with status {status}")
         # ----------------------------------------------------------
         # Return selected controls *and* f1,f2
         # ----------------------------------------------------------
@@ -500,13 +531,14 @@ class DoubleFacilitySampler(LexicographicCaseControlResampler):
         df_cases,
         df_controls,
         exclude_cols_matching,
+        w_range,
+        results_dir = None,
         final_ratio=1.0,
-        w=0.5,
         top_k_case_ctrl=20,
         top_k_ctrl_ctrl=20,
         K_factor=3.0,
         stratified=False,
-        verbose=True
+        verbose=True,
     ):
         # ===== 1. Preprocess =====
         X_cases, X_controls = self.get_preprocessed_control_case_features(
@@ -522,7 +554,7 @@ class DoubleFacilitySampler(LexicographicCaseControlResampler):
 
         candidate_indices = self.prune_nodes_distance_stratified(
             X_cases, X_controls, df_controls,
-            top_k_per_case=50,         
+            top_k_per_case=top_k_case_ctrl,         
             K_outer=K_outer,
             stratified=stratified
         )
@@ -546,21 +578,34 @@ class DoubleFacilitySampler(LexicographicCaseControlResampler):
         )
         if verbose:
             print("[EXTREME POINTS]: ", ext)
+            
+        records = []  
+        
+        for w in w_range:
+            print("="*40)
+            print(f" Running double-facility sampling w={w:.2f}")
+            print("="*40)
+            # ===== 4. Solve normalized objective =====
+            sol = self.solve_double_facility_normalized_MILP(
+                X_cases, X_controls, candidate_indices,
+                w=w,
+                final_ratio=final_ratio,
+                top_k_case_ctrl=top_k_case_ctrl,
+                top_k_ctrl_ctrl=top_k_ctrl_ctrl,
+                ext=ext,
+                verbose=verbose
+            )
+            selected = sol["selected"]
+            raw_f1, raw_f2 = sol["raw"]
+            undersampled_training_data = pd.concat([df_cases, df_controls.iloc[selected]], ignore_index=True)
 
-        # ===== 4. Solve normalized objective =====
-        sol = self.solve_double_facility_normalized_MILP(
-            X_cases, X_controls, candidate_indices,
-            w=w,
-            final_ratio=final_ratio,
-            top_k_case_ctrl=top_k_case_ctrl,
-            top_k_ctrl_ctrl=top_k_ctrl_ctrl,
-            ext=ext,
-            verbose=verbose
-        )
-        selected = sol["selected"]
-        raw_f1, raw_f2 = sol["raw"]
-       
-        # ===== 5. Return training set =====
-        return pd.concat(
-            [df_cases, df_controls.iloc[selected]], ignore_index=True
-        ), {"w": w, "f1": raw_f1, "f2": raw_f2}
+            records.append({"w": w, "f1": raw_f1, "f2": raw_f2})
+            print("Final shape at w",w, " ",undersampled_training_data.shape)
+            print(undersampled_training_data["cost_stratum_2018"].value_counts())
+            if results_dir:
+                save_path = f"{results_dir}/undersampled_w_{w:.2f}.csv"
+                undersampled_training_data.to_csv(save_path, index=False)
+                print("Undersampled train data saved to", save_path)
+            else:
+                return undersampled_training_data,pd.DataFrame(records)
+        return pd.DataFrame(records)
