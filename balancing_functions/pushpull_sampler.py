@@ -1,16 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Bilevel undersampling module:
- - Inner problem: distance-based selection (p-median style)
- - Outer problem: diversity maximization (facility-location)
-
-Inherits from LexicographicCaseControlResampler to reuse
-all preprocessing and solver infrastructure.
-
-ADDED ALSO : 
- - Biobjective Double Facility sampler with simple scaled objective (just 1/max(f) etc) --> for extreme point scaling see DoubleFacilitySampler
- - Biobjective Push Pull sampler with simple scaled objective (just 1/max(f) etc)
+Multiobjective Push Pull sampler with extreme-point scaled objective (f(x)-f_min/f_max-f_min)
 """
 
 import numpy as np
@@ -19,13 +10,12 @@ from tqdm import trange
 from scipy.spatial.distance import cdist
 from ortools.linear_solver import pywraplp
 from sklearn.metrics import pairwise_distances
-
 # import parent class
 from balancing_functions.optimal_match_lexicographic import LexicographicCaseControlResampler
 import time
 from tqdm import tqdm
 
-
+# TODO: come up with a test to quantify coverage in terms of volume + feature space
 def evaluate_terms_case_and_coverage(P, C, NN_case, D_pn, a, NN_ctrl, D_nn, r):
     """Compute raw term_1 and term_2 under the current MILP solution."""
     # Case–control term
@@ -47,7 +37,7 @@ class PushPullSampler(LexicographicCaseControlResampler):
     One-stage multi-objective with extreme point scaling of cost terms 
     """   
 
-    def prune_nodes_distance_stratified(
+    def prune_nodes_distance(
         self, 
         X_cases, 
         X_controls, 
@@ -56,11 +46,7 @@ class PushPullSampler(LexicographicCaseControlResampler):
         K_outer=2000,
         stratified=False,       # <-- NEW flag
     ):
-        """
-        Distance-based node pruning.
-        If stratified=True, we preserve approximate global proportions of strata.
-        If stratified=False, we return the K_outer closest nodes overall.
-        """
+       
         # ---- Step 1: Case→Control expansion (top-k per case) ----
         D = cdist(X_cases, X_controls)
         nearest = np.argpartition(D, top_k_per_case, axis=1)[:, :top_k_per_case]
@@ -206,9 +192,11 @@ class PushPullSampler(LexicographicCaseControlResampler):
 
         # Nearest neighbors: case → control
         NN_case, D_pn = self._topk_prune_case_to_control(X_cases, X_C, top_k_case_ctrl)
-
         # Farthest pairs: control ↔ control
         pairs, D_nn = self._topk_farthest_control_pairs(X_C, L_pairs=L_pairs, verbose=verbose)
+        if verbose:
+            print(f"[EDGE PRUNING] → Each case ({np.array(NN_case).shape[0]} cases) has {np.array(NN_case).shape[1]} control candidates")
+            print(f"[EDGE PRUNING] → Kept {np.array(pairs).shape} control-control pairs")
 
         # Build SCIP model
         solver = pywraplp.Solver.CreateSolver("SCIP")
@@ -217,13 +205,21 @@ class PushPullSampler(LexicographicCaseControlResampler):
         s = [solver.BoolVar(f"s[{j}]") for j in range(C)]
 
         # Assignment (binary recommended)
-        a = [
+        """a = [
             { j: solver.BoolVar(f"a[{i},{j}]") for j in NN_case[i] }
             for i in range(P)
         ]
 
         # Diversity var
         z = { (j,k): solver.BoolVar(f"z[{j},{k}]") for (j,k) in pairs }
+        """
+        a = [
+            {j: solver.NumVar(0, 1, f"a[{i},{j}]") for j in NN_case[i]}
+            for i in range(P)
+        ]
+
+        # Pairwise co-selection vars: z[(j,k)] ∈ [0,1]
+        z = { (j,k): solver.NumVar(0, 1, f"z[{j},{k}]") for (j,k) in pairs }
 
         # Constraints
         solver.Add(sum(s) == k)
@@ -242,6 +238,9 @@ class PushPullSampler(LexicographicCaseControlResampler):
         f2 = solver.Sum(D_nn[j,k] * z[(j,k)] for (j,k) in pairs)
 
         # --- Objective selection ---
+        if verbose:
+            print("Solving for ", objective_mode)
+
         if objective_mode == "f1min":
             solver.Minimize(f1)
 
@@ -255,6 +254,7 @@ class PushPullSampler(LexicographicCaseControlResampler):
             solver.Maximize(f2)
 
         elif objective_mode == "weighted":
+            
             assert ext is not None, "ext must be provided for weighted objective"
             f1_min, f1_max = ext["f1_min"], ext["f1_max"]
             f2_min, f2_max = ext["f2_min"], ext["f2_max"]
@@ -288,16 +288,33 @@ class PushPullSampler(LexicographicCaseControlResampler):
             raise RuntimeError(f"Unified Diverse MILP failed with status {status}")
 
         if return_only_objective:
+            if verbose:
+                print(f"  Computed {objective_mode} objective = {solver.Objective().Value():.4f}")
             return float(solver.Objective().Value())
 
         selected = [candidate_indices[j] for j in range(C) if s[j].solution_value() > 0.5]
+        f1_val = sum(D_pn[i, j] * a[i][j].solution_value()
+             for i in range(P)
+             for j in NN_case[i])
+
+        f2_val = sum(D_nn[j, k] * z[(j, k)].solution_value()
+                    for (j, k) in pairs)
+
+        if verbose:
+            print("[Optimal cost decomposition]")
+            print(f"  distance min-maj   = {f1_val:.4f}")
+            print(f"  distance maj-maj   = {f2_val:.4f}")
+            print(f"  weighted objective = {solver.Objective().Value():.4f}")
+ 
 
         return {
             "selected": selected,
-            "f1": float(solver.Value(f1)),
-            "f2": float(solver.Value(f2)),
+            "f1": float(f1_val),
+            "f2": float(f2_val),
             "status": int(status),
         }
+        
+
 
     def compute_pushpull_extreme_points(
         self, X_cases, X_controls, candidate_indices,
@@ -357,144 +374,6 @@ class PushPullSampler(LexicographicCaseControlResampler):
             "f2_max": float(f2_max),
         }
 
-    def solve_pushpull_normalized_MILP(
-        self,
-        X_cases,
-        X_controls,
-        candidate_indices,
-        ext,                # dict with f1_min, f1_max, f2_min, f2_max
-        final_ratio: float,
-        w: float = 0.5,
-        top_k_case_ctrl: int = 20,
-        L_pairs: int = 20,
-        verbose: bool = True,
-    ):
-        """
-        Unified MILP with:
-        - Term 1: case→control distance (closeness)
-        - Term 2: pairwise control–control distance (diversity / dispersion)
-
-        We select k = final_ratio * P controls from candidate_indices.
-        """
-        from ortools.linear_solver import pywraplp
-                # Unpack normalization constants
-        f1_min, f1_max = ext["f1_min"], ext["f1_max"]
-        f2_min, f2_max = ext["f2_min"], ext["f2_max"]
-        range_f1 = max(f1_max - f1_min, 1e-8)
-        range_f2 = max(f2_max - f2_min, 1e-8)
-
-
-        # Restrict controls to candidate pool
-        X_C = X_controls[candidate_indices]
-        P = X_cases.shape[0]
-        C = len(candidate_indices)
-
-        # Number of controls to select
-        k = int(np.clip(final_ratio * P, 1, C))
-        if verbose:
-            print(f"[Unified-Diverse] P={P}, C={C}, final_ratio={final_ratio} → k={k} controls")
-
-        # --- Case→Control: nearest neighbors for assignment a[i,j] ---
-        NN_case, D_pn = self._topk_prune_case_to_control(
-            X_cases, X_C, top_k_case_ctrl
-        )  # D_pn shape (P, C_eff == C)
-
-        # --- Control→Control: farthest pairs for z[j,k] ---
-        pairs, D_nn = self._topk_farthest_control_pairs(
-            X_C, L_pairs=L_pairs, verbose=verbose
-        )
-
-        # Build solver
-        solver = pywraplp.Solver.CreateSolver("SCIP")
-
-        # Selection vars: s[j] ∈ {0,1}
-        s = [solver.BoolVar(f"s[{j}]") for j in range(C)]
-
-        # Case assignment vars: a[i][j] ∈ [0,1] only for j in NN_case[i]
-        # Use BoolVar for tight relaxation (as you just discovered)
-        a = [{j: solver.BoolVar(f"a[{i},{j}]") for j in NN_case[i]} for i in range(P)]
-
-        # Pairwise co-selection vars: z[(j,k)] ∈ [0,1]
-        z = { (j,k): solver.BoolVar(f"z[{j},{k}]") for (j,k) in pairs }
-
-        # --- Constraints ---
-
-        # Total selected controls
-        solver.Add(sum(s) == k)
-
-        # Case coverage: each case assigned to exactly one selected control
-        for i in range(P):
-            solver.Add(sum(a[i][j] for j in NN_case[i]) == 1)
-            for j in NN_case[i]:
-                solver.Add(a[i][j] <= s[j])
-
-        # Pairwise linkage: z[j,k] ≤ s[j], z[j,k] ≤ s[k]
-        for (j, k), z_var in z.items():
-            solver.Add(z_var <= s[j])
-            solver.Add(z_var <= s[k])
-
-       
-        # Raw objectives:
-        f1 = solver.Sum(D_pn[i,j] * a[i][j] 
-                        for i in range(P) for j in NN_case[i])
-        f2 = solver.Sum(D_nn[j, k] * z[(j, k)] for (j, k) in pairs)
-
-
-        # Normalized objectives
-        tilde_f1 = (f1 - f1_min) / range_f1
-        tilde_f2 = (f2 - f2_min) / range_f2
-
-        obj = w * tilde_f1 + (1 - w) * tilde_f2
-        solver.Minimize(obj)
-
-
-
-        if verbose:
-            print("[MILP-Diverse] Variables:", solver.NumVariables())
-            print("[MILP-Diverse] Constraints:", solver.NumConstraints())
-
-        solver.SetTimeLimit(1200000)   # 300 sec = 5 minutes
-
-        # SCIP internal parameters (seconds)
-        solver.SetSolverSpecificParametersAsString(r"""
-        timing/clocktype = 1
-        limits/time = 1200
-        limits/softtime = 1200
-        display/verblevel = 4
-        """)
-        status = solver.Solve()
-
-        if status not in (solver.OPTIMAL, solver.FEASIBLE):
-            raise RuntimeError(f"Unified Diverse MILP failed with status {status}")
-
-        if verbose:
-            # ---- CASE TERM ----
-            raw_cases = 0.0
-            for i in range(P):
-                for j in NN_case[i]:
-                    raw_cases += D_pn[i, j] * a[i][j].solution_value()
-
-            # ---- DISPERSION TERM ----
-            raw_disp = 0.0
-            for (j, k) in pairs:
-                raw_disp += D_nn[j, k] * z[(j, k)].solution_value()
-
-            print("[Objective decomposition]")
-            print(f"  term_cases_raw    = {raw_cases:.4f}")
-            print(f"  term_disp_raw     = {raw_disp:.4f}")
-            print(f"  weighted_obj      = {solver.Objective().Value():.4f}")
-                # Return selected controls (candidate_indices indexing)
-        selected_controls = [
-            candidate_indices[j] for j in range(C) if s[j].solution_value() > 0.5
-        ]
-
-        return {
-                "selected": selected_controls,
-                "raw_objectives": {
-                    "f1": float(solver.Value(f1)),
-                    "f2": float(solver.Value(f2)),
-                }
-            }
 
     def solve_pushpull_normalized_MILP(
         self,
@@ -527,14 +406,14 @@ class PushPullSampler(LexicographicCaseControlResampler):
         K_outer = int(K_factor * P)
         K_outer = min(K_outer, X_controls.shape[0])
         if verbose:
-            print(f"[INNER] Selecting {K_outer} candidate controls out of {X_controls.shape[0]}")
+            print(f"[K_factor * |minority|] Node pruning {K_outer} candidate controls out of {X_controls.shape[0]}")
 
         candidate_indices = self.prune_nodes_distance(
            X_cases, X_controls, df_controls,top_k_per_case=top_k_case_ctrl, K_outer = K_outer
 )
         candidate_indices = list(map(int, candidate_indices))
         if verbose:
-            print(f"[INNER] → Kept {len(candidate_indices)} controls")
+            print(f"[NODE PRUNING] → Kept {len(candidate_indices)} controls")
 
         ext = self.compute_pushpull_extreme_points(
             X_cases, X_controls, candidate_indices,
@@ -561,5 +440,6 @@ class PushPullSampler(LexicographicCaseControlResampler):
             [df_cases, df_controls.iloc[selected_ctrls]],
             ignore_index=True
         )
+        
 
         return undersampled, result, ext

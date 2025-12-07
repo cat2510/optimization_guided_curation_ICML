@@ -4,8 +4,10 @@ import numpy as np
 import pandas as pd
 from interpretableai import iai
 import itertools
-from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score, precision_recall_curve, confusion_matrix
+from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score, precision_recall_curve, confusion_matrix, brier_score_loss
 from model_pipeline import get_preprocessor, train_test_split_enrol
+from sklearn.calibration import calibration_curve
+import matplotlib.pyplot as plt
 
 def train_opt_with_feature_names(X_train, treatments, outcomes,
                                  categorical_cols, numeric_cols,
@@ -203,7 +205,9 @@ def evaluate_binary_oct(
     y_test,
     preprocessor,
     feature_names,
-    compute_leaf_metrics=False
+    compute_leaf_metrics=False,
+    results_dir=None,              # ← NEW: where to save predictions
+    ratio=None                     # ← NEW: to encode file name
 ):
     print(f"Test dataset for OCT application: {len(X_test_df):,} samples")
 
@@ -219,6 +223,7 @@ def evaluate_binary_oct(
         y_proba = iai_model.predict_proba(X_test_processed).iloc[:, 1]
 
         X_test_processed["predicted_proba"] = y_proba
+        X_test_processed["predicted_class_default"] = y_pred_default
         leaf_assignments = iai_model.apply(X_test_processed)
 
         print("✓ Predictions completed")
@@ -248,19 +253,28 @@ def evaluate_binary_oct(
     best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
 
     y_pred_opt = (y_proba >= best_threshold).astype(int)
-
+    X_test_processed["predicted_class_optf1"] = y_pred_opt
+    # ------------------------------------------------------------
+    # **WRITE OUT PREDICTIONS TO DISK**
+    # ------------------------------------------------------------
+    if results_dir is not None:
+        pred_path = f"{results_dir}/oct_predictions_ratio_{ratio:.2f}.csv"
+        X_test_processed.to_csv(pred_path, index=False)       # ← NEW OUTPUT FILE
+        print(f"✓ Saved OCT predictions to: {pred_path}")
     # Confusion matrix for optimized threshold
     tn, fp, fn, tp = confusion_matrix(y_test_series, y_pred_opt).ravel()
-
     sensitivity = tp / (tp + fn) if (tp + fn) else 0.0
     specificity = tn / (tn + fp) if (tn + fp) else 0.0
-
+    tn, fp, fn, tp = confusion_matrix(y_test_series, y_pred_default).ravel()
+    sensitivity_default = tp / (tp + fn) if (tp + fn) else 0.0
+    specificity_default = tn / (tn + fp) if (tn + fp) else 0.0
+    
     print(f"AUC score: {auc:.3f}")
     print(f"PR-AUC (Average Precision): {pr_auc:.3f}")
-    print(f"Optimal-threshold F1: {f1_scores[best_idx]:.3f} at threshold={best_threshold:.3f}")
     print(f"Sensitivity (Recall): {sensitivity:.3f}")
     print(f"Specificity: {specificity:.3f}")
-    print("Confusion Matrix:\n", confusion_matrix(y_test_series, y_pred_opt))
+    print(f"Sensitivity (default): {sensitivity_default:.3f}")
+    print(f"Specificity (default): {specificity_default:.3f}")
     print("Number of leaves:", len(pd.unique(leaf_assignments)))
 
     # ------------------------------------------------------------
@@ -311,95 +325,153 @@ def evaluate_binary_oct(
         "optimal_f1": f1_scores[best_idx],
         "sensitivity": sensitivity,
         "specificity": specificity,
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "tn": tn,
+        "sensitivity_default": sensitivity_default,
+        "specificity_default": specificity_default,
         "leaf_metrics": leaf_metrics_df if compute_leaf_metrics else None,
     }
 
-def train_and_evaluate_for_w(
-    matched_df, 
-    X_val, y_val,
-    X_test,
-    y_test,
-    feature_cols,
-    target_col='highcost_gt_200000',
-    categorical_cols=None,
-    numeric_cols=None,
-    minbuckets=[50, 100, 120, 150],
-    cps=[0.00001, 5e-4, 0.0001, 5e-3, 0.001, 0.01],
-    depths=[5, 7, 9],
-    verbose=True
-):
-    """ DANGEROUS: X_val should be from imbalanced data not balanced!!
-    
-    # Split matched data
-    _, _, train_df, val_df = train_test_split_enrol(
-        matched_df, 
-        target_col="cost_stratum_2018", # TODO: change to cost_stratum_2018
-        test_size=0.3,
-        verbose=False
-    )
-    
-    X_train = train_df[feature_cols]
-    y_train = train_df[target_col]
-    X_val = val_df[feature_cols]
-    y_val = val_df[target_col]"""
-    X_train = matched_df[feature_cols]
-    y_train = matched_df[target_col]
-    if verbose:
-        print(f"Training: {len(X_train):,}, Validation: {len(X_val):,}")
-    
-    # Train model
-    model, best_params, val_results, preprocessor, feature_names = finetune_oct(
-        X_train, y_train, X_val, y_val,
-        categorical_cols=categorical_cols,
-        numeric_cols=numeric_cols,
-        depths=depths,
-        minbuckets=minbuckets,
-        cps=cps
-    )
-    
-    if verbose:
-        print(f"Best params: {best_params}")
-    
-    # Evaluate on test using YOUR function
-    X_test_processed = evaluate_binary_oct(
-        model, X_test, y_test, 
-        preprocessor, feature_names
-    )
-    
-    # Extract metrics from the evaluation output
-    y_pred = X_test_processed['predicted_cost_stratum']
-    
-    # Calculate metrics
-    cm = confusion_matrix(y_test, y_pred)
-    tn, fp, fn, tp = cm.ravel()
-    
-    recall = tp / (tp + fn)  # Sensitivity
-    specificity = tn / (tn + fp)
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-    accuracy = (tp + tn) / (tp + tn + fp + fn)
-    
-    # AUC (get from model score)
-    auc = model.score(X_test_processed.drop(columns=['leaf_assignment', 'predicted_cost_stratum', 'predicted_proba'], errors='ignore'), 
-                      y_test, criterion='auc')
-    
-    return {
-        'model': model,
-        'preprocessor': preprocessor,
-        'feature_names': feature_names,
-        'X_test_processed': X_test_processed,
-        'auc': auc,
-        'recall': recall,
-        'specificity': specificity,
-        'precision': precision,
-        'f1': f1,
-        'accuracy': accuracy,
-        'confusion_matrix': cm,
-        'train_size': len(X_train),
-        'val_size': len(X_val)
-    }
 
+# -------------------------------
+# Expected Calibration Error (ECE)
+# -------------------------------
+def expected_calibration_error(y_true, y_prob, n_bins=10):
+    bins = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        mask = (y_prob >= bins[i]) & (y_prob < bins[i + 1])
+        if mask.sum() == 0:
+            continue
+        avg_conf = y_prob[mask].mean()
+        avg_acc = y_true[mask].mean()
+        ece += np.abs(avg_conf - avg_acc) * (mask.sum() / len(y_prob))
+    return ece
+
+
+# ------------------------------------------------------------
+# Find threshold satisfying constraints (precision/recall)
+# ------------------------------------------------------------
+def find_feasible_threshold(y_true, y_prob, min_precision=0.8, min_recall=0.8):
+    precision_curve, recall_curve, thresholds = precision_recall_curve(y_true, y_prob)
+
+    valid = []
+    # thresholds has len-1 relative to precision/recall curves
+    thr_padded = list(thresholds) + [thresholds[-1]]
+
+    for p, r, t in zip(precision_curve, recall_curve, thr_padded):
+        if p >= min_precision and r >= min_recall:
+            valid.append((t, p, r))
+
+    if len(valid) == 0:
+        return None
+
+    # choose maximum F1 in feasible region
+    best = max(valid, key=lambda x: 2 * x[1] * x[2] / (x[1] + x[2] + 1e-12))
+    return {"threshold": best[0], "precision": best[1], "recall": best[2]}
+
+
+# ============================================================
+#                 MAIN EVALUATION FUNCTION
+# ============================================================
+def evaluate_binary_oct_calibration(
+    iai_model,
+    X_test_df,
+    y_test,
+    preprocessor,
+    feature_names,
+    compute_leaf_metrics=False,
+    constraint_precision=0.8,
+    constraint_recall=0.8,
+    plot_calibration=True
+):
+    print(f"Test dataset for OCT application: {len(X_test_df):,} samples")
+
+    # ------------------------------------------------------------
+    # Preprocessing + OCT Predictions
+    # ------------------------------------------------------------
+    X_test_processed = preprocessor.transform(X_test_df)
+    X_test_processed = pd.DataFrame(X_test_processed, columns=feature_names)
+
+    y_pred_default = iai_model.predict(X_test_processed)
+    y_proba = iai_model.predict_proba(X_test_processed).iloc[:, 1]
+
+    X_test_processed["predicted_proba"] = y_proba
+    leaf_assignments = iai_model.apply(X_test_processed)
+    X_test_processed["leaf_assignment"] = leaf_assignments
+
+    y_test_series = pd.Series(y_test).reset_index(drop=True)
+    print("✓ Predictions completed")
+
+    # ------------------------------------------------------------
+    # Calibration evaluation
+    # ------------------------------------------------------------
+    brier = brier_score_loss(y_test_series, y_proba)
+    ece = expected_calibration_error(y_test_series.values, y_proba)
+
+    print(f"Brier score: {brier:.4f}")
+    print(f"ECE: {ece:.4f}")
+
+    if plot_calibration:
+        prob_true, prob_pred = calibration_curve(y_test_series, y_proba, n_bins=10)
+        plt.figure(figsize=(5, 5))
+        plt.plot(prob_pred, prob_true, marker='o')
+        plt.plot([0, 1], [0, 1], linestyle="--")
+        plt.title("Calibration Curve (Reliability Diagram)")
+        plt.xlabel("Mean predicted probability")
+        plt.ylabel("Fraction of positives")
+        plt.grid(True)
+        plt.show()
+
+    # ------------------------------------------------------------
+    # Threshold-free metrics (AUC)
+    # ------------------------------------------------------------
+    auc = iai_model.score(X_test_processed, y_test_series, criterion="auc")
+    pr_auc = average_precision_score(y_test_series, y_proba)
+    print(f"AUC score: {auc:.3f}")
+    print(f"PR-AUC (Average Precision): {pr_auc:.3f}")
+
+    # ------------------------------------------------------------
+    # F1-optimal threshold
+    # ------------------------------------------------------------
+    precision_curve, recall_curve, thresholds = precision_recall_curve(y_test_series, y_proba)
+    f1_scores = 2 * precision_curve * recall_curve / (precision_curve + recall_curve + 1e-12)
+
+    best_idx = np.argmax(f1_scores)
+    best_f1_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
+    best_f1 = f1_scores[best_idx]
+
+    y_pred_f1 = (y_proba >= best_f1_threshold).astype(int)
+
+    print(f"Optimal-threshold F1={best_f1:.3f} at threshold={best_f1_threshold:.3f}")
+    print(f"Confusion matrix (F1 threshold):\n{confusion_matrix(y_test_series, y_pred_f1)}")
+
+    # ------------------------------------------------------------
+    # Feasible threshold search (precision≥X, recall≥Y)
+    # ------------------------------------------------------------
+    feasible = find_feasible_threshold(
+        y_test_series.values,
+        y_proba,
+        min_precision=constraint_precision,
+        min_recall=constraint_recall
+    )
+
+    if feasible is None:
+        print(f"⚠ No feasible threshold found with precision≥{constraint_precision} and recall≥{constraint_recall}")
+        feasible_threshold = 0.5
+    else:
+        feasible_threshold = feasible["threshold"]
+        print(f"Feasible threshold found: {feasible_threshold:.3f}")
+    print(f"   Precision={feasible['precision']:.3f}")
+    print(f"   Recall={feasible['recall']:.3f}")
+
+    y_pred_feasible = (y_proba >= feasible_threshold).astype(int)
+    print("Confusion matrix (feasible threshold):")
+    print(confusion_matrix(y_test_series, y_pred_feasible))
+    return {
+        "auc": auc,
+        "pr_auc": pr_auc,
+        "brier": brier,
+        "ece": ece,
+        "optimal_threshold": best_f1_threshold,
+        "optimal_f1": best_f1,
+        "feasible_threshold": feasible_threshold,
+    }
