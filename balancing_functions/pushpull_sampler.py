@@ -10,12 +10,12 @@ from tqdm import trange
 from scipy.spatial.distance import cdist
 from ortools.linear_solver import pywraplp
 from sklearn.metrics import pairwise_distances
-# import parent class
-from balancing_functions.optimal_match_lexicographic import LexicographicCaseControlResampler
+from sklearn.impute import SimpleImputer
+from typing import Optional, List
+from model_pipeline import get_preprocessor, get_bin_flag_columns
 import time
 from tqdm import tqdm
 
-# TODO: come up with a test to quantify coverage in terms of volume + feature space
 def evaluate_terms_case_and_coverage(P, C, NN_case, D_pn, a, NN_ctrl, D_nn, r):
     """Compute raw term_1 and term_2 under the current MILP solution."""
     # Case–control term
@@ -32,88 +32,182 @@ def evaluate_terms_case_and_coverage(P, C, NN_case, D_pn, a, NN_ctrl, D_nn, r):
 
     return term1, term2
 
-class PushPullSampler(LexicographicCaseControlResampler):
+
+class BaseMultiObjectiveSampler:
     """
-    One-stage multi-objective with extreme point scaling of cost terms 
-    """   
+    Base class for multi-objective samplers that provides shared utility functions.
+    This is a standalone class that includes the necessary preprocessing functionality
+    extracted from LexicographicCaseControlResampler, plus shared pruning methods.
+    Provides common functionality for both PushPullSampler and DoubleFacilitySampler.
+    """
+    
+    def __init__(
+        self,
+        bin_edges: Optional[np.ndarray] = None,
+        impute_strategy: str = "mean",
+        uid_col: str = "uid",
+        random_state: int = 42,
+        binary_group: str = "high_cost_2018",
+    ):
+        """
+        Initialize base sampler with preprocessing configuration.
+        
+        Parameters
+        ----------
+        bin_edges : Optional[np.ndarray]
+            Bin edges for feature binning (not used in multi-objective samplers but kept for compatibility)
+        impute_strategy : str
+            Strategy for imputing missing values ("mean", "median", "most_frequent")
+        uid_col : str
+            Name of the unique identifier column
+        random_state : int
+            Random seed for reproducibility
+        binary_group : str
+            Name of the binary grouping column to exclude from features
+        """
+        self.bin_edges = bin_edges if bin_edges is not None else np.linspace(0, 1, 11)
+        self.bin_labels = [
+            f"{a:.2f}-{b:.2f}" for a, b in zip(self.bin_edges[:-1], self.bin_edges[1:])
+        ]
+        self.impute_strategy = impute_strategy
+        self.uid_col = uid_col
+        self.random_state = random_state
+        self.binary_group = binary_group
+    
+    def get_preprocessed_control_case_features(
+        self,
+        cases: pd.DataFrame,
+        controls: pd.DataFrame,
+        exclude_cols_matching: List[str],
+        verbose: bool = False
+    ) -> tuple:
+        """
+        Use preprocessing pipeline to preserve the feature engineering approach.
+        Return X_control, X_cases
+        
+        This method is extracted from LexicographicCaseControlResampler to make
+        BaseMultiObjectiveSampler independent.
+        """
+        # Step 1: Feature categorization logic
+        drop_cols = [self.uid_col, self.binary_group] + exclude_cols_matching
+        all_cols = [c for c in cases.columns if c not in drop_cols]
+        # Combine datasets for consistent preprocessing
+        combined_df = pd.concat([cases[all_cols], controls[all_cols]], ignore_index=True)
+        
+        # Step 2: Handle missing values first
+        # Separate numeric and categorical columns
+        numeric_cols = combined_df.select_dtypes(include=[np.number]).columns.tolist()
+        categorical_cols = combined_df.select_dtypes(include=["object", "category"]).columns.tolist()
+        
+        # Impute numeric columns
+        if numeric_cols:
+            imputer = SimpleImputer(strategy=self.impute_strategy)
+            combined_df[numeric_cols] = imputer.fit_transform(combined_df[numeric_cols])
+        
+        # Impute categorical columns  
+        if categorical_cols:
+            cat_imputer = SimpleImputer(strategy="most_frequent")
+            combined_df[categorical_cols] = cat_imputer.fit_transform(combined_df[categorical_cols])
+        
+        # Intersect with your three feature pools
+        bin_feats = get_bin_flag_columns(combined_df) 
+        num_feats = [c for c in numeric_cols if c not in bin_feats]
+
+        if verbose:
+            print(f">>> Distance computation will use {len(all_cols)} features")
+            print(f"{len(categorical_cols)} Categorical features (one-hot encoded):", categorical_cols)
+            print(f"{len(num_feats)} Numeric features (normalized):", num_feats)
+            print(f"{len(bin_feats)} Binary features (unchanged):", bin_feats)
+
+        # Step 3: Build your sophisticated preprocessor
+        preprocessor = get_preprocessor(
+            df=combined_df,
+            categorical_cols=categorical_cols,
+            numeric_cols=num_feats,
+            verbose=False
+        )
+        
+        X_combined = preprocessor.fit_transform(combined_df)
+        n_cases = len(cases)
+        X_cases = X_combined[:n_cases]
+        X_controls = X_combined[n_cases:]
+        if verbose:
+            print(f"After preprocessing: {X_cases.shape[1]} features")
+        
+        return X_cases, X_controls
 
     def prune_nodes_distance(
-        self, 
-        X_cases, 
-        X_controls, 
-        df_controls,
+        self,
+        X_cases,
+        X_controls,
         top_k_per_case=50,
         K_outer=2000,
-        stratified=False,       # <-- NEW flag
     ):
-       
-        # ---- Step 1: Case→Control expansion (top-k per case) ----
-        D = cdist(X_cases, X_controls)
-        nearest = np.argpartition(D, top_k_per_case, axis=1)[:, :top_k_per_case]
-        candidate_indices = sorted(set(nearest.flatten()))  # list of original control indices
-        
-        # ---- Step 2: Compute minimal distance score for these candidates ----
-        D_sub = cdist(X_cases, X_controls[candidate_indices])
-        min_dist = D_sub.min(axis=0)
-
-        # ---- Step 3: Build dfC with RESET INDEX ----
-        dfC = df_controls.iloc[candidate_indices].copy()
-        dfC = dfC.reset_index(drop=False)  # keep original index
-        dfC["min_dist"] = min_dist
-        # Sort all candidates purely by minimal distance
-        df_sorted = dfC.sort_values("min_dist")
-        K_eff = min(K_outer, len(df_sorted))
-        selected = dfC.nsmallest(K_eff, "min_dist").index.tolist()
-        return selected
-    
-    def _topk_prune_case_to_control(self,X_cases, X_controls, L):
         """
-        Returns list of lists:
-            NN_case[i] = array of L nearest control indices for case i.
+        Purely feature-space pruning.
+        
+        Algorithm:
+        1. For each case, find top_k_per_case nearest controls.
+        2. Collect all unique candidate controls that appear in any case's top-k.
+        3. For each candidate, compute its minimum distance to any case.
+        4. Return the K_outer candidates with smallest minimum distances.
+        """
+
+        # ---- Step 1: construct case→control distance matrix ----
+        print(f"X_cases shape: {X_cases.shape}")
+        print(f"X_controls shape: {X_controls.shape}")
+        D = cdist(X_cases, X_controls)          # shape: (P, C)
+        P, C = D.shape
+
+        # ---- Step 2: top-k nearest controls for each case ----
+        # Handle edge case where top_k_per_case >= C
+        top_k_eff = min(top_k_per_case, C)
+        if top_k_eff == C:
+            print("All controls are candidates, no need for argpartition")
+            nearest = np.arange(C).reshape(1, -1).repeat(P, axis=0)
+        else:
+            nearest = np.argpartition(D, top_k_eff, axis=1)[:, :top_k_eff]
+
+        # Candidate control positions
+        candidate_pos = np.unique(nearest.ravel())     # ⟵ indices in 0..C−1
+
+        # ---- Step 3: compute each candidate's minimal distance to any case ----
+        # Instead of recomputing cdist, slice D:
+        min_dist = D[:, candidate_pos].min(axis=0)
+
+        # ---- Step 4: retain K_outer best candidates ----
+        # Sort candidate positions by their min_dist
+        order = np.argsort(min_dist)
+        K_eff = min(K_outer, len(candidate_pos))
+
+        selected_pos = candidate_pos[order[:K_eff]]
+
+        return selected_pos.tolist()
+
+    def _topk_prune_case_to_control(self, X_cases, X_controls, L):
+        """
+        For each case i, find L nearest controls j.
+        Returns:
+            NN_case[i] = length-L array of control indices
+            D          = full distance matrix (P x C)
         """
         D = pairwise_distances(X_cases, X_controls, metric="euclidean")
-        # Take smallest L distances per case
-        nearest = np.argpartition(D, L, axis=1)[:, :L]
-        # Optional: sort each L-block for stability
-        sorted_idx = np.argsort(D[np.arange(D.shape[0])[:,None], nearest], axis=1)
-        NN_case = nearest[np.arange(nearest.shape[0])[:,None], sorted_idx]
+        P, C = D.shape
+
+        L_eff = min(L, C)
+        nearest = np.argpartition(D, L_eff, axis=1)[:, :L_eff]
+
+        # sort each neighbor list by distance for stability
+        sorted_idx = np.argsort(D[np.arange(P)[:, None], nearest], axis=1)
+        NN_case = nearest[np.arange(P)[:, None], sorted_idx]
 
         return NN_case, D
 
-    def compute_pushpull_extreme_points(self, X_cases, X_controls, candidate_indices, top_k, verbose=True):
-        """
-        Compute true extreme points (f1_min, f1_max, f2_min, f2_max)
-        by solving 4 MILPs with fixed objective directions.
-        """
 
-        # Helper: solve push-pull MILP with objective = f1 or f2 only
-        def solve_for_objective(maximize_f1=False, maximize_f2=False):
-            return self.solve_pushpull_MILP(
-                X_cases, X_controls, candidate_indices,
-                w=None,       # ignore weights (special mode)
-                top_k=top_k,
-                objective_mode=("f1max" if maximize_f1 else
-                                "f1min" if not maximize_f1 and not maximize_f2 else
-                                "f2max" if maximize_f2 else
-                                "f2min"),
-                return_only_objective=True,
-                verbose=verbose
-            )
-
-        f1_min = solve_for_objective(maximize_f1=False)
-        f1_max = solve_for_objective(maximize_f1=True)
-
-        f2_min = solve_for_objective(maximize_f2=False)
-        f2_max = solve_for_objective(maximize_f2=True)
-
-        return {
-            "f1_min": float(f1_min),
-            "f1_max": float(f1_max),
-            "f2_min": float(f2_min),
-            "f2_max": float(f2_max),
-        }
-  
-
+class PushPullSampler(BaseMultiObjectiveSampler):
+    """
+    One-stage multi-objective with extreme point scaling of cost terms 
+    """   
 
     def _topk_farthest_control_pairs(self, X_C, L_pairs=20, verbose=True):
         """
@@ -205,16 +299,8 @@ class PushPullSampler(LexicographicCaseControlResampler):
         s = [solver.BoolVar(f"s[{j}]") for j in range(C)]
 
         # Assignment (binary recommended)
-        """a = [
-            { j: solver.BoolVar(f"a[{i},{j}]") for j in NN_case[i] }
-            for i in range(P)
-        ]
-
-        # Diversity var
-        z = { (j,k): solver.BoolVar(f"z[{j},{k}]") for (j,k) in pairs }
-        """
         a = [
-            {j: solver.NumVar(0, 1, f"a[{i},{j}]") for j in NN_case[i]}
+            { j: solver.BoolVar(f"a[{i},{j}]") for j in NN_case[i] }
             for i in range(P)
         ]
 
@@ -232,6 +318,8 @@ class PushPullSampler(LexicographicCaseControlResampler):
         for (j,k), z_var in z.items():
             solver.Add(z_var <= s[j])
             solver.Add(z_var <= s[k])
+            solver.Add(z_var >= s[j] + s[k] - 1)
+
 
         # Raw objective components
         f1 = solver.Sum(D_pn[i,j] * a[i][j] for i in range(P) for j in NN_case[i])
@@ -273,13 +361,13 @@ class PushPullSampler(LexicographicCaseControlResampler):
             print("[MILP-Diverse] Variables:", solver.NumVariables())
             print("[MILP-Diverse] Constraints:", solver.NumConstraints())
 
-        solver.SetTimeLimit(1200000)   # 300 sec = 5 minutes
+        solver.SetTimeLimit(2400000)   # 300 sec = 5 minutes
 
         # SCIP internal parameters (seconds)
         solver.SetSolverSpecificParametersAsString(r"""
         timing/clocktype = 1
-        limits/time = 1200
-        limits/softtime = 1200
+        limits/time = 2400
+        limits/softtime = 2400
         display/verblevel = 4
         """)
         status = solver.Solve()
@@ -385,15 +473,22 @@ class PushPullSampler(LexicographicCaseControlResampler):
         K_factor, # inner pruning ratio
         top_k_case_ctrl,
         L_pairs,
+        ext=None,  # Optional: pre-computed extreme points
         verbose=True
     ):
         """
         Full wrapper for normalized push–pull sampling.
         1. Preprocess cases/controls into feature space.
         2. Prune controls using distance-based strategy.
-        3. Compute extreme points (min/max f1,f2).
+        3. Compute extreme points (min/max f1,f2) or use provided ones.
         4. Solve weighted normalized MILP to select control subset.
         5. Return undersampled dataset.
+        
+        Parameters
+        ----------
+        ext : dict, optional
+            Pre-computed extreme points dict with keys: f1_min, f1_max, f2_min, f2_max.
+            If provided, skips extreme point computation.
         """
 
         X_cases, X_controls = self.get_preprocessed_control_case_features(
@@ -409,19 +504,27 @@ class PushPullSampler(LexicographicCaseControlResampler):
             print(f"[K_factor * |minority|] Node pruning {K_outer} candidate controls out of {X_controls.shape[0]}")
 
         candidate_indices = self.prune_nodes_distance(
-           X_cases, X_controls, df_controls,top_k_per_case=top_k_case_ctrl, K_outer = K_outer
-)
+           X_cases, X_controls, top_k_per_case=top_k_case_ctrl, K_outer = K_outer)
         candidate_indices = list(map(int, candidate_indices))
         if verbose:
             print(f"[NODE PRUNING] → Kept {len(candidate_indices)} controls")
 
-        ext = self.compute_pushpull_extreme_points(
-            X_cases, X_controls, candidate_indices,
-            final_ratio=final_ratio,
-            top_k_case_ctrl=top_k_case_ctrl,
-            L_pairs=L_pairs,
-            verbose=verbose
-        )
+        # Compute extreme points only if not provided
+        if ext is None:
+            if verbose:
+                print("[EXTREME POINTS] Computing extreme points (this may take a while)...")
+            ext = self.compute_pushpull_extreme_points(
+                X_cases, X_controls, candidate_indices,
+                final_ratio=final_ratio,
+                top_k_case_ctrl=top_k_case_ctrl,
+                L_pairs=L_pairs,
+                verbose=verbose
+            )
+        else:
+            if verbose:
+                print("[EXTREME POINTS] Using provided extreme points")
+                print(f"  f1 in [{ext['f1_min']:.4f}, {ext['f1_max']:.4f}], "
+                      f"f2 in [{ext['f2_min']:.4f}, {ext['f2_max']:.4f}]")
 
         result = self.solve_pushpull_MILP(
             X_cases, X_controls, candidate_indices,

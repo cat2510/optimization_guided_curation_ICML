@@ -1,0 +1,316 @@
+BUG:
+distance maj-maj = 0 at each ratio because z[j,k] not forced to be 1 when s[j]=s[k]=1
+====================================
+  Running PUSH–PULL sampling ratio=1.00
+====================================
+
+>>> Distance computation will use 42 features
+5 Categorical features (one-hot encoded): ['INCOME_LEVEL', 'AGEGRP', 'SEX', 'REGION', 'lab_monitoring_intensity']
+12 Numeric features (normalized): ['stage_2017', 'util_2017', '2017Q1_ckd_claims', '2017Q1_max_ckd_stage', '2017Q2_ckd_claims', '2017Q2_max_ckd_stage', '2017Q3_ckd_claims', '2017Q3_max_ckd_stage', '2017Q4_ckd_claims', '2017Q4_max_ckd_stage', 'total_lab_tests', 'nephrology_visit_count']
+25 Binary features (unchanged): ['has_Hypertension', 'has_Type_2_Diabetes', 'has_Anemia', 'has_Hyperlipidemia', 'has_Acute_Kidney_Failure', 'has_Hyperparathyroidism', 'has_Kidney_Transplant', 'has_Vitamin_D_Deficiency', 'has_Long-term_Drug_Therapy', 'has_Hypothyroidism', 'has_Sleep_Apnea', 'Antihyperlipidemic Drugs, NEC (THRCLS_53)', 'Cardiac, Beta Blockers (THRCLS_51)', 'Cardiac, Calcium Channel (THRCLS_52)', 'Psychother, Antidepressants (THRCLS_69)', 'Cardiac Drugs, NEC (THRCLS_46)', 'Cardiac, ACE Inhibitors (THRCLS_47)', 'Antidiabetic Agents, Insulins (THRCLS_172)', 'Antidiabetic Agents, Misc (THRCLS_174)', 'Immunosuppressants, NEC (THRCLS_181)', 'Analg/Antipyr, Opiate Agonists (THRCLS_60)', 'is_consistently_decreasing_2017', 'lab_monitoring_adherent', 'nephrology_consult_adherent', 'early_nephrology_referral']
+After preprocessing: 52 features
+[K_factor * |minority|] Node pruning 3300 candidate controls out of 22819
+[NODE PRUNING] → Kept 3300 controls
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f1min
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f1min objective = 2757.4750
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f1max
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f1max objective = 4052.3062
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f2min
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f2min objective = 0.0000
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f2max
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f2max objective = 135806.4820
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  weighted
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+[Optimal cost decomposition]
+  distance min-maj   = 3149.1632
+  distance maj-maj   = 0.0000
+  weighted objective = 0.0000
+→ Building preprocessor:
+   • OneHotEncoder on: ['INCOME_LEVEL', 'AGEGRP', 'SEX', 'REGION', 'cost_pattern_2017', 'cost_stability_2017', 'lab_monitoring_intensity']
+   • StandardScaler on: ['2017Q1_ckd_cost', '2017Q1_ckd_claims', '2017Q1_direct_ckd_cost', '2017Q1_procedure_ckd_cost', '2017Q1_comorbidity_ckd_cost', '2017Q2_ckd_cost', '2017Q2_ckd_claims', '2017Q2_direct_ckd_cost', '2017Q2_procedure_ckd_cost', '2017Q2_comorbidity_ckd_cost', '2017Q3_ckd_cost', '2017Q3_ckd_claims', '2017Q3_direct_ckd_cost', '2017Q3_procedure_ckd_cost', '2017Q3_comorbidity_ckd_cost', '2017Q4_ckd_cost', '2017Q4_ckd_claims', '2017Q4_direct_ckd_cost', '2017Q4_procedure_ckd_cost', '2017Q4_comorbidity_ckd_cost', 'ckd_cost_trend_2017', 'ckd_cost_volatility_2017', 'ckd_cost_deriv_Q1_Q2_2017', 'ckd_cost_deriv_Q2_Q3_2017', 'ckd_cost_deriv_Q3_Q4_2017', 'avg_quarterly_derivative_2017', 'quarterly_std_2017', 'quarterly_skewness_2017', 'quarterly_kurtosis_2017', 'quarterly_cv_2017', 'quarterly_max_2017', 'quarterly_min_2017', 'quarterly_range_2017', 'util_2017', 'total_increasing_quarters_2017', 'total_lab_tests', 'nephrology_visit_count']
+Test dataset for OCT application: 5,032 samples
+✓ Predictions completed
+✓ Saved OCT predictions to: ./ratio_sweep_results_pushpull_extremepoint_continous_vars_zero_w/oct_predictions_ratio_1.00.csv
+AUC score: 0.800
+PR-AUC (Average Precision): 0.106
+Sensitivity (Recall): 0.532
+Specificity: 0.906
+Sensitivity (default): 0.716
+Specificity (default): 0.838
+Number of leaves: 4
+
+====================================
+  Running PUSH–PULL sampling ratio=2.00
+====================================
+
+>>> Distance computation will use 42 features
+5 Categorical features (one-hot encoded): ['INCOME_LEVEL', 'AGEGRP', 'SEX', 'REGION', 'lab_monitoring_intensity']
+12 Numeric features (normalized): ['stage_2017', 'util_2017', '2017Q1_ckd_claims', '2017Q1_max_ckd_stage', '2017Q2_ckd_claims', '2017Q2_max_ckd_stage', '2017Q3_ckd_claims', '2017Q3_max_ckd_stage', '2017Q4_ckd_claims', '2017Q4_max_ckd_stage', 'total_lab_tests', 'nephrology_visit_count']
+25 Binary features (unchanged): ['has_Hypertension', 'has_Type_2_Diabetes', 'has_Anemia', 'has_Hyperlipidemia', 'has_Acute_Kidney_Failure', 'has_Hyperparathyroidism', 'has_Kidney_Transplant', 'has_Vitamin_D_Deficiency', 'has_Long-term_Drug_Therapy', 'has_Hypothyroidism', 'has_Sleep_Apnea', 'Antihyperlipidemic Drugs, NEC (THRCLS_53)', 'Cardiac, Beta Blockers (THRCLS_51)', 'Cardiac, Calcium Channel (THRCLS_52)', 'Psychother, Antidepressants (THRCLS_69)', 'Cardiac Drugs, NEC (THRCLS_46)', 'Cardiac, ACE Inhibitors (THRCLS_47)', 'Antidiabetic Agents, Insulins (THRCLS_172)', 'Antidiabetic Agents, Misc (THRCLS_174)', 'Immunosuppressants, NEC (THRCLS_181)', 'Analg/Antipyr, Opiate Agonists (THRCLS_60)', 'is_consistently_decreasing_2017', 'lab_monitoring_adherent', 'nephrology_consult_adherent', 'early_nephrology_referral']
+After preprocessing: 52 features
+[K_factor * |minority|] Node pruning 3300 candidate controls out of 22819
+[NODE PRUNING] → Kept 3300 controls
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f1min
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f1min objective = 2757.4750
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f1max
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f1max objective = 4052.3062
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f2min
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f2min objective = 0.0000
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f2max
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f2max objective = 271602.6855
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  weighted
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+[Optimal cost decomposition]
+  distance min-maj   = 2782.5545
+  distance maj-maj   = 0.0000
+  weighted objective = 0.0000
+→ Building preprocessor:
+   • OneHotEncoder on: ['INCOME_LEVEL', 'AGEGRP', 'SEX', 'REGION', 'cost_pattern_2017', 'cost_stability_2017', 'lab_monitoring_intensity']
+   • StandardScaler on: ['2017Q1_ckd_cost', '2017Q1_ckd_claims', '2017Q1_direct_ckd_cost', '2017Q1_procedure_ckd_cost', '2017Q1_comorbidity_ckd_cost', '2017Q2_ckd_cost', '2017Q2_ckd_claims', '2017Q2_direct_ckd_cost', '2017Q2_procedure_ckd_cost', '2017Q2_comorbidity_ckd_cost', '2017Q3_ckd_cost', '2017Q3_ckd_claims', '2017Q3_direct_ckd_cost', '2017Q3_procedure_ckd_cost', '2017Q3_comorbidity_ckd_cost', '2017Q4_ckd_cost', '2017Q4_ckd_claims', '2017Q4_direct_ckd_cost', '2017Q4_procedure_ckd_cost', '2017Q4_comorbidity_ckd_cost', 'ckd_cost_trend_2017', 'ckd_cost_volatility_2017', 'ckd_cost_deriv_Q1_Q2_2017', 'ckd_cost_deriv_Q2_Q3_2017', 'ckd_cost_deriv_Q3_Q4_2017', 'avg_quarterly_derivative_2017', 'quarterly_std_2017', 'quarterly_skewness_2017', 'quarterly_kurtosis_2017', 'quarterly_cv_2017', 'quarterly_max_2017', 'quarterly_min_2017', 'quarterly_range_2017', 'util_2017', 'total_increasing_quarters_2017', 'total_lab_tests', 'nephrology_visit_count']
+Test dataset for OCT application: 5,032 samples
+✓ Predictions completed
+✓ Saved OCT predictions to: ./ratio_sweep_results_pushpull_extremepoint_continous_vars_zero_w/oct_predictions_ratio_2.00.csv
+AUC score: 0.795
+PR-AUC (Average Precision): 0.144
+Sensitivity (Recall): 0.397
+Specificity: 0.962
+Sensitivity (default): 0.397
+Specificity (default): 0.962
+Number of leaves: 5
+
+====================================
+  Running PUSH–PULL sampling ratio=3.00
+====================================
+
+>>> Distance computation will use 42 features
+5 Categorical features (one-hot encoded): ['INCOME_LEVEL', 'AGEGRP', 'SEX', 'REGION', 'lab_monitoring_intensity']
+12 Numeric features (normalized): ['stage_2017', 'util_2017', '2017Q1_ckd_claims', '2017Q1_max_ckd_stage', '2017Q2_ckd_claims', '2017Q2_max_ckd_stage', '2017Q3_ckd_claims', '2017Q3_max_ckd_stage', '2017Q4_ckd_claims', '2017Q4_max_ckd_stage', 'total_lab_tests', 'nephrology_visit_count']
+25 Binary features (unchanged): ['has_Hypertension', 'has_Type_2_Diabetes', 'has_Anemia', 'has_Hyperlipidemia', 'has_Acute_Kidney_Failure', 'has_Hyperparathyroidism', 'has_Kidney_Transplant', 'has_Vitamin_D_Deficiency', 'has_Long-term_Drug_Therapy', 'has_Hypothyroidism', 'has_Sleep_Apnea', 'Antihyperlipidemic Drugs, NEC (THRCLS_53)', 'Cardiac, Beta Blockers (THRCLS_51)', 'Cardiac, Calcium Channel (THRCLS_52)', 'Psychother, Antidepressants (THRCLS_69)', 'Cardiac Drugs, NEC (THRCLS_46)', 'Cardiac, ACE Inhibitors (THRCLS_47)', 'Antidiabetic Agents, Insulins (THRCLS_172)', 'Antidiabetic Agents, Misc (THRCLS_174)', 'Immunosuppressants, NEC (THRCLS_181)', 'Analg/Antipyr, Opiate Agonists (THRCLS_60)', 'is_consistently_decreasing_2017', 'lab_monitoring_adherent', 'nephrology_consult_adherent', 'early_nephrology_referral']
+After preprocessing: 52 features
+[K_factor * |minority|] Node pruning 3300 candidate controls out of 22819
+[NODE PRUNING] → Kept 3300 controls
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f1min
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f1min objective = 2757.4750
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f1max
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f1max objective = 4052.3062
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f2min
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f2min objective = 0.0000
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f2max
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f2max objective = 405212.9257
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  weighted
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+[Optimal cost decomposition]
+  distance min-maj   = 2765.6242
+  distance maj-maj   = 0.0000
+  weighted objective = 0.0000
+→ Building preprocessor:
+   • OneHotEncoder on: ['INCOME_LEVEL', 'AGEGRP', 'SEX', 'REGION', 'cost_pattern_2017', 'cost_stability_2017', 'lab_monitoring_intensity']
+   • StandardScaler on: ['2017Q1_ckd_cost', '2017Q1_ckd_claims', '2017Q1_direct_ckd_cost', '2017Q1_procedure_ckd_cost', '2017Q1_comorbidity_ckd_cost', '2017Q2_ckd_cost', '2017Q2_ckd_claims', '2017Q2_direct_ckd_cost', '2017Q2_procedure_ckd_cost', '2017Q2_comorbidity_ckd_cost', '2017Q3_ckd_cost', '2017Q3_ckd_claims', '2017Q3_direct_ckd_cost', '2017Q3_procedure_ckd_cost', '2017Q3_comorbidity_ckd_cost', '2017Q4_ckd_cost', '2017Q4_ckd_claims', '2017Q4_direct_ckd_cost', '2017Q4_procedure_ckd_cost', '2017Q4_comorbidity_ckd_cost', 'ckd_cost_trend_2017', 'ckd_cost_volatility_2017', 'ckd_cost_deriv_Q1_Q2_2017', 'ckd_cost_deriv_Q2_Q3_2017', 'ckd_cost_deriv_Q3_Q4_2017', 'avg_quarterly_derivative_2017', 'quarterly_std_2017', 'quarterly_skewness_2017', 'quarterly_kurtosis_2017', 'quarterly_cv_2017', 'quarterly_max_2017', 'quarterly_min_2017', 'quarterly_range_2017', 'util_2017', 'total_increasing_quarters_2017', 'total_lab_tests', 'nephrology_visit_count']
+Test dataset for OCT application: 5,032 samples
+✓ Predictions completed
+✓ Saved OCT predictions to: ./ratio_sweep_results_pushpull_extremepoint_continous_vars_zero_w/oct_predictions_ratio_3.00.csv
+AUC score: 0.778
+PR-AUC (Average Precision): 0.164
+Sensitivity (Recall): 0.426
+Specificity: 0.967
+Sensitivity (default): 0.426
+Specificity (default): 0.967
+Number of leaves: 5
+
+====================================
+  Running PUSH–PULL sampling ratio=4.00
+====================================
+
+>>> Distance computation will use 42 features
+5 Categorical features (one-hot encoded): ['INCOME_LEVEL', 'AGEGRP', 'SEX', 'REGION', 'lab_monitoring_intensity']
+12 Numeric features (normalized): ['stage_2017', 'util_2017', '2017Q1_ckd_claims', '2017Q1_max_ckd_stage', '2017Q2_ckd_claims', '2017Q2_max_ckd_stage', '2017Q3_ckd_claims', '2017Q3_max_ckd_stage', '2017Q4_ckd_claims', '2017Q4_max_ckd_stage', 'total_lab_tests', 'nephrology_visit_count']
+25 Binary features (unchanged): ['has_Hypertension', 'has_Type_2_Diabetes', 'has_Anemia', 'has_Hyperlipidemia', 'has_Acute_Kidney_Failure', 'has_Hyperparathyroidism', 'has_Kidney_Transplant', 'has_Vitamin_D_Deficiency', 'has_Long-term_Drug_Therapy', 'has_Hypothyroidism', 'has_Sleep_Apnea', 'Antihyperlipidemic Drugs, NEC (THRCLS_53)', 'Cardiac, Beta Blockers (THRCLS_51)', 'Cardiac, Calcium Channel (THRCLS_52)', 'Psychother, Antidepressants (THRCLS_69)', 'Cardiac Drugs, NEC (THRCLS_46)', 'Cardiac, ACE Inhibitors (THRCLS_47)', 'Antidiabetic Agents, Insulins (THRCLS_172)', 'Antidiabetic Agents, Misc (THRCLS_174)', 'Immunosuppressants, NEC (THRCLS_181)', 'Analg/Antipyr, Opiate Agonists (THRCLS_60)', 'is_consistently_decreasing_2017', 'lab_monitoring_adherent', 'nephrology_consult_adherent', 'early_nephrology_referral']
+After preprocessing: 52 features
+[K_factor * |minority|] Node pruning 3300 candidate controls out of 22819
+[NODE PRUNING] → Kept 3300 controls
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f1min
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f1min objective = 2757.4750
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f1max
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f1max objective = 4052.2766
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f2min
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f2min objective = 0.0000
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f2max
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f2max objective = 535891.9818
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  weighted
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+[Optimal cost decomposition]
+  distance min-maj   = 2758.8160
+  distance maj-maj   = 0.0000
+  weighted objective = 0.0000
+→ Building preprocessor:
+   • OneHotEncoder on: ['INCOME_LEVEL', 'AGEGRP', 'SEX', 'REGION', 'cost_pattern_2017', 'cost_stability_2017', 'lab_monitoring_intensity']
+   • StandardScaler on: ['2017Q1_ckd_cost', '2017Q1_ckd_claims', '2017Q1_direct_ckd_cost', '2017Q1_procedure_ckd_cost', '2017Q1_comorbidity_ckd_cost', '2017Q2_ckd_cost', '2017Q2_ckd_claims', '2017Q2_direct_ckd_cost', '2017Q2_procedure_ckd_cost', '2017Q2_comorbidity_ckd_cost', '2017Q3_ckd_cost', '2017Q3_ckd_claims', '2017Q3_direct_ckd_cost', '2017Q3_procedure_ckd_cost', '2017Q3_comorbidity_ckd_cost', '2017Q4_ckd_cost', '2017Q4_ckd_claims', '2017Q4_direct_ckd_cost', '2017Q4_procedure_ckd_cost', '2017Q4_comorbidity_ckd_cost', 'ckd_cost_trend_2017', 'ckd_cost_volatility_2017', 'ckd_cost_deriv_Q1_Q2_2017', 'ckd_cost_deriv_Q2_Q3_2017', 'ckd_cost_deriv_Q3_Q4_2017', 'avg_quarterly_derivative_2017', 'quarterly_std_2017', 'quarterly_skewness_2017', 'quarterly_kurtosis_2017', 'quarterly_cv_2017', 'quarterly_max_2017', 'quarterly_min_2017', 'quarterly_range_2017', 'util_2017', 'total_increasing_quarters_2017', 'total_lab_tests', 'nephrology_visit_count']
+Test dataset for OCT application: 5,032 samples
+✓ Predictions completed
+✓ Saved OCT predictions to: ./ratio_sweep_results_pushpull_extremepoint_continous_vars_zero_w/oct_predictions_ratio_4.00.csv
+AUC score: 0.804
+PR-AUC (Average Precision): 0.205
+Sensitivity (Recall): 0.468
+Specificity: 0.964
+Sensitivity (default): 0.468
+Specificity (default): 0.964
+Number of leaves: 8
+
+====================================
+  Running PUSH–PULL sampling ratio=5.00
+====================================
+
+>>> Distance computation will use 42 features
+5 Categorical features (one-hot encoded): ['INCOME_LEVEL', 'AGEGRP', 'SEX', 'REGION', 'lab_monitoring_intensity']
+12 Numeric features (normalized): ['stage_2017', 'util_2017', '2017Q1_ckd_claims', '2017Q1_max_ckd_stage', '2017Q2_ckd_claims', '2017Q2_max_ckd_stage', '2017Q3_ckd_claims', '2017Q3_max_ckd_stage', '2017Q4_ckd_claims', '2017Q4_max_ckd_stage', 'total_lab_tests', 'nephrology_visit_count']
+25 Binary features (unchanged): ['has_Hypertension', 'has_Type_2_Diabetes', 'has_Anemia', 'has_Hyperlipidemia', 'has_Acute_Kidney_Failure', 'has_Hyperparathyroidism', 'has_Kidney_Transplant', 'has_Vitamin_D_Deficiency', 'has_Long-term_Drug_Therapy', 'has_Hypothyroidism', 'has_Sleep_Apnea', 'Antihyperlipidemic Drugs, NEC (THRCLS_53)', 'Cardiac, Beta Blockers (THRCLS_51)', 'Cardiac, Calcium Channel (THRCLS_52)', 'Psychother, Antidepressants (THRCLS_69)', 'Cardiac Drugs, NEC (THRCLS_46)', 'Cardiac, ACE Inhibitors (THRCLS_47)', 'Antidiabetic Agents, Insulins (THRCLS_172)', 'Antidiabetic Agents, Misc (THRCLS_174)', 'Immunosuppressants, NEC (THRCLS_181)', 'Analg/Antipyr, Opiate Agonists (THRCLS_60)', 'is_consistently_decreasing_2017', 'lab_monitoring_adherent', 'nephrology_consult_adherent', 'early_nephrology_referral']
+After preprocessing: 52 features
+[K_factor * |minority|] Node pruning 3300 candidate controls out of 22819
+[NODE PRUNING] → Kept 3300 controls
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f1min
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f1min objective = 2757.4750
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f1max
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f1max objective = 4052.3062
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f2min
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f2min objective = 0.0000
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  f2max
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+  Computed f2max objective = 659186.9454
+[Dispersion] Using 32897 far pairs among 3300 controls (L_pairs=10)
+[EDGE PRUNING] → Each case (660 cases) has 50 control candidates
+[EDGE PRUNING] → Kept (32897, 2) control-control pairs
+Solving for  weighted
+[MILP-Diverse] Variables: 69197
+[MILP-Diverse] Constraints: 99455
+[Optimal cost decomposition]
+  distance min-maj   = 2757.4750
+  distance maj-maj   = 0.0000
+  weighted objective = 0.0000
+→ Building preprocessor:
+   • OneHotEncoder on: ['INCOME_LEVEL', 'AGEGRP', 'SEX', 'REGION', 'cost_pattern_2017', 'cost_stability_2017', 'lab_monitoring_intensity']
+   • StandardScaler on: ['2017Q1_ckd_cost', '2017Q1_ckd_claims', '2017Q1_direct_ckd_cost', '2017Q1_procedure_ckd_cost', '2017Q1_comorbidity_ckd_cost', '2017Q2_ckd_cost', '2017Q2_ckd_claims', '2017Q2_direct_ckd_cost', '2017Q2_procedure_ckd_cost', '2017Q2_comorbidity_ckd_cost', '2017Q3_ckd_cost', '2017Q3_ckd_claims', '2017Q3_direct_ckd_cost', '2017Q3_procedure_ckd_cost', '2017Q3_comorbidity_ckd_cost', '2017Q4_ckd_cost', '2017Q4_ckd_claims', '2017Q4_direct_ckd_cost', '2017Q4_procedure_ckd_cost', '2017Q4_comorbidity_ckd_cost', 'ckd_cost_trend_2017', 'ckd_cost_volatility_2017', 'ckd_cost_deriv_Q1_Q2_2017', 'ckd_cost_deriv_Q2_Q3_2017', 'ckd_cost_deriv_Q3_Q4_2017', 'avg_quarterly_derivative_2017', 'quarterly_std_2017', 'quarterly_skewness_2017', 'quarterly_kurtosis_2017', 'quarterly_cv_2017', 'quarterly_max_2017', 'quarterly_min_2017', 'quarterly_range_2017', 'util_2017', 'total_increasing_quarters_2017', 'total_lab_tests', 'nephrology_visit_count']
+Test dataset for OCT application: 5,032 samples
+✓ Predictions completed
+✓ Saved OCT predictions to: ./ratio_sweep_results_pushpull_extremepoint_continous_vars_zero_w/oct_predictions_ratio_5.00.csv
+AUC score: 0.730
+PR-AUC (Average Precision): 0.172
+Sensitivity (Recall): 0.390
+Specificity: 0.975
+Sensitivity (default): 0.390
+Specificity (default): 0.975
+Number of leaves: 4
