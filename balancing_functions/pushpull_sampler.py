@@ -83,10 +83,7 @@ class BaseMultiObjectiveSampler:
     ) -> tuple:
         """
         Use preprocessing pipeline to preserve the feature engineering approach.
-        Return X_control, X_cases
-        
-        This method is extracted from LexicographicCaseControlResampler to make
-        BaseMultiObjectiveSampler independent.
+        Return X_control, X_cases. Double checked for alignment between df_controls and X_controls.
         """
         # Step 1: Feature categorization logic
         drop_cols = [self.uid_col, self.binary_group] + exclude_cols_matching
@@ -132,7 +129,7 @@ class BaseMultiObjectiveSampler:
         X_cases = X_combined[:n_cases]
         X_controls = X_combined[n_cases:]
         if verbose:
-            print(f"After preprocessing: {X_cases.shape[1]} features")
+            print(f"X_cases has shape: {X_cases.shape}, X_controls has shape: {X_controls.shape}")
         
         return X_cases, X_controls
 
@@ -190,28 +187,39 @@ class BaseMultiObjectiveSampler:
         Returns:
             NN_case[i] = length-L array of control indices
             D          = full distance matrix (P x C)
+
+        NEW Jan 7, 2026: Patched version that handles L >= C case (all controls).
         """
         D = pairwise_distances(X_cases, X_controls, metric="euclidean")
         P, C = D.shape
-
+        
         L_eff = min(L, C)
-        nearest = np.argpartition(D, L_eff, axis=1)[:, :L_eff]
-
-        # sort each neighbor list by distance for stability
+        
+        # If L >= C, we want all controls, so just use all indices
+        if L_eff >= C:
+            # Return all control indices for each case
+            nearest = np.arange(C).reshape(1, -1).repeat(P, axis=0)
+        else:
+            # Use argpartition for partial selection
+            nearest = np.argpartition(D, L_eff, axis=1)[:, :L_eff]
+        
+        # Sort each neighbor list by distance for stability
         sorted_idx = np.argsort(D[np.arange(P)[:, None], nearest], axis=1)
         NN_case = nearest[np.arange(P)[:, None], sorted_idx]
-
+        
         return NN_case, D
+
+
 
 
 class PushPullSampler(BaseMultiObjectiveSampler):
     """
     One-stage multi-objective with extreme point scaling of cost terms 
     """   
-
     def _topk_farthest_control_pairs(self, X_C, L_pairs=20, verbose=True):
         """
         For dispersion: build a sparse set of FAR pairs (j,k) among controls.
+        NEW Jan 7, 2026: Patched version that handles the case where we want all control-control pairs.
 
         Parameters
         ----------
@@ -228,31 +236,38 @@ class PushPullSampler(BaseMultiObjectiveSampler):
             Full control-control distance matrix (C x C).
         """
         from sklearn.metrics import pairwise_distances
-
+        
         C = X_C.shape[0]
         D_nn = pairwise_distances(X_C, X_C, metric="euclidean")
-
+        
         pairs_set = set()
-        # for each control j, find L_pairs farthest others
-        for j in range(C):
-            row = D_nn[j]
-            # indices of L largest distances (excluding j itself)
-            # argpartition on -row yields largest L indices
-            L_eff = min(L_pairs, C - 1)
-            far_idx = np.argpartition(-row, L_eff)[:L_eff]
-            # drop self if present
-            far_idx = far_idx[far_idx != j]
-            for k in far_idx:
-                j_min, j_max = (j, k) if j < k else (k, j)
-                pairs_set.add((j_min, j_max))
-
+        
+        # If L_pairs >= C - 1, we want all pairs (each control paired with all others)
+        if L_pairs >= C - 1:
+            # Generate all unique pairs (j, k) where j < k
+            for j in range(C):
+                for k in range(j + 1, C):
+                    pairs_set.add((j, k))
+        else:
+            # Use original logic for partial selection
+            for j in range(C):
+                row = D_nn[j]
+                # indices of L largest distances (excluding j itself)
+                L_eff = min(L_pairs, C - 1)
+                far_idx = np.argpartition(-row, L_eff)[:L_eff]
+                # drop self if present
+                far_idx = far_idx[far_idx != j]
+                for k in far_idx:
+                    j_min, j_max = (j, k) if j < k else (k, j)
+                    pairs_set.add((j_min, j_max))
+        
         pairs = sorted(list(pairs_set))
         if verbose:
             print(f"[Dispersion] Using {len(pairs)} far pairs among {C} controls (L_pairs={L_pairs})")
-
+        
         return pairs, D_nn
-    
-    
+
+   
     def solve_pushpull_MILP(
         self,
         X_cases,
@@ -274,6 +289,11 @@ class PushPullSampler(BaseMultiObjectiveSampler):
             weighted → normalized weighted-sum using ext
 
         This is the underlying solver.
+        
+        The weighted mode uses extreme-point normalization:
+            tilde_f1 = (f1 - f1_min) / (f1_max - f1_min)
+            tilde_f2 = (f2 - f2_min) / (f2_max - f2_min)
+        Both terms are normalized to [0, 1], making them comparable.
         """
 
         from ortools.linear_solver import pywraplp
@@ -304,26 +324,26 @@ class PushPullSampler(BaseMultiObjectiveSampler):
             for i in range(P)
         ]
 
-        # Pairwise co-selection vars: z[(j,k)] ∈ [0,1]
-        z = { (j,k): solver.NumVar(0, 1, f"z[{j},{k}]") for (j,k) in pairs }
+        # Pairwise co-selection vars: z[(j_idx,k_idx)] ∈ [0,1]
+        z = { (j_idx, k_idx): solver.NumVar(0, 1, f"z[{j_idx},{k_idx}]") for (j_idx, k_idx) in pairs }
 
         # Constraints
         solver.Add(sum(s) == k)
 
         for i in range(P):
-            solver.Add(sum(a[i][j] for j in NN_case[i]) == 1)
+            # each case assigned to at least one control
+            solver.Add(sum(a[i][j] for j in NN_case[i]) == 1) 
             for j in NN_case[i]:
                 solver.Add(a[i][j] <= s[j])
 
-        for (j,k), z_var in z.items():
-            solver.Add(z_var <= s[j])
-            solver.Add(z_var <= s[k])
-            solver.Add(z_var >= s[j] + s[k] - 1)
+        for (j_idx, k_idx), z_var in z.items():
+            solver.Add(z_var <= s[j_idx])
+            solver.Add(z_var <= s[k_idx])
 
 
         # Raw objective components
         f1 = solver.Sum(D_pn[i,j] * a[i][j] for i in range(P) for j in NN_case[i])
-        f2 = solver.Sum(D_nn[j,k] * z[(j,k)] for (j,k) in pairs)
+        f2 = solver.Sum(D_nn[j_idx, k_idx] * z[(j_idx, k_idx)] for (j_idx, k_idx) in pairs)
 
         # --- Objective selection ---
         if verbose:
@@ -352,7 +372,9 @@ class PushPullSampler(BaseMultiObjectiveSampler):
             tilde_f1 = (f1 - f1_min) / range_f1
             tilde_f2 = (f2 - f2_min) / range_f2
 
-            solver.Minimize(w * tilde_f1 + (1 - w) * tilde_f2)
+            # Both terms are normalized to [0, 1] via extreme-point normalization,
+            # so they should be on the same scale and comparable.
+            solver.Minimize(w * tilde_f1 - (1 - w) * tilde_f2)
 
         else:
             raise ValueError("Invalid objective_mode")
@@ -385,8 +407,8 @@ class PushPullSampler(BaseMultiObjectiveSampler):
              for i in range(P)
              for j in NN_case[i])
 
-        f2_val = sum(D_nn[j, k] * z[(j, k)].solution_value()
-                    for (j, k) in pairs)
+        f2_val = sum(D_nn[j_idx, k_idx] * z[(j_idx, k_idx)].solution_value()
+                    for (j_idx, k_idx) in pairs)
 
         if verbose:
             print("[Optimal cost decomposition]")
@@ -489,6 +511,9 @@ class PushPullSampler(BaseMultiObjectiveSampler):
         ext : dict, optional
             Pre-computed extreme points dict with keys: f1_min, f1_max, f2_min, f2_max.
             If provided, skips extreme point computation.
+            
+        Note: The weighted objective uses extreme-point normalization to ensure both
+        terms (f1 and f2) are on the same [0, 1] scale, making them comparable.
         """
 
         X_cases, X_controls = self.get_preprocessed_control_case_features(
@@ -538,6 +563,7 @@ class PushPullSampler(BaseMultiObjectiveSampler):
         )
         selected_ctrls = result["selected"]
 
+    
         # --- Step 5: Build undersampled dataset ---
         undersampled = pd.concat(
             [df_cases, df_controls.iloc[selected_ctrls]],

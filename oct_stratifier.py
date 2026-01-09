@@ -103,11 +103,11 @@ def train_stratifier_oct(df_prebalanced, stratification_cols, CAT_COLUMNS, TRUE_
 best_params = None):
     if bias_feature:
         stratifier_train_pd = df_prebalanced[df_prebalanced[bias_feature]==1].copy()
-        print(f"\n Training binary OCT M1 biased on {bias_feature} data with {len(stratifier_train_pd):,} samples")
+        print(f"\n Training OCT M1 biased on {bias_feature} data with {len(stratifier_train_pd):,} samples")
 
     else:
         stratifier_train_pd = df_prebalanced
-        print(f"\n Training binary OCT M1 on all train data with {len(stratifier_train_pd):,} samples")
+        print(f"\n Training OCT M1 on all train data with {len(stratifier_train_pd):,} samples")
     print("-"*60)
     
     # Prepare features (include stage columns for now - you can modify this)
