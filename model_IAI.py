@@ -128,12 +128,12 @@ def train_oct_with_feature_names(X_train, y_train,
 def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
                  depths=[5, 7,9],
                  minbuckets=[50, 100,150],
-                 cps=[0.001, 0.01, 0.05]):
+                 cps=[1e-6,1e-5,1e-4]):
     """
     Hyperparameter tuning for IAI OptimalTreeClassifier
     Selects best hyperparameters based on F1 score
     """
-
+    print(f"Finetuning OCT with depths: {depths}, minbuckets: {minbuckets}, cps: {cps}, for best recalL!!!")
     best_score = -1
     best_params = None
     best_model = None
@@ -188,12 +188,12 @@ def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
             "f1": f1
         })
 
-        if f1 > best_score:
-            best_score = f1
+        if recall > best_score:
+            best_score = recall
             best_params = (depth, minbucket, cp)
             best_model = model
 
-    results_df = pd.DataFrame(results).sort_values("f1", ascending=False)
+    results_df = pd.DataFrame(results).sort_values("recall", ascending=False)
 
     return best_model, best_params, results_df,preprocessor, feature_names
 

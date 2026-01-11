@@ -8,7 +8,10 @@ from sklearn.metrics import (
     accuracy_score,
     f1_score,
     roc_auc_score,
-    classification_report
+    classification_report,
+    precision_score,
+    recall_score,
+    average_precision_score
 )
 import time
 import warnings
@@ -510,6 +513,322 @@ def tune_oct_multiclass(
 
 
 # -----------------------------------------------------------
+# Utility: Evaluate binary classification predictions
+# -----------------------------------------------------------
+def evaluate_binary(y_true, y_pred, y_proba=None):
+    """
+    Evaluate binary classification predictions.
+    
+    Parameters
+    ----------
+    y_true : array-like
+        True binary labels (0/1)
+    y_pred : array-like
+        Predicted binary labels (0/1)
+    y_proba : array-like, optional
+        Predicted probabilities for positive class
+    
+    Returns
+    -------
+    dict : Dictionary of binary classification metrics
+    """
+    metrics = {}
+    metrics["accuracy"] = accuracy_score(y_true, y_pred)
+    metrics["precision"] = precision_score(y_true, y_pred, zero_division=0)
+    metrics["recall"] = recall_score(y_true, y_pred, zero_division=0)
+    metrics["f1"] = f1_score(y_true, y_pred, zero_division=0)
+    
+    if y_proba is not None:
+        try:
+            metrics["roc_auc"] = roc_auc_score(y_true, y_proba)
+            metrics["pr_auc"] = average_precision_score(y_true, y_proba)
+        except ValueError:
+            # Only one class present in y_true
+            metrics["roc_auc"] = np.nan
+            metrics["pr_auc"] = np.nan
+    
+    return metrics
+
+
+# -----------------------------------------------------------
+# Binary classification hyperparameter tuning function
+# -----------------------------------------------------------
+def tune_oct_binary(
+    df_prebalanced,
+    stratification_cols,
+    CAT_COLUMNS,
+    TRUE_NUM_COLUMNS,
+    target="highcost_gt_200000",
+    bias_feature=None,
+    param_grid=None,
+    n_splits=5,
+    random_state=42,
+    refit_metric="f1",
+    verbose=True,
+    max_models=None,
+    random_sample=False,
+    random_sample_size=20
+):
+    """
+    Perform cross-validated grid (or random) search over OCT hyperparameters
+    for BINARY classification.
+    
+    Parameters
+    ----------
+    df_prebalanced : DataFrame
+        Training dataframe (already pre-filtered / balanced upstream if desired).
+    stratification_cols : list[str]
+        Feature column names used for the OCT.
+    CAT_COLUMNS : list[str]
+        Categorical feature names (subset of stratification_cols).
+    TRUE_NUM_COLUMNS : list[str]
+        Numeric feature names (subset of stratification_cols).
+    target : str
+        Binary target column (0/1).
+    bias_feature : str or None
+        If provided, subset data where bias_feature == 1 is used for training/tuning.
+    param_grid : dict or None
+        Keys: 'max_depth', 'minbucket', 'cp'; values: list of candidate values.
+    n_splits : int
+        Number of StratifiedKFold folds.
+    refit_metric : str
+        Aggregated metric used to pick best model.
+        Options: 'f1', 'recall', 'precision', 'roc_auc', 'pr_auc', 'accuracy'
+    max_models : int or None
+        Hard cap on number of (hyperparam combinations) to evaluate (after random sampling).
+    random_sample : bool
+        If True, sample random_sample_size combinations from full grid.
+    random_sample_size : int
+        Number of random parameter sets to sample if random_sample=True.
+    
+    Returns
+    -------
+    dict with:
+        'tuning_results' : DataFrame (aggregated metrics per combo)
+        'cv_details'     : DataFrame (fold-level metrics per combo)
+        'best_params'    : dict
+        'best_model'     : fitted model on all (biased or full) training data
+        'preprocessor'   : fitted preprocessor for best model
+        'feature_names'  : list
+        'train_leaf_assignments' : array
+        'train_predictions'      : array
+        'train_probabilities'    : array
+    """
+    if param_grid is None:
+        param_grid = {
+            "max_depth": [5, 7, 9],
+            "minbucket": [50, 100, 150],
+            "cp": [1e-5, 1e-4, 1e-3]
+        }
+    
+    # Subset for bias if requested
+    if bias_feature:
+        data = df_prebalanced[df_prebalanced[bias_feature] == 1].copy()
+        if verbose:
+            print(f"Using biased subset ( {bias_feature} == 1 ): {len(data):,} rows")
+    else:
+        data = df_prebalanced.copy()
+        if verbose:
+            print(f"Using full dataset for tuning: {len(data):,} rows")
+    
+    # Basic target checks
+    y = data[target].astype(int).values
+    X = data[stratification_cols].copy()
+    
+    class_dist = pd.Series(y).value_counts().sort_index()
+    if verbose:
+        print("Target distribution (tuning base):")
+        for cls, cnt in class_dist.items():
+            print(f"  Class {cls}: {cnt:,} ({cnt/len(y)*100:.1f}%)")
+    
+    # Build parameter combinations
+    keys = list(param_grid.keys())
+    all_combos = list(product(*[param_grid[k] for k in keys]))
+    if verbose:
+        print(f"Total parameter combinations before sampling: {len(all_combos)}")
+    
+    # Optional random sampling of combos
+    if random_sample and len(all_combos) > random_sample_size:
+        rng = np.random.default_rng(random_state)
+        sampled_indices = rng.choice(len(all_combos), size=random_sample_size, replace=False)
+        all_combos = [all_combos[i] for i in sampled_indices]
+        if verbose:
+            print(f"Randomly sampled {len(all_combos)} parameter combinations")
+    
+    # Truncate if max_models specified
+    if max_models is not None:
+        all_combos = all_combos[:max_models]
+        if verbose:
+            print(f"Evaluating only first {len(all_combos)} combinations due to max_models cap.")
+    
+    # Prepare CV
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    
+    fold_results = []
+    combo_counter = 0
+    
+    for combo in all_combos:
+        params = dict(zip(keys, combo))
+        combo_counter += 1
+        start_combo_time = time.time()
+        
+        if verbose:
+            print(f"\n[{combo_counter}/{len(all_combos)}] Evaluating params: {params}")
+        
+        fold_idx = 0
+        for train_index, valid_index in skf.split(X, y):
+            fold_idx += 1
+            X_train_fold = X.iloc[train_index]
+            y_train_fold = y[train_index]
+            X_valid_fold = X.iloc[valid_index]
+            y_valid_fold = y[valid_index]
+            
+            # Train a model for this fold
+            try:
+                model, preprocessor, feature_names = model_IAI.train_oct_with_feature_names(
+                    X_train_fold, y_train_fold,
+                    categorical_cols=CAT_COLUMNS,
+                    numeric_cols=TRUE_NUM_COLUMNS,
+                    max_depth=params["max_depth"],
+                    minbucket=params["minbucket"],
+                    cp=params["cp"]
+                )
+            except Exception as e:
+                warnings.warn(f"Training failed for params {params} fold {fold_idx}: {e}")
+                # Record NaN metrics so we can later filter
+                fold_results.append({
+                    **params,
+                    "fold": fold_idx,
+                    "accuracy": np.nan,
+                    "precision": np.nan,
+                    "recall": np.nan,
+                    "f1": np.nan,
+                    "roc_auc": np.nan,
+                    "pr_auc": np.nan
+                })
+                continue
+            
+            # Transform validation set
+            X_valid_processed = preprocessor.transform(X_valid_fold)
+            X_valid_processed_df = pd.DataFrame(X_valid_processed, columns=feature_names)
+            
+            # Predictions & probs
+            y_valid_pred = model.predict(X_valid_processed_df)
+            
+            # Get probabilities for positive class
+            try:
+                proba = model.predict_proba(X_valid_processed_df)
+                if isinstance(proba, pd.DataFrame):
+                    # Get column for class 1 (positive class)
+                    if 1 in proba.columns:
+                        y_valid_proba = proba[1].values
+                    else:
+                        y_valid_proba = proba.iloc[:, 1].values
+                else:
+                    y_valid_proba = np.array(proba)[:, 1]
+            except Exception:
+                y_valid_proba = None
+            
+            metrics = evaluate_binary(y_valid_fold, y_valid_pred, y_valid_proba)
+            fold_results.append({
+                **params,
+                "fold": fold_idx,
+                **metrics
+            })
+        
+        elapsed = time.time() - start_combo_time
+        if verbose:
+            # Show interim aggregate for this combo
+            tmp_df = pd.DataFrame([r for r in fold_results if all(r.get(k) == params[k] for k in keys)])
+            agg_f1 = tmp_df["f1"].mean()
+            agg_recall = tmp_df["recall"].mean()
+            agg_precision = tmp_df["precision"].mean()
+            print(f"  -> Interim avg precision={agg_precision:.4f}, recall={agg_recall:.4f}, f1={agg_f1:.4f} (time {elapsed:.1f}s)")
+    
+    cv_details_df = pd.DataFrame(fold_results)
+    
+    # Aggregate across folds
+    agg_funcs = {
+        "accuracy": "mean",
+        "precision": "mean",
+        "recall": "mean",
+        "f1": "mean",
+        "roc_auc": "mean",
+        "pr_auc": "mean"
+    }
+    
+    tuning_results = (cv_details_df
+                      .groupby(keys, as_index=False)
+                      .agg(agg_funcs)
+                      .sort_values(refit_metric, ascending=False))
+    
+    if verbose:
+        print("\n=== Binary OCT Hyperparameter Tuning Summary (top 10 by refit metric) ===")
+        display_cols = keys + [refit_metric, "accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc"]
+        print(tuning_results[display_cols].head(10).to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+    
+    if tuning_results.empty:
+        raise RuntimeError("No successful model trainings; tune search failed.")
+    
+    best_row = tuning_results.iloc[0]
+    best_params = {
+        "max_depth": int(best_row["max_depth"]),
+        "minbucket": int(best_row["minbucket"]),
+        "cp": float(best_row["cp"]),
+    }
+    
+    if verbose:
+        print(f"\nBest params by {refit_metric}: {best_params}")
+        print(f"  Best {refit_metric}: {best_row[refit_metric]:.4f}")
+    
+    # -------------------------------------------------------
+    # Refit final model on full (possibly biased) training set
+    # -------------------------------------------------------
+    if verbose:
+        print("Refitting best model on full training data...")
+    final_model, final_preprocessor, final_feature_names = model_IAI.train_oct_with_feature_names(
+        X, y,
+        categorical_cols=CAT_COLUMNS,
+        numeric_cols=TRUE_NUM_COLUMNS,
+        max_depth=best_params["max_depth"],
+        minbucket=best_params["minbucket"],
+        cp=best_params["cp"]
+    )
+    
+    # Leaf assignments + predictions on train (for potential diagnostics)
+    X_full_processed = final_preprocessor.transform(X)
+    X_full_processed_df = pd.DataFrame(X_full_processed, columns=final_feature_names)
+    train_preds = final_model.predict(X_full_processed_df)
+    train_leaf_ids = final_model.apply(X_full_processed_df)
+    
+    # Get probabilities
+    try:
+        train_proba = final_model.predict_proba(X_full_processed_df)
+        if isinstance(train_proba, pd.DataFrame):
+            if 1 in train_proba.columns:
+                train_proba = train_proba[1].values
+            else:
+                train_proba = train_proba.iloc[:, 1].values
+        else:
+            train_proba = np.array(train_proba)[:, 1]
+    except Exception:
+        train_proba = None
+    
+    results = {
+        "tuning_results": tuning_results.reset_index(drop=True),
+        "cv_details": cv_details_df,
+        "best_params": best_params,
+        "best_model": final_model,
+        "preprocessor": final_preprocessor,
+        "feature_names": final_feature_names,
+        "train_leaf_assignments": train_leaf_ids,
+        "train_predictions": train_preds,
+        "train_probabilities": train_proba
+    }
+    return results
+
+
+# -----------------------------------------------------------
 # Wrapper function that integrates tuning + final enrichment
 # (Optional convenience if you want to match your previous API)
 # -----------------------------------------------------------
@@ -579,6 +898,128 @@ def train_stratifier_oct_tuned(
         "cost_stratum_predictions": predictions_all,
         "leaf_assignments": leaf_ids_all,
         "leaf_stratum_summary": leaf_stratum_summary,
+        "tuning_results": tuning_out["tuning_results"],
+        "cv_details": tuning_out["cv_details"],
+        "best_params": tuning_out["best_params"]
+    }
+    return results
+
+
+# -----------------------------------------------------------
+# Binary classification wrapper function
+# -----------------------------------------------------------
+def train_stratifier_oct_binary_tuned(
+    df_prebalanced,
+    stratification_cols,
+    CAT_COLUMNS,
+    TRUE_NUM_COLUMNS,
+    bias_feature=None,
+    target="highcost_gt_200000",
+    param_grid=None,
+    oct_seed=42,
+    refit_metric="recall",
+    **tune_kwargs
+):
+    """
+    High-level convenience for BINARY classification: run hyperparameter tuning
+    and then add leaf assignments, predictions, and probabilities back into df_prebalanced.
+    
+    Parameters
+    ----------
+    df_prebalanced : DataFrame
+        Training data
+    stratification_cols : list[str]
+        Feature columns to use
+    CAT_COLUMNS : list[str]
+        Categorical feature names
+    TRUE_NUM_COLUMNS : list[str]
+        Numeric feature names
+    bias_feature : str or None
+        If provided, only rows where bias_feature == 1 are used for training/tuning
+    target : str
+        Binary target column name (0/1)
+    param_grid : dict or None
+        Hyperparameter grid for tuning
+    oct_seed : int
+        Random seed
+    refit_metric : str
+        Metric to optimize during tuning.
+        Options: 'recall', 'precision', 'f1', 'roc_auc', 'pr_auc', 'accuracy'
+    **tune_kwargs : dict
+        Additional arguments passed to tune_oct_binary (e.g., n_splits, verbose)
+    
+    Returns
+    -------
+    dict with:
+        'df_with_leaves' : DataFrame with leaf assignments and predictions
+        'model' : Best fitted OCT model
+        'preprocessor' : Fitted preprocessor
+        'feature_names' : List of feature names after preprocessing
+        'stratification_cols' : Original feature columns
+        'predictions' : Predicted classes for all samples
+        'probabilities' : Predicted probabilities for all samples
+        'leaf_assignments' : Leaf assignments for all samples
+        'tuning_results' : DataFrame of hyperparameter tuning results
+        'cv_details' : DataFrame of fold-level CV results
+        'best_params' : Dict of best hyperparameters
+    """
+    tuning_out = tune_oct_binary(
+        df_prebalanced=df_prebalanced,
+        stratification_cols=stratification_cols,
+        CAT_COLUMNS=CAT_COLUMNS,
+        TRUE_NUM_COLUMNS=TRUE_NUM_COLUMNS,
+        target=target,
+        bias_feature=bias_feature,
+        param_grid=param_grid,
+        refit_metric=refit_metric,
+        random_state=oct_seed,
+        **tune_kwargs
+    )
+    
+    model = tuning_out["best_model"]
+    preprocessor = tuning_out["preprocessor"]
+    feature_names = tuning_out["feature_names"]
+    
+    # Apply to full dataset (not just biased subset) for downstream use
+    X_all = df_prebalanced[stratification_cols]
+    X_all_processed = preprocessor.transform(X_all)
+    X_all_processed_df = pd.DataFrame(X_all_processed, columns=feature_names)
+    
+    predictions_all = model.predict(X_all_processed_df)
+    leaf_ids_all = model.apply(X_all_processed_df)
+    
+    # Get probabilities
+    try:
+        proba_all = model.predict_proba(X_all_processed_df)
+        if isinstance(proba_all, pd.DataFrame):
+            if 1 in proba_all.columns:
+                proba_all = proba_all[1].values
+            else:
+                proba_all = proba_all.iloc[:, 1].values
+        else:
+            proba_all = np.array(proba_all)[:, 1]
+    except Exception:
+        proba_all = None
+    
+    df_prebalanced = df_prebalanced.copy()
+    df_prebalanced["predicted_class"] = predictions_all
+    df_prebalanced["predicted_proba"] = proba_all
+    df_prebalanced["leaf_assignment"] = leaf_ids_all
+    
+    if tune_kwargs.get("verbose", True):
+        print(f"\nPost-fit: {len(np.unique(leaf_ids_all))} unique leaves")
+        print(f"Prediction distribution:")
+        print(pd.Series(predictions_all).value_counts().sort_index())
+    
+    results = {
+        "df_with_leaves": df_prebalanced,
+        "model": model,
+        "preprocessor": preprocessor,
+        "feature_names": feature_names,
+        "stratification_cols": stratification_cols,
+        "predictions": predictions_all,
+        "probabilities": proba_all,
+        "leaf_assignments": leaf_ids_all,
         "tuning_results": tuning_out["tuning_results"],
         "cv_details": tuning_out["cv_details"],
         "best_params": tuning_out["best_params"]
