@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-K-Center Matching Hyperparameter Search
-========================================
+K-Center Matching Hyperparameter Search (Global Undersampling)
+================================================================
 This script performs a grid search over k-center matching hyperparameters:
 - Case weighting: None, "boundary", "uncertainty", "density_inverse"
 - Adaptive pool: True/False
 - Seed method: "smart", "centroid", "density", "random"
 
 For each configuration, it:
-1. Runs per-leaf k-center matching to create undersampled training data
+1. Runs GLOBAL k-center matching (single call per config) to create undersampled training data
 2. Trains an OCT model on the undersampled data
 3. Evaluates and saves results
+
+NOTE: This version does NOT use per-leaf stratification - it undersamples globally.
 """
 
 import os
@@ -49,11 +51,9 @@ OCT_MINBUCKETS = [50, 100, 120, 150]
 OCT_CPS = [0.00001, 0.0001, 0.001, 0.01]
 
 # Paths
-MODEL_PATH = "saved_models/oct_stratifier_model.pkl"
-DF_WITH_LEAVES_PATH = "saved_models/df_with_leaves.csv"
 PN_H5_PATH = "./precomputed_distances/distances_majority_minority.h5"
-RESULTS_DIR = "./kcenter_hyperparameter_search_results"
-DNN_OUT_DIR = "./precomputed_distances/leaf_dnn_oct_stratifier"
+RESULTS_DIR = "./kcenter_hyperparameter_search_results_global"
+DNN_OUT_DIR = "./precomputed_distances/global_dnn"
 
 # Target column
 TARGET_COL = "highcost_gt_200000"
@@ -62,17 +62,48 @@ TARGET_COL = "highcost_gt_200000"
 # HELPER FUNCTIONS
 # ============================================================================
 
-def get_oct_probabilities(model, preprocessor, feature_names, leaf_cases, feature_cols):
-    """Get OCT predicted probabilities for uncertainty weighting."""
-    X_cases = leaf_cases[feature_cols].copy()
-    X_cases_transformed = preprocessor.transform(X_cases)
-    X_cases_df = pd.DataFrame(X_cases_transformed, columns=feature_names)
-    predicted_probs = model.predict_proba(X_cases_df)
+def get_model_probabilities_for_uncertainty(
+    train_pd,
+    feature_cols,
+    target_col,
+    CAT_COLUMNS,
+    TRUE_NUM_COLUMNS,
+    X_cases,
+):
+    """
+    Train a simple model on full training data to get probabilities for uncertainty weighting.
+    Uses a Random Forest for quick training.
+    """
+    from sklearn.ensemble import RandomForestClassifier
+    from model_pipeline import get_preprocessor
+    
+    print(f"\n  Training Random Forest for uncertainty weighting...")
+    
+    # Preprocess training data
+    preprocessor = get_preprocessor(
+        df=train_pd[feature_cols],
+        categorical_cols=CAT_COLUMNS,
+        numeric_cols=TRUE_NUM_COLUMNS,
+        verbose=False
+    )
+    X_train_processed = preprocessor.transform(train_pd[feature_cols])
+    y_train = train_pd[target_col]
+    
+    # Train RF
+    rf = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
+    rf.fit(X_train_processed, y_train)
+    
+    # Get probabilities for cases
+    X_cases_processed = preprocessor.transform(X_cases)
+    predicted_probs = rf.predict_proba(X_cases_processed)
+    
+    print(f"    ✓ Got probabilities for {len(predicted_probs)} cases")
+    
     return predicted_probs
 
 
-def run_kcenter_matching_for_config(
-    df_with_leaves,
+def run_global_kcenter_matching(
+    train_pd,
     target_col,
     feature_cols,
     pn_h5_path,
@@ -80,236 +111,208 @@ def run_kcenter_matching_for_config(
     case_weighting,
     use_adaptive_pool,
     seed_method,
-    model=None,
-    preprocessor=None,
-    feature_names=None,
     CAT_COLUMNS=None,
     TRUE_NUM_COLUMNS=None,
     COST_COLUMNS=None,
 ):
     """
-    Run k-center matching for all leaves with specified hyperparameters.
+    Run global k-center matching (single call) with specified hyperparameters.
     
     Returns:
-        dict: all_leaf_results dictionary with matching results for each leaf
+        dict: Matching results with selected controls and costs
     """
     print(f"\n{'='*80}")
-    print(f"CONFIGURATION:")
+    print(f"GLOBAL K-CENTER MATCHING CONFIGURATION:")
     print(f"  case_weighting: {case_weighting}")
     print(f"  use_adaptive_pool: {use_adaptive_pool}")
     print(f"  seed_method: {seed_method}")
     print(f"  matching_ratio: 1:{matching_ratio}")
     print(f"{'='*80}\n")
     
-    # Get unique leaves
-    unique_leaves = sorted(df_with_leaves['leaf_assignment'].unique())
-    print(f"Total leaves to process: {len(unique_leaves)}\n")
+    # Extract cases and controls globally
+    cases = train_pd[train_pd[target_col] == 1].copy()
+    controls = train_pd[train_pd[target_col] == 0].copy()
     
-    # Store results for all leaves
-    all_leaf_results = {}
+    n_cases = len(cases)
+    n_controls = len(controls)
     
-    for leaf_id in unique_leaves:
-        print(f"\n{'='*80}")
-        print(f"PROCESSING LEAF {int(leaf_id)}")
-        print(f"{'='*80}")
+    print(f"Global Statistics:")
+    print(f"  Cases (minority): {n_cases:,}")
+    print(f"  Controls (majority): {n_controls:,}")
+    print(f"  Ratio: {n_controls/n_cases if n_cases > 0 else float('inf'):.2f}:1")
+    
+    if n_cases == 0:
+        raise ValueError("No cases in training data!")
+    
+    if n_controls == 0:
+        raise ValueError("No controls in training data!")
+    
+    # Handle edge case: More cases than controls
+    if n_cases > n_controls:
+        print(f"\n  ⚠️ WARNING: More cases ({n_cases:,}) than controls ({n_controls:,})")
+        print(f"     Strategy: SKIP k-center matching - keep ALL minority and ALL majority as-is")
         
-        # Extract data for this leaf
-        leaf_df = df_with_leaves[df_with_leaves['leaf_assignment'] == leaf_id].copy()
-        leaf_cases = leaf_df[leaf_df[target_col] == 1].copy()
-        leaf_controls = leaf_df[leaf_df[target_col] == 0].copy()
-        
-        n_cases = len(leaf_cases)
-        n_controls = len(leaf_controls)
-        
-        print(f"\nLeaf {int(leaf_id)} Statistics:")
-        print(f"  Cases (minority): {n_cases:,}")
-        print(f"  Controls (majority): {n_controls:,}")
-        print(f"  Ratio: {n_controls/n_cases if n_cases > 0 else float('inf'):.2f}:1")
-        
-        if n_cases == 0:
-            print(f"  ⚠️ No cases in leaf {int(leaf_id)}, skipping...")
-            continue
-        
-        if n_controls == 0:
-            print(f"  ⚠️ No controls in leaf {int(leaf_id)}, skipping...")
-            continue
-        
-        # Preprocess controls to get feature matrix
-        exclude_cols_leaf = ["cost_stratum_2018"] + COST_COLUMNS + ["leaf_assignment", "predicted_cost_stratum"]
-        drop_cols_leaf = ['ENROLID', target_col] + exclude_cols_leaf
-        feature_cols_leaf = [c for c in leaf_controls.columns if c not in drop_cols_leaf]
-        
-        numeric_cols_leaf = leaf_controls[feature_cols_leaf].select_dtypes(include=[np.number]).columns.tolist()
-        categorical_cols_leaf = leaf_controls[feature_cols_leaf].select_dtypes(include=["object", "category"]).columns.tolist()
-        
-        # Impute and preprocess
-        leaf_controls_preprocessed = leaf_controls[feature_cols_leaf].copy()
-        if numeric_cols_leaf:
-            imputer = SimpleImputer(strategy='median')
-            leaf_controls_preprocessed[numeric_cols_leaf] = imputer.fit_transform(leaf_controls_preprocessed[numeric_cols_leaf])
-        if categorical_cols_leaf:
-            cat_imputer = SimpleImputer(strategy="most_frequent")
-            leaf_controls_preprocessed[categorical_cols_leaf] = cat_imputer.fit_transform(leaf_controls_preprocessed[categorical_cols_leaf])
-        
-        bin_feats_leaf = get_bin_flag_columns(leaf_controls_preprocessed)
-        num_feats_leaf = [c for c in numeric_cols_leaf if c not in bin_feats_leaf]
-        
-        preprocessor_leaf = get_preprocessor(
-            df=leaf_controls_preprocessed,
-            categorical_cols=categorical_cols_leaf,
-            numeric_cols=num_feats_leaf,
-            verbose=False
+        return {
+            'n_cases_total': n_cases,
+            'n_cases_matched': 0,
+            'n_controls': n_controls,
+            'M': 0,
+            'selected_control_enrolids': controls["ENROLID"].to_numpy(),
+            'match_costs': np.array([]),
+            'candidate_majority_enrolids': controls["ENROLID"].to_numpy(),
+            'case_to_control_map': {},
+            'skipped_reason': 'more_cases_than_controls'
+        }
+    
+    # Preprocess controls to get feature matrix
+    exclude_cols = ["cost_stratum_2018"] + (COST_COLUMNS or [])
+    drop_cols = ['ENROLID', target_col] + exclude_cols
+    feature_cols_controls = [c for c in controls.columns if c not in drop_cols]
+    
+    numeric_cols = controls[feature_cols_controls].select_dtypes(include=[np.number]).columns.tolist()
+    categorical_cols = controls[feature_cols_controls].select_dtypes(include=["object", "category"]).columns.tolist()
+    
+    # Impute and preprocess
+    controls_preprocessed = controls[feature_cols_controls].copy()
+    if numeric_cols:
+        imputer = SimpleImputer(strategy='median')
+        controls_preprocessed[numeric_cols] = imputer.fit_transform(controls_preprocessed[numeric_cols])
+    if categorical_cols:
+        cat_imputer = SimpleImputer(strategy="most_frequent")
+        controls_preprocessed[categorical_cols] = cat_imputer.fit_transform(controls_preprocessed[categorical_cols])
+    
+    bin_feats = get_bin_flag_columns(controls_preprocessed)
+    num_feats = [c for c in numeric_cols if c not in bin_feats]
+    
+    preprocessor_controls = get_preprocessor(
+        df=controls_preprocessed,
+        categorical_cols=categorical_cols,
+        numeric_cols=num_feats,
+        verbose=False
+    )
+    X_majority = preprocessor_controls.fit_transform(controls_preprocessed)
+    
+    print(f"\n  Preprocessing:")
+    print(f"    Features: {len(feature_cols_controls)}")
+    print(f"    Preprocessed shape: {X_majority.shape}")
+    
+    # Precompute or load control-control distances globally
+    print(f"\n  Preparing control-control distances (global)...")
+    majority_enrolids = controls["ENROLID"].to_numpy()
+
+    # Paths used by precompute_leaf_dnn_memmap for the global run
+    dnn_matrix_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_matrix.npy")
+    dnn_enrolids_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_enrolids.npy")
+
+    if os.path.exists(dnn_matrix_npy) and os.path.exists(dnn_enrolids_npy):
+        print(f"    ✓ Found existing global d_nn files, loading paths:")
+        print(f"      d_nn matrix: {dnn_matrix_npy}")
+        print(f"      d_nn enrolids: {dnn_enrolids_npy}")
+    else:
+        print(f"    ⚙️  Computing global control-control distances (this is done once)...")
+        dnn_matrix_npy, dnn_enrolids_npy = precompute_leaf_dnn_memmap(
+            X_majority_leaf=X_majority,
+            majority_enrolids_leaf=majority_enrolids,
+            out_dir=DNN_OUT_DIR,
+            leaf_id="global",  # Use \"global\" as leaf_id
+            batch_size=750,
         )
-        X_majority_leaf = preprocessor_leaf.fit_transform(leaf_controls_preprocessed)
-        
-        print(f"\n  Preprocessing:")
-        print(f"    Features: {len(feature_cols_leaf)}")
-        print(f"    Preprocessed shape: {X_majority_leaf.shape}")
-        
-        # Precompute control-control distances for this leaf
-        print(f"\n  Loading/precomputing control-control distances...")
-        majority_enrolids_leaf = leaf_controls["ENROLID"].to_numpy()
-        
-        # Paths used by precompute_leaf_dnn_memmap for the global run
-        dnn_matrix_npy = os.path.join(DNN_OUT_DIR, f"leaf_{leaf_id}_dnn_matrix.npy")
-        dnn_enrolids_npy = os.path.join(DNN_OUT_DIR, f"leaf_{leaf_id}_dnn_enrolids.npy")
-
-        if os.path.exists(dnn_matrix_npy) and os.path.exists(dnn_enrolids_npy):
-            print(f"    ✓ Found existing global d_nn files, loading paths:")
-            print(f"      d_nn matrix: {dnn_matrix_npy}")
-            print(f"      d_nn enrolids: {dnn_enrolids_npy}")
-        else:
-            print(f"    ⚙️  Computing control-control distances for leaf {leaf_id}...")
-            dnn_matrix_npy, dnn_enrolids_npy = precompute_leaf_dnn_memmap(
-                X_majority_leaf=X_majority_leaf,
-                majority_enrolids_leaf=majority_enrolids_leaf,
-                out_dir=DNN_OUT_DIR,
-                leaf_id=str(int(leaf_id)),  
-                batch_size=750,
-            )
-            print(f"    ✓ Control-control distances computed and saved")
-            
-        # Handle edge case: More cases than controls
-        if n_cases > n_controls:
-            print(f"\n  ⚠️ WARNING: More cases ({n_cases:,}) than controls ({n_controls:,}) in leaf {int(leaf_id)}")
-            print(f"     Strategy: SKIP k-center matching - keep ALL minority and ALL majority as-is")
-            
-            all_leaf_results[leaf_id] = {
-                'n_cases_total': n_cases,
-                'n_cases_matched': 0,
-                'n_controls': n_controls,
-                'M': 0,
-                'selected_control_enrolids': leaf_controls["ENROLID"].to_numpy(),
-                'match_costs': np.array([]),
-                'candidate_majority_enrolids': leaf_controls["ENROLID"].to_numpy(),
-                'case_to_control_map': {},
-                'skipped_reason': 'more_cases_than_controls'
-            }
-            
-            print(f"    ✓ Leaf will use ALL {n_controls:,} controls (no matching)")
-            continue
-        
-        # Normal case: n_controls >= n_cases
-        M_leaf = max(n_cases * matching_ratio, min(8000, n_controls))
-        
-        print(f"\n  K-Center Configuration:")
-        print(f"    M (candidate pool size): {M_leaf:,} / {n_controls:,} ({M_leaf/n_controls*100:.1f}%)")
-        print(f"    Cases to match: {n_cases:,}")
-        print(f"    Seed method: {seed_method}")
-        print(f"    Adaptive pool: {use_adaptive_pool}")
-        print(f"    Case weighting: {case_weighting}")
-        
-        # Get OCT probabilities if needed for uncertainty weighting
-        predicted_probs = None
-        if case_weighting == "uncertainty" and model is not None:
-            print(f"\n  Computing OCT probabilities for uncertainty weighting...")
-            predicted_probs = get_oct_probabilities(
-                model, preprocessor, feature_names, leaf_cases, feature_cols
-            )
-            print(f"    ✓ Got probabilities for {len(predicted_probs)} cases")
-        
-        # Run two-stage k-center matching
-        print(f"\n  Running two-stage k-center matching (1:{matching_ratio})...")
-        try:
-            out = two_stage_kcenter_then_match(
-                leaf_controls_enrolids=leaf_controls["ENROLID"].to_numpy(),
-                leaf_cases_enrolids=leaf_cases["ENROLID"].to_numpy(),
-                leaf_nn_matrix_npy=dnn_matrix_npy,
-                leaf_nn_enrolids_npy=dnn_enrolids_npy,
-                pn_h5_path=pn_h5_path,
-                M=M_leaf,
-                use_adaptive_pool=use_adaptive_pool,
-                tau=None,  # Auto-compute from 95th percentile
-                plateau_eps=0.01,
-                force_nearest_per_case=True,
-                force_topm=1,
-                assignment_topk_start=None,  # Exact matching
-                seed_method=seed_method,
-                matching_ratio=matching_ratio,
-                X_majority_leaf=X_majority_leaf,
-                case_weighting=case_weighting,
-                predicted_probs=predicted_probs,
-            )
-            
-            # Extract results
-            selected_control_enrolids = out["selected_control_enrolids"]
-            all_match_costs = out["match_costs"]
-            candidate_majority_enrolids = out["candidate_majority_enrolids"]
-            case_to_control_map = out["case_to_control_map"]
-            
-            # Store results
-            all_leaf_results[leaf_id] = {
-                'n_cases_total': n_cases,
-                'n_cases_matched': n_cases,
-                'n_controls': n_controls,
-                'M': M_leaf,
-                'matching_ratio': matching_ratio,
-                'selected_control_enrolids': selected_control_enrolids,
-                'match_costs': all_match_costs,
-                'candidate_majority_enrolids': candidate_majority_enrolids,
-                'case_to_control_map': case_to_control_map,
-                'skipped_reason': None
-            }
-            
-            print(f"    ✓ Matching complete!")
-            print(f"    Cases matched: {n_cases:,}")
-            print(f"    Total selected controls: {len(selected_control_enrolids):,} (unique: {len(set(selected_control_enrolids)):,})")
-            print(f"    Mean matching cost: {all_match_costs.mean():.4f}")
-            
-        except Exception as e:
-            print(f"    ✗ ERROR in leaf {int(leaf_id)}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
+        print(f"    ✓ Control-control distances computed and saved")
     
-    print(f"\n\n{'='*80}")
-    print("K-CENTER MATCHING COMPLETE FOR ALL LEAVES")
-    print(f"{'='*80}")
-    print(f"\nSuccessfully processed {len(all_leaf_results)}/{len(unique_leaves)} leaves")
+    # Normal case: n_controls >= n_cases
+    M = max(n_cases * matching_ratio, min(8000, n_controls))
     
-    return all_leaf_results
+    print(f"\n  K-Center Configuration:")
+    print(f"    M (candidate pool size): {M:,} / {n_controls:,} ({M/n_controls*100:.1f}%)")
+    print(f"    Cases to match: {n_cases:,}")
+    print(f"    Seed method: {seed_method}")
+    print(f"    Adaptive pool: {use_adaptive_pool}")
+    print(f"    Case weighting: {case_weighting}")
+    
+    # Get probabilities if needed for uncertainty weighting
+    predicted_probs = None
+    if case_weighting == "uncertainty":
+        print(f"\n  Computing probabilities for uncertainty weighting...")
+        predicted_probs = get_model_probabilities_for_uncertainty(
+            train_pd=train_pd,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            CAT_COLUMNS=CAT_COLUMNS,
+            TRUE_NUM_COLUMNS=TRUE_NUM_COLUMNS,
+            X_cases=cases[feature_cols],
+        )
+    
+    # Run two-stage k-center matching
+    print(f"\n  Running two-stage k-center matching (1:{matching_ratio})...")
+    try:
+        out = two_stage_kcenter_then_match(
+            leaf_controls_enrolids=controls["ENROLID"].to_numpy(),
+            leaf_cases_enrolids=cases["ENROLID"].to_numpy(),
+            leaf_nn_matrix_npy=dnn_matrix_npy,
+            leaf_nn_enrolids_npy=dnn_enrolids_npy,
+            pn_h5_path=pn_h5_path,
+            M=M,
+            use_adaptive_pool=use_adaptive_pool,
+            tau=None,  # Auto-compute from 95th percentile
+            plateau_eps=0.01,
+            force_nearest_per_case=True,
+            force_topm=1,
+            assignment_topk_start=None,  # Exact matching
+            seed_method=seed_method,
+            matching_ratio=matching_ratio,
+            X_majority_leaf=X_majority,
+            case_weighting=case_weighting,
+            predicted_probs=predicted_probs,
+        )
+        
+        # Extract results
+        selected_control_enrolids = out["selected_control_enrolids"]
+        all_match_costs = out["match_costs"]
+        candidate_majority_enrolids = out["candidate_majority_enrolids"]
+        case_to_control_map = out["case_to_control_map"]
+        
+        print(f"    ✓ Matching complete!")
+        print(f"    Cases matched: {n_cases:,}")
+        print(f"    Total selected controls: {len(selected_control_enrolids):,} (unique: {len(set(selected_control_enrolids)):,})")
+        print(f"    Mean matching cost: {all_match_costs.mean():.4f}")
+        
+        return {
+            'n_cases_total': n_cases,
+            'n_cases_matched': n_cases,
+            'n_controls': n_controls,
+            'M': M,
+            'matching_ratio': matching_ratio,
+            'selected_control_enrolids': selected_control_enrolids,
+            'match_costs': all_match_costs,
+            'candidate_majority_enrolids': candidate_majority_enrolids,
+            'case_to_control_map': case_to_control_map,
+            'skipped_reason': None
+        }
+        
+    except Exception as e:
+        print(f"    ✗ ERROR in global matching: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
-def build_undersampled_dataset(df_with_leaves, all_leaf_results, target_col, matching_ratio):
+def build_undersampled_dataset(train_pd, matching_result, target_col, matching_ratio):
     """Build undersampled training dataset from matching results."""
     print(f"\n{'='*80}")
     print("BUILDING UNDERSAMPLED TRAINING DATASET")
     print(f"{'='*80}\n")
     
     # Collect all minority samples (keep ALL)
-    all_minority = df_with_leaves[df_with_leaves[target_col] == 1].copy()
+    all_minority = train_pd[train_pd[target_col] == 1].copy()
     print(f"✓ Collected all minority samples: {len(all_minority):,}")
     
-    # Collect majority samples from each leaf
-    selected_majority_enrolids = []
-    
-    for leaf_id, result in all_leaf_results.items():
-        if result.get('skipped_reason') == 'more_cases_than_controls':
-            # For imbalanced leaves, keep all controls
-            selected_majority_enrolids.extend(result['selected_control_enrolids'].tolist())
-        else:
-            # For matched leaves, use the selected controls
-            selected_majority_enrolids.extend(result['selected_control_enrolids'].tolist())
+    # Collect majority samples from matching result
+    if matching_result.get('skipped_reason') == 'more_cases_than_controls':
+        # For imbalanced case, keep all controls
+        selected_majority_enrolids = matching_result['selected_control_enrolids'].tolist()
+    else:
+        # For matched case, use the selected controls
+        selected_majority_enrolids = matching_result['selected_control_enrolids'].tolist()
     
     # Handle control reuse in 1:k matching
     if matching_ratio > 1:
@@ -320,9 +323,9 @@ def build_undersampled_dataset(df_with_leaves, all_leaf_results, target_col, mat
     
     # Get unique majority samples
     unique_majority_enrolids = list(set(selected_majority_enrolids))
-    selected_majority = df_with_leaves[
-        (df_with_leaves[target_col] == 0) & 
-        (df_with_leaves['ENROLID'].isin(unique_majority_enrolids))
+    selected_majority = train_pd[
+        (train_pd[target_col] == 0) & 
+        (train_pd['ENROLID'].isin(unique_majority_enrolids))
     ].copy()
     
     print(f"✓ Collected selected majority samples: {len(selected_majority):,}")
@@ -385,8 +388,8 @@ def train_and_evaluate_oct(
         print(f"   AUC: {metrics.get('auc', 'N/A'):.4f}" if isinstance(metrics.get('auc'), (int, float)) else f"   AUC: {metrics.get('auc', 'N/A')}")
         print(f"   PR-AUC: {metrics.get('pr_auc', 'N/A'):.4f}" if isinstance(metrics.get('pr_auc'), (int, float)) else f"   PR-AUC: {metrics.get('pr_auc', 'N/A')}")
         print(f"   Optimal F1: {metrics.get('optimal_f1', 'N/A'):.4f}" if isinstance(metrics.get('optimal_f1'), (int, float)) else f"   Optimal F1: {metrics.get('optimal_f1', 'N/A')}")
-        print(f"   Sensitivity (F1 threshold): {metrics.get('sensitivity_f1', 'N/A'):.4f}" if isinstance(metrics.get('sensitivity_f1'), (int, float)) else f"   Sensitivity: {metrics.get('sensitivity_f1', 'N/A')}")
-        print(f"   Specificity (F1 threshold): {metrics.get('specificity_f1', 'N/A'):.4f}" if isinstance(metrics.get('specificity_f1'), (int, float)) else f"   Specificity: {metrics.get('specificity_f1', 'N/A')}")
+        print(f"   Sensitivity (G-mean threshold): {metrics.get('balanced_recall_gmean', 'N/A'):.4f}" if isinstance(metrics.get('balanced_recall_gmean'), (int, float)) else f"   Sensitivity: {metrics.get('sensitivity_f1', 'N/A')}")
+        print(f"   Specificity (G-mean threshold): {metrics.get('balanced_specificity_gmean', 'N/A'):.4f}" if isinstance(metrics.get('balanced_specificity_gmean'), (int, float)) else f"   Specificity: {metrics.get('specificity_f1', 'N/A')}")
     else:
         print(f"   WARNING: metrics is not a dict, type={type(metrics)}")
     
@@ -401,7 +404,7 @@ def main():
     """Main execution function."""
     start_time = datetime.now()
     print(f"\n{'='*80}")
-    print("K-CENTER HYPERPARAMETER SEARCH")
+    print("K-CENTER HYPERPARAMETER SEARCH (GLOBAL UNDERSAMPLING)")
     print(f"{'='*80}")
     print(f"Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     
@@ -418,7 +421,7 @@ def main():
     
     # Load Spark data
     from pyspark.sql import SparkSession
-    spark = SparkSession.builder.appName("KCenterSearch").getOrCreate()
+    spark = SparkSession.builder.appName("KCenterSearchGlobal").getOrCreate()
     df_2018 = spark.read.format("parquet").load("0917_2017_18_with_2017_cost.parquet")
     df_og = df_2018.toPandas()
     print(f"✓ Loaded original data: {df_og.shape}")
@@ -480,20 +483,6 @@ def main():
     
     print(f"✓ Train: {train_pd.shape}, Val: {val_pd.shape}, Test: {test_pd.shape}")
     
-    # Load OCT stratifier model
-    with open(MODEL_PATH, 'rb') as f:
-        saved_data = pickle.load(f)
-        model = saved_data['model']
-        preprocessor = saved_data['preprocessor']
-        feature_names = saved_data['feature_names']
-    print(f"✓ Loaded OCT stratifier from: {MODEL_PATH}")
-    
-    # Load dataframe with leaves
-    df_with_leaves = pd.read_csv(DF_WITH_LEAVES_PATH)
-    print(f"✓ Loaded df_with_leaves from: {DF_WITH_LEAVES_PATH}")
-    print(f"  Shape: {df_with_leaves.shape}")
-    print(f"  Unique leaves: {df_with_leaves['leaf_assignment'].nunique()}")
-    
     # ========================================================================
     # HYPERPARAMETER GRID SEARCH
     # ========================================================================
@@ -526,9 +515,9 @@ def main():
         print(f"{'#'*80}")
         
         try:
-            # Run k-center matching
-            all_leaf_results = run_kcenter_matching_for_config(
-                df_with_leaves=df_with_leaves,
+            # Run global k-center matching
+            matching_result = run_global_kcenter_matching(
+                train_pd=train_pd,
                 target_col=TARGET_COL,
                 feature_cols=feature_cols,
                 pn_h5_path=PN_H5_PATH,
@@ -536,9 +525,6 @@ def main():
                 case_weighting=config['case_weighting'],
                 use_adaptive_pool=config['use_adaptive_pool'],
                 seed_method=config['seed_method'],
-                model=model,
-                preprocessor=preprocessor,
-                feature_names=feature_names,
                 CAT_COLUMNS=CAT_COLUMNS,
                 TRUE_NUM_COLUMNS=TRUE_NUM_COLUMNS,
                 COST_COLUMNS=COST_COLUMNS,
@@ -546,8 +532,8 @@ def main():
             
             # Build undersampled dataset
             undersampled_training_data = build_undersampled_dataset(
-                df_with_leaves=df_with_leaves,
-                all_leaf_results=all_leaf_results,
+                train_pd=train_pd,
+                matching_result=matching_result,
                 target_col=TARGET_COL,
                 matching_ratio=MATCHING_RATIO,
             )
@@ -613,10 +599,12 @@ def main():
             if isinstance(metrics, dict):
                 auc = metrics.get('auc', 0)
                 opt_f1 = metrics.get('optimal_f1', 0)
-                sens = metrics.get('balanced_recall_gmean', 0) #'', 'balanced_specificity_gmean'
+                sens = metrics.get('balanced_recall_gmean', 0)
+                spec = metrics.get('balanced_specificity_gmean', 0)
                 print(f"  AUC: {auc:.4f}" if isinstance(auc, (int, float)) else f"  AUC: {auc}")
                 print(f"  Optimal F1: {opt_f1:.4f}" if isinstance(opt_f1, (int, float)) else f"  Optimal F1: {opt_f1}")
-                print(f"  Sensitivity: {sens:.4f}" if isinstance(sens, (int, float)) else f"  Sensitivity: {sens}")
+                print(f"  Sensitivity: {sens:.4f}" if isinstance(sens, (int, float)) else f"  Sensitivity: {sens}")    
+                print(f"  Specificity: {spec:.4f}" if isinstance(spec, (int, float)) else f"  Specificity: {spec}")
             
         except Exception as e:
             print(f"\n✗ ERROR in configuration {config_name}:")
@@ -661,17 +649,20 @@ def main():
             
             # Display relevant metrics
             display_cols = ['config_name']
-            for col in ['auc', 'pr_auc', 'optimal_f1', 'sensitivity_f1', 'specificity_f1']:
+            for col in ['auc', 'pr_auc', 'optimal_f1', 'balanced_recall_gmean', 'balanced_specificity_gmean']:
                 if col in results_df.columns:
                     display_cols.append(col)
             
             print(results_df_sorted[display_cols].head())
             
             # Also show by optimal F1 if available
-            if 'optimal_f1' in results_df.columns:
-                print(f"\nTop 5 configurations by Optimal F1:")
-                results_df_sorted_f1 = results_df.sort_values('optimal_f1', ascending=False)
-                print(results_df_sorted_f1[display_cols].head())
+            if 'balanced_recall_gmean' in results_df.columns:
+                print(f"\n{'='*80}")
+                print("TOP 10 CONFIGURATIONS BY BALANCED RECALL G-MEAN")
+                print(f"{'='*80}\n")
+                results_df_sorted_f1 = results_df.sort_values('balanced_recall_gmean', ascending=False)
+                print(results_df_sorted_f1[display_cols].head(10).to_string(index=False))
+            
         else:
             print(f"\nAll configurations completed. Available columns: {list(results_df.columns)}")
             print(results_df.head())
