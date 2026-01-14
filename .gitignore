@@ -11,3 +11,5 @@
 *.json
 *.png
 *.pkl
+*.npy
+*.h5
