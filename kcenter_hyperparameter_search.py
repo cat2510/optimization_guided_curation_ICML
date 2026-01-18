@@ -385,8 +385,9 @@ def train_and_evaluate_oct(
         print(f"   AUC: {metrics.get('auc', 'N/A'):.4f}" if isinstance(metrics.get('auc'), (int, float)) else f"   AUC: {metrics.get('auc', 'N/A')}")
         print(f"   PR-AUC: {metrics.get('pr_auc', 'N/A'):.4f}" if isinstance(metrics.get('pr_auc'), (int, float)) else f"   PR-AUC: {metrics.get('pr_auc', 'N/A')}")
         print(f"   Optimal F1: {metrics.get('optimal_f1', 'N/A'):.4f}" if isinstance(metrics.get('optimal_f1'), (int, float)) else f"   Optimal F1: {metrics.get('optimal_f1', 'N/A')}")
-        print(f"   Sensitivity (F1 threshold): {metrics.get('sensitivity_f1', 'N/A'):.4f}" if isinstance(metrics.get('sensitivity_f1'), (int, float)) else f"   Sensitivity: {metrics.get('sensitivity_f1', 'N/A')}")
-        print(f"   Specificity (F1 threshold): {metrics.get('specificity_f1', 'N/A'):.4f}" if isinstance(metrics.get('specificity_f1'), (int, float)) else f"   Specificity: {metrics.get('specificity_f1', 'N/A')}")
+        print(f"   Best MCC: {metrics.get('best_mcc', 'N/A'):.4f}" if isinstance(metrics.get('best_mcc'), (int, float)) else f"   Best MCC: {metrics.get('best_mcc', 'N/A')}")
+        print(f"   Sensitivity (G-mean threshold): {metrics.get('balanced_recall_gmean', 'N/A'):.4f}" if isinstance(metrics.get('balanced_recall_gmean'), (int, float)) else f"   Sensitivity: {metrics.get('sensitivity_f1', 'N/A')}")
+        print(f"   Specificity (G-mean threshold): {metrics.get('balanced_specificity_gmean', 'N/A'):.4f}" if isinstance(metrics.get('balanced_specificity_gmean'), (int, float)) else f"   Specificity: {metrics.get('specificity_f1', 'N/A')}")
     else:
         print(f"   WARNING: metrics is not a dict, type={type(metrics)}")
     
@@ -612,11 +613,17 @@ def main():
             print(f"\n✓ Configuration {idx}/{len(all_combinations)} complete")
             if isinstance(metrics, dict):
                 auc = metrics.get('auc', 0)
+                pr_auc = metrics.get('pr_auc', 0)
                 opt_f1 = metrics.get('optimal_f1', 0)
-                sens = metrics.get('balanced_recall_gmean', 0) #'', 'balanced_specificity_gmean'
+                best_mcc = metrics.get('best_mcc', 0)
+                sens = metrics.get('balanced_recall_gmean', 0)
+                spec = metrics.get('balanced_specificity_gmean', 0)
                 print(f"  AUC: {auc:.4f}" if isinstance(auc, (int, float)) else f"  AUC: {auc}")
+                print(f"  PR-AUC: {pr_auc:.4f}" if isinstance(pr_auc, (int, float)) else f"  PR-AUC: {pr_auc}")
                 print(f"  Optimal F1: {opt_f1:.4f}" if isinstance(opt_f1, (int, float)) else f"  Optimal F1: {opt_f1}")
+                print(f"  Best MCC: {best_mcc:.4f}" if isinstance(best_mcc, (int, float)) else f"  Best MCC: {best_mcc}")
                 print(f"  Sensitivity: {sens:.4f}" if isinstance(sens, (int, float)) else f"  Sensitivity: {sens}")
+                print(f"  Specificity: {spec:.4f}" if isinstance(spec, (int, float)) else f"  Specificity: {spec}")
             
         except Exception as e:
             print(f"\n✗ ERROR in configuration {config_name}:")
@@ -661,17 +668,35 @@ def main():
             
             # Display relevant metrics
             display_cols = ['config_name']
-            for col in ['auc', 'pr_auc', 'optimal_f1', 'sensitivity_f1', 'specificity_f1']:
+            for col in ['auc', 'pr_auc', 'optimal_f1', 'best_mcc', 'balanced_recall_gmean', 'balanced_specificity_gmean']:
                 if col in results_df.columns:
                     display_cols.append(col)
             
             print(results_df_sorted[display_cols].head())
             
+            # Also show by MCC if available
+            if 'best_mcc' in results_df.columns:
+                print(f"\n{'='*80}")
+                print("TOP 10 CONFIGURATIONS BY MCC (MATTHEWS CORRELATION COEFFICIENT)")
+                print(f"{'='*80}\n")
+                results_df_sorted_mcc = results_df.sort_values('best_mcc', ascending=False)
+                print(results_df_sorted_mcc[display_cols].head(10).to_string(index=False))
+            
             # Also show by optimal F1 if available
             if 'optimal_f1' in results_df.columns:
-                print(f"\nTop 5 configurations by Optimal F1:")
+                print(f"\n{'='*80}")
+                print("TOP 10 CONFIGURATIONS BY OPTIMAL F1")
+                print(f"{'='*80}\n")
                 results_df_sorted_f1 = results_df.sort_values('optimal_f1', ascending=False)
-                print(results_df_sorted_f1[display_cols].head())
+                print(results_df_sorted_f1[display_cols].head(10).to_string(index=False))
+            
+            # Also show by balanced recall G-mean if available
+            if 'balanced_recall_gmean' in results_df.columns:
+                print(f"\n{'='*80}")
+                print("TOP 10 CONFIGURATIONS BY BALANCED RECALL G-MEAN")
+                print(f"{'='*80}\n")
+                results_df_sorted_gmean = results_df.sort_values('balanced_recall_gmean', ascending=False)
+                print(results_df_sorted_gmean[display_cols].head(10).to_string(index=False))
         else:
             print(f"\nAll configurations completed. Available columns: {list(results_df.columns)}")
             print(results_df.head())

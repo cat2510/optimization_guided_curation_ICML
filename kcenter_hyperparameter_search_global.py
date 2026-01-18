@@ -36,7 +36,7 @@ from sklearn.impute import SimpleImputer
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-
+TRAIN_TEST_SEED = 9012
 # Hyperparameter grid
 MATCHING_RATIO = 1  # Fixed for now, can be added to grid if needed
 HYPERPARAMETER_GRID = {
@@ -51,9 +51,9 @@ OCT_MINBUCKETS = [50, 100, 120, 150]
 OCT_CPS = [0.00001, 0.0001, 0.001, 0.01]
 
 # Paths
-PN_H5_PATH = "./precomputed_distances/distances_majority_minority.h5"
-RESULTS_DIR = "./kcenter_hyperparameter_search_results_global"
-DNN_OUT_DIR = "./precomputed_distances/global_dnn"
+PN_H5_PATH = f"./precomputed_distances/distances_majority_minority_seed_{TRAIN_TEST_SEED}.h5"
+RESULTS_DIR = f"./kcenter_hyperparameter_search_results_global_seed_{TRAIN_TEST_SEED}"
+DNN_OUT_DIR = f"./precomputed_distances/global_dnn_seed_{TRAIN_TEST_SEED}"
 
 # Target column
 TARGET_COL = "highcost_gt_200000"
@@ -388,6 +388,7 @@ def train_and_evaluate_oct(
         print(f"   AUC: {metrics.get('auc', 'N/A'):.4f}" if isinstance(metrics.get('auc'), (int, float)) else f"   AUC: {metrics.get('auc', 'N/A')}")
         print(f"   PR-AUC: {metrics.get('pr_auc', 'N/A'):.4f}" if isinstance(metrics.get('pr_auc'), (int, float)) else f"   PR-AUC: {metrics.get('pr_auc', 'N/A')}")
         print(f"   Optimal F1: {metrics.get('optimal_f1', 'N/A'):.4f}" if isinstance(metrics.get('optimal_f1'), (int, float)) else f"   Optimal F1: {metrics.get('optimal_f1', 'N/A')}")
+        print(f"   Best MCC: {metrics.get('best_mcc', 'N/A'):.4f}" if isinstance(metrics.get('best_mcc'), (int, float)) else f"   Best MCC: {metrics.get('best_mcc', 'N/A')}")
         print(f"   Sensitivity (G-mean threshold): {metrics.get('balanced_recall_gmean', 'N/A'):.4f}" if isinstance(metrics.get('balanced_recall_gmean'), (int, float)) else f"   Sensitivity: {metrics.get('sensitivity_f1', 'N/A')}")
         print(f"   Specificity (G-mean threshold): {metrics.get('balanced_specificity_gmean', 'N/A'):.4f}" if isinstance(metrics.get('balanced_specificity_gmean'), (int, float)) else f"   Specificity: {metrics.get('specificity_f1', 'N/A')}")
     else:
@@ -470,10 +471,10 @@ def main():
     
     # Train/test split
     train_ids, test_ids, train_pd, test_pd = model_pipeline.train_test_split_enrol(
-        df_og, target_col="cost_stratum_2018", test_size=0.3, verbose=False, random_state=123
+        df_og, target_col="cost_stratum_2018", test_size=0.3, verbose=False, random_state=TRAIN_TEST_SEED
     )
     val_ids, test_ids, val_pd, test_pd = model_pipeline.train_test_split_enrol(
-        test_pd, target_col=TARGET_COL, test_size=0.5, verbose=False
+        test_pd, target_col=TARGET_COL, test_size=0.5, verbose=False,random_state=TRAIN_TEST_SEED
     )
     
     X_test = test_pd[feature_cols]
@@ -598,11 +599,15 @@ def main():
             print(f"\n✓ Configuration {idx}/{len(all_combinations)} complete")
             if isinstance(metrics, dict):
                 auc = metrics.get('auc', 0)
+                pr_auc = metrics.get('pr_auc', 0)
                 opt_f1 = metrics.get('optimal_f1', 0)
+                best_mcc = metrics.get('best_mcc', 0)
                 sens = metrics.get('balanced_recall_gmean', 0)
                 spec = metrics.get('balanced_specificity_gmean', 0)
                 print(f"  AUC: {auc:.4f}" if isinstance(auc, (int, float)) else f"  AUC: {auc}")
+                print(f"  PR-AUC: {pr_auc:.4f}" if isinstance(pr_auc, (int, float)) else f"  PR-AUC: {pr_auc}")
                 print(f"  Optimal F1: {opt_f1:.4f}" if isinstance(opt_f1, (int, float)) else f"  Optimal F1: {opt_f1}")
+                print(f"  Best MCC: {best_mcc:.4f}" if isinstance(best_mcc, (int, float)) else f"  Best MCC: {best_mcc}")
                 print(f"  Sensitivity: {sens:.4f}" if isinstance(sens, (int, float)) else f"  Sensitivity: {sens}")    
                 print(f"  Specificity: {spec:.4f}" if isinstance(spec, (int, float)) else f"  Specificity: {spec}")
             
@@ -649,11 +654,19 @@ def main():
             
             # Display relevant metrics
             display_cols = ['config_name']
-            for col in ['auc', 'pr_auc', 'optimal_f1', 'balanced_recall_gmean', 'balanced_specificity_gmean']:
+            for col in ['auc', 'pr_auc', 'optimal_f1', 'best_mcc', 'balanced_recall_gmean', 'balanced_specificity_gmean']:
                 if col in results_df.columns:
                     display_cols.append(col)
             
             print(results_df_sorted[display_cols].head())
+            
+            # Also show by MCC if available
+            if 'best_mcc' in results_df.columns:
+                print(f"\n{'='*80}")
+                print("TOP 10 CONFIGURATIONS BY MCC (MATTHEWS CORRELATION COEFFICIENT)")
+                print(f"{'='*80}\n")
+                results_df_sorted_mcc = results_df.sort_values('best_mcc', ascending=False)
+                print(results_df_sorted_mcc[display_cols].head(10).to_string(index=False))
             
             # Also show by optimal F1 if available
             if 'balanced_recall_gmean' in results_df.columns:

@@ -25,8 +25,8 @@ from model_IAI import finetune_oct, evaluate_binary_oct
 # ============================================================================
 
 # Paths
-UNDERSAMPLED_DIR = "./kcenter_hyperparameter_search_results"
-RESULTS_DIR = "./oct_training_results"
+UNDERSAMPLED_DIR = "./kcenter_hyperparameter_search_results/undersampled_train_datasets"
+RESULTS_DIR = "./kcenter_hyperparameter_search_results/oct_training_results"
 
 # OCT hyperparameters for model training
 OCT_DEPTHS = [7, 9]
@@ -271,8 +271,9 @@ def main():
                 print(f"    AUC: {metrics.get('auc', 'N/A'):.4f}" if isinstance(metrics.get('auc'), (int, float)) else f"    AUC: {metrics.get('auc', 'N/A')}")
                 print(f"    PR-AUC: {metrics.get('pr_auc', 'N/A'):.4f}" if isinstance(metrics.get('pr_auc'), (int, float)) else f"    PR-AUC: {metrics.get('pr_auc', 'N/A')}")
                 print(f"    Optimal F1: {metrics.get('optimal_f1', 'N/A'):.4f}" if isinstance(metrics.get('optimal_f1'), (int, float)) else f"    Optimal F1: {metrics.get('optimal_f1', 'N/A')}")
-                print(f"    Sensitivity (F1): {metrics.get('sensitivity_f1', 'N/A'):.4f}" if isinstance(metrics.get('sensitivity_f1'), (int, float)) else f"    Sensitivity (F1): {metrics.get('sensitivity_f1', 'N/A')}")
-                print(f"    Specificity (F1): {metrics.get('specificity_f1', 'N/A'):.4f}" if isinstance(metrics.get('specificity_f1'), (int, float)) else f"    Specificity (F1): {metrics.get('specificity_f1', 'N/A')}")
+                print(f"    Best MCC: {metrics.get('best_mcc', 'N/A'):.4f}" if isinstance(metrics.get('best_mcc'), (int, float)) else f"    Best MCC: {metrics.get('best_mcc', 'N/A')}")
+                print(f"    Sensitivity (G-mean threshold): {metrics.get('balanced_recall_gmean', 'N/A'):.4f}" if isinstance(metrics.get('balanced_recall_gmean'), (int, float)) else f"    Sensitivity: {metrics.get('sensitivity_f1', 'N/A')}")
+                print(f"    Specificity (G-mean threshold): {metrics.get('balanced_specificity_gmean', 'N/A'):.4f}" if isinstance(metrics.get('balanced_specificity_gmean'), (int, float)) else f"    Specificity: {metrics.get('specificity_f1', 'N/A')}")
             
         except Exception as e:
             print(f"\n  ✗ ERROR in configuration {config_name}:")
@@ -320,8 +321,7 @@ def main():
             
             # Display relevant columns
             display_cols = ['config_name']
-            for col in ['auc', 'pr_auc', 'optimal_f1', 'sensitivity_f1', 'specificity_f1', 
-                       'balanced_recall_gmean', 'balanced_specificity_gmean']:
+            for col in ['auc', 'pr_auc', 'optimal_f1', 'best_mcc', 'balanced_recall_gmean', 'balanced_specificity_gmean']:
                 if col in results_df.columns:
                     display_cols.append(col)
             
@@ -331,13 +331,29 @@ def main():
             
             print(results_df_sorted[display_cols].head(10).to_string(index=False))
             
+            # Also show by MCC if available
+            if 'best_mcc' in results_df.columns:
+                print(f"\n{'='*80}")
+                print("TOP 10 CONFIGURATIONS BY MCC (MATTHEWS CORRELATION COEFFICIENT)")
+                print(f"{'='*80}\n")
+                results_df_sorted_mcc = results_df.sort_values('best_mcc', ascending=False)
+                print(results_df_sorted_mcc[display_cols].head(10).to_string(index=False))
+            
             # Also show by optimal F1 if available
+            if 'optimal_f1' in results_df.columns:
+                print(f"\n{'='*80}")
+                print("TOP 10 CONFIGURATIONS BY OPTIMAL F1")
+                print(f"{'='*80}\n")
+                results_df_sorted_f1 = results_df.sort_values('optimal_f1', ascending=False)
+                print(results_df_sorted_f1[display_cols].head(10).to_string(index=False))
+            
+            # Also show by balanced recall G-mean if available
             if 'balanced_recall_gmean' in results_df.columns:
                 print(f"\n{'='*80}")
                 print("TOP 10 CONFIGURATIONS BY BALANCED RECALL G-MEAN")
                 print(f"{'='*80}\n")
-                results_df_sorted_f1 = results_df.sort_values('balanced_recall_gmean', ascending=False)
-                print(results_df_sorted_f1[display_cols].head(10).to_string(index=False))
+                results_df_sorted_gmean = results_df.sort_values('balanced_recall_gmean', ascending=False)
+                print(results_df_sorted_gmean[display_cols].head(10).to_string(index=False))
             
             # Save sorted results
             sorted_path = f"{RESULTS_DIR}/metrics_sorted_by_auc.csv"

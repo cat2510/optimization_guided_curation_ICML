@@ -133,7 +133,7 @@ def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
     Hyperparameter tuning for IAI OptimalTreeClassifier
     Selects best hyperparameters based on F1 score
     """
-    print(f"Finetuning OCT with depths: {depths}, minbuckets: {minbuckets}, cps: {cps}, for best recalL!!!")
+    print(f"Finetuning OCT with depths: {depths}, minbuckets: {minbuckets}, cps: {cps}, for best PR-AUC!!!")
     best_score = -1
     best_params = None
     best_model = None
@@ -175,26 +175,26 @@ def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
 
         y_pred = model.predict(X_val_df)
 
-        precision = precision_score(y_val, y_pred, zero_division=0)
-        recall = recall_score(y_val, y_pred, zero_division=0)
+        #precision = precision_score(y_val, y_pred, zero_division=0)
+        #recall = recall_score(y_val, y_pred, zero_division=0)
         f1 = f1_score(y_val, y_pred, zero_division=0)
+        pr_auc = average_precision_score(y_val, y_pred)
 
         results.append({
             "depth": depth,
             "minbucket": minbucket,
             "cp": cp,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1
+            "f1": f1,
+            "pr_auc": pr_auc
         })
 
-        if recall > best_score:
-            best_score = recall
+        if pr_auc > best_score:
+            best_score = pr_auc
             best_params = (depth, minbucket, cp)
             best_model = model
 
-    results_df = pd.DataFrame(results).sort_values("recall", ascending=False)
-
+    results_df = pd.DataFrame(results).sort_values("pr_auc", ascending=False)
+    print(f"Best params: {best_params} @ PR-AUC: {best_score:.3f}")
     return best_model, best_params, results_df,preprocessor, feature_names
 
 
@@ -302,14 +302,63 @@ def _save_tree_splits(learner, out_path):
         if methods:
             print(f"   Split-related: {methods[:5]}")
 
+from sklearn.metrics import matthews_corrcoef
+
+def best_mcc_threshold(y_true, y_proba):
+    """
+    Find threshold t that maximizes MCC for predictions 1{p >= t}.
+
+    Returns
+    -------
+    dict with keys:
+      - threshold
+      - mcc
+      - y_pred
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_proba = np.asarray(y_proba).astype(float)
+
+    # If y_true has only one class, MCC is undefined -> return NaN
+    if np.unique(y_true).size < 2:
+        return {"threshold": np.nan, "mcc": np.nan, "y_pred": np.zeros_like(y_true)}
+
+    # If all probabilities identical, any threshold yields constant predictions -> MCC will be 0 (or NaN)
+    if np.all(y_proba == y_proba[0]):
+        y_pred = (y_proba >= y_proba[0]).astype(int)  # all 1s
+        mcc = matthews_corrcoef(y_true, y_pred) if np.unique(y_pred).size > 1 else 0.0
+        return {"threshold": float(y_proba[0]), "mcc": float(mcc), "y_pred": y_pred}
+
+    # Candidate thresholds: midpoints between sorted unique probabilities
+    uniq = np.unique(y_proba)
+    uniq.sort()
+
+    # thresholds that induce distinct labelings for rule (p >= t):
+    # include extremes so we can produce all-1 and all-0 predictions
+    candidates = np.concatenate((
+        [uniq[0] - 1e-12],                    # all predicted 1
+        (uniq[:-1] + uniq[1:]) / 2.0,         # changes happen between uniq values
+        [uniq[-1] + 1e-12],                   # all predicted 0
+    ))
+
+    best = {"threshold": np.nan, "mcc": -np.inf, "y_pred": None}
+
+    for t in candidates:
+        y_pred = (y_proba >= t).astype(int)
+        # MCC is defined even if y_pred is constant, but it becomes 0.0 in sklearn when denominator is 0
+        mcc = matthews_corrcoef(y_true, y_pred)
+        if mcc > best["mcc"]:
+            best = {"threshold": float(t), "mcc": float(mcc), "y_pred": y_pred}
+
+    return best
+
 def evaluate_binary_oct(
     iai_model,
     X_test_df,
     y_test,
     preprocessor,
     feature_names,
-    results_dir=None,              # ← NEW: where to save predictions
-    ratio=None                     # ← NEW: to encode file name
+    results_dir=None,
+    ratio=None
 ):
     print(f"Test dataset for OCT application: {len(X_test_df):,} samples")
 
@@ -351,18 +400,29 @@ def evaluate_binary_oct(
     precision_curve, recall_curve, thresholds = precision_recall_curve(y_test_series, y_proba)
     f1_scores = 2 * precision_curve * recall_curve / (precision_curve + recall_curve + 1e-10)
 
-    best_idx = np.argmax(f1_scores)
-    best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
-
-    y_pred_opt = (y_proba >= best_threshold).astype(int)
-    X_test_processed["predicted_class_optf1"] = y_pred_opt
-
+    best_idx = int(np.argmax(f1_scores))
+    best_threshold = float(thresholds[best_idx]) if best_idx < len(thresholds) else 0.5
     # ------------------------------------------------------------
-    # Balanced recall/specificity thresholds (no F1/Youden)
+    # Balanced recall/specificity thresholds (Gmean or min-side)
     # ------------------------------------------------------------
     balanced = best_balanced_threshold(y_test_series.values, y_proba)
+
     # ------------------------------------------------------------
-    # **WRITE OUT PREDICTIONS TO DISK**
+    # MCC (balanced precision/recall trade-off) at multiple thresholds
+    # ------------------------------------------------------------
+    mcc_best = best_mcc_threshold(y_test_series.values, y_proba.values if hasattr(y_proba, "values") else y_proba)
+    best_mcc_threshold_value = mcc_best["threshold"]
+    best_mcc_value = mcc_best["mcc"]
+    y_pred_opt_mcc = mcc_best["y_pred"]
+    
+    # Compute recall, precision, and specificity at best MCC threshold from confusion matrix
+    tn_mcc, fp_mcc, fn_mcc, tp_mcc = confusion_matrix(y_test_series, y_pred_opt_mcc).ravel()
+    recall_mcc = tp_mcc / (tp_mcc + fn_mcc) if (tp_mcc + fn_mcc) else 0.0
+    precision_mcc = tp_mcc / (tp_mcc + fp_mcc) if (tp_mcc + fp_mcc) else 0.0
+    specificity_mcc = tn_mcc / (tn_mcc + fp_mcc) if (tn_mcc + fp_mcc) else 0.0
+    
+    # ------------------------------------------------------------
+    # WRITE OUT PREDICTIONS TO DISK
     # ------------------------------------------------------------
     if results_dir is not None:
         os.makedirs(results_dir, exist_ok=True)
@@ -373,49 +433,41 @@ def evaluate_binary_oct(
         else:
             pred_path = f"{results_dir}/predictions/oct_predictions.csv"
             tree_path = f"{results_dir}/oct_tree.json"
-        X_test_processed.to_csv(pred_path, index=False)       # ← NEW OUTPUT FILE
+        X_test_processed.to_csv(pred_path, index=False)
         print(f"✓ Saved OCT predictions to: {pred_path}")
         _save_tree_splits(iai_model, tree_path)
-    # Confusion matrix for optimized threshold
-    tn, fp, fn, tp = confusion_matrix(y_test_series, y_pred_opt).ravel()
-    sensitivity = tp / (tp + fn) if (tp + fn) else 0.0
-    specificity = tn / (tn + fp) if (tn + fp) else 0.0
-    tn, fp, fn, tp = confusion_matrix(y_test_series, y_pred_default).ravel()
-    sensitivity_default = tp / (tp + fn) if (tp + fn) else 0.0
-    specificity_default = tn / (tn + fp) if (tn + fp) else 0.0
-    
+
     print(f"AUC score: {auc:.3f}")
     print(f"PR-AUC (Average Precision): {pr_auc:.3f}")
-    print(f"Sensitivity (Recall): {sensitivity:.3f}")
-    print(f"Specificity: {specificity:.3f}")
+    print(f"Best MCC: {best_mcc_value:.3f} @ threshold={best_mcc_threshold_value:.6f}")
+    print(f"Sensitivity (Recall) @MCC*: {recall_mcc:.3f}")
+    print(f"Specificity @MCC*: {specificity_mcc:.3f}")
     print(f"Balanced (G-mean) recall: {balanced['gmean_opt']['recall']:.3f}")
     print(f"Balanced (G-mean) specificity: {balanced['gmean_opt']['specificity']:.3f}")
-    print(f"Sensitivity (default): {sensitivity_default:.3f}")
-    print(f"Specificity (default): {specificity_default:.3f}")
     print("Number of leaves:", len(pd.unique(leaf_assignments)))
-
 
     # ------------------------------------------------------------
     # Return dictionary for logging
     # ------------------------------------------------------------
+    # Compute precision at G-mean threshold
+    precision_gmean = None
+    if 'gmean_opt' in balanced and 'threshold' in balanced['gmean_opt']:
+        y_pred_gmean = (y_proba >= balanced['gmean_opt']['threshold']).astype(int)
+        tn_gmean, fp_gmean, fn_gmean, tp_gmean = confusion_matrix(y_test_series, y_pred_gmean).ravel()
+        precision_gmean = tp_gmean / (tp_gmean + fp_gmean) if (tp_gmean + fp_gmean) else 0.0
+    
     return {
         "auc": auc,
         "pr_auc": pr_auc,
-        "f1_threshold": best_threshold,
-        "optimal_f1": f1_scores[best_idx],
-        "sensitivity_f1": sensitivity,
-        "specificity_f1": specificity,
-        "sensitivity_default": sensitivity_default,
-        "specificity_default": specificity_default,
-        "balanced_threshold_gmean": balanced["gmean_opt"]["threshold"],
-        "balanced_recall_gmean": balanced["gmean_opt"]["recall"],
-        "balanced_specificity_gmean": balanced["gmean_opt"]["specificity"],
-        "balanced_threshold_minside": balanced["minside_opt"]["threshold"],
-        "balanced_recall_minside": balanced["minside_opt"]["recall"],
-        "balanced_specificity_minside": balanced["minside_opt"]["specificity"],
-        
-    }
-
+        "best_mcc": best_mcc_value,
+        "best_mcc_threshold": best_mcc_threshold_value,
+        "recall_mcc": float(recall_mcc),
+        "precision_mcc": float(precision_mcc),
+        "optimal_f1": float(f1_scores[best_idx]),
+        "balanced_recall_gmean": float(balanced["gmean_opt"]["recall"]),
+        "balanced_specificity_gmean": float(balanced["gmean_opt"]["specificity"]),
+        "precision_gmean": float(precision_gmean) if precision_gmean is not None else None,
+}
 
 # -------------------------------
 # Expected Calibration Error (ECE)
@@ -482,218 +534,5 @@ def best_balanced_threshold(y_true, y_prob):
 
     return {"gmean_opt": pack(idx_g), "minside_opt": pack(idx_min)}
 
-
-def calculate_auc_by_vanilla_subgroups(
-    anchor_model_pred_path,
-    y_test,
-    test_model_pred_path=None,
-    enrolid_col=None
-):
-    """
-    Calculate AUC in subgroups defined by vanilla OCT leaf assignments.
-    Uses leaf_assignment directly from predictions CSV files for reliability.
-    
-    Note: Vanilla OCT assigns constant probabilities within each leaf (tree behavior),
-    so vanilla ROC AUC within subgroups will be 0.5 (no discrimination within leaf).
-    The balanced OCT can have varying probabilities within the same leaves, allowing
-    for discrimination. For fair comparison, also check calibration_error and mean_proba.
-    
-    Parameters
-    ----------
-    anchor_model_pred_path : str
-        Path to anchor model OCT predictions CSV (must have 'leaf_assignment' and 'predicted_proba' columns)
-    y_test : pd.Series or array-like
-        True labels (must align with predictions by position/index)
-    test_model_pred_path : str, optional
-        Path to test model OCT predictions CSV (must have 'predicted_proba' column).
-        If provided, will calculate metrics using balanced probabilities in vanilla subgroups.
-    enrolid_col : str, optional
-        (Deprecated - not used) Kept for backward compatibility.
-    
-    Returns
-    -------
-    dict
-        Dictionary with:
-        - 'subgroups': DataFrame with subgroup assignments and metrics including:
-          * positive_rate: actual positive rate in subgroup
-          * vanilla_mean_proba: mean vanilla probability (constant within leaf)
-          * vanilla_calibration_error: |mean_proba - positive_rate|
-          * balanced_mean_proba: mean balanced probability
-          * balanced_calibration_error: |mean_proba - positive_rate|
-          * vanilla_roc_auc: Will be 0.5 if constant (expected for trees)
-          * balanced_roc_auc: Can be >0.5 if probabilities vary
-        - 'vanilla_roc_auc_by_subgroup': dict mapping subgroup_id to vanilla ROC AUC
-        - 'vanilla_pr_auc_by_subgroup': dict mapping subgroup_id to vanilla PR-AUC
-        - 'balanced_roc_auc_by_subgroup': dict mapping subgroup_id to balanced ROC AUC (if provided)
-        - 'balanced_pr_auc_by_subgroup': dict mapping subgroup_id to balanced PR-AUC (if provided)
-    """
-    # Load vanilla OCT predictions
-    vanilla_preds = pd.read_csv(anchor_model_pred_path)
-    
-    if 'leaf_assignment' not in vanilla_preds.columns:
-        raise ValueError(f"Vanilla predictions CSV must have 'leaf_assignment' column: {anchor_model_pred_path}")
-    if 'predicted_proba' not in vanilla_preds.columns:
-        raise ValueError(f"Vanilla predictions CSV must have 'predicted_proba' column: {anchor_model_pred_path}")
-    
-    # Load balanced OCT predictions if provided
-    balanced_preds = pd.read_csv(test_model_pred_path)
-    if 'predicted_proba' not in balanced_preds.columns:
-        raise ValueError(f"Balanced predictions CSV must have 'predicted_proba' column: {test_model_pred_path}")
-    
-    # Prepare y_test as Series
-    y_test = pd.Series(y_test)
-    
-    # Match predictions with y_test
-    if enrolid_col is not None:
-        # Match by ENROLID
-        if enrolid_col not in vanilla_preds.columns:
-            raise ValueError(f"ENROLID column '{enrolid_col}' not found in anchor model predictions")
-        # Set ENROLID as index for matching
-        vanilla_preds = vanilla_preds.set_index(enrolid_col)
-        if balanced_preds is not None:
-            if enrolid_col not in balanced_preds.columns:
-                raise ValueError(f"ENROLID column '{enrolid_col}' not found in test model predictions")
-            balanced_preds = balanced_preds.set_index(enrolid_col)
-        # y_test should also have ENROLID as index
-        if not isinstance(y_test.index, pd.Index) or enrolid_col not in str(y_test.index.name):
-            # Try to set index if y_test has ENROLID column
-            if hasattr(y_test, 'name') and y_test.name == enrolid_col:
-                pass  # Already indexed
-            else:
-                raise ValueError(f"y_test should have ENROLID as index when enrolid_col is provided")
-    
-    # Align by index (assuming same order or mat ching indices)
-    aligned_indices = vanilla_preds.index.intersection(y_test.index)
-    if len(aligned_indices) == 0:
-        # Try matching by position if indices don't match
-        min_len = min(len(vanilla_preds), len(y_test))
-        aligned_indices = vanilla_preds.index[:min_len]
-        y_test_aligned = y_test.iloc[:min_len]
-        print(f"⚠ Warning: Indices don't match. Using first {min_len} samples by position")
-    else:
-        y_test_aligned = y_test.loc[aligned_indices]
-    
-    vanilla_leaf_assignments = vanilla_preds.loc[aligned_indices, 'leaf_assignment']
-    vanilla_probas = vanilla_preds.loc[aligned_indices, 'predicted_proba']
-    
-    if balanced_preds is not None:
-        balanced_indices = balanced_preds.index.intersection(aligned_indices)
-        if len(balanced_indices) != len(aligned_indices):
-            print(f"⚠ Warning: Only {len(balanced_indices)}/{len(aligned_indices)} samples matched for balanced predictions")
-        balanced_probas = balanced_preds.loc[balanced_indices, 'predicted_proba']
-        # Align balanced with vanilla indices
-        balanced_probas_aligned = pd.Series(index=aligned_indices, dtype=float)
-        balanced_probas_aligned.loc[balanced_indices] = balanced_probas
-    else:
-        balanced_probas_aligned = None
-    
-    # Group by leaf_assignment and calculate metrics
-    results = []
-    
-    for leaf_id in sorted(vanilla_leaf_assignments.unique()):
-        # Get samples in this leaf (by position/index)
-        leaf_mask = vanilla_leaf_assignments == leaf_id
-        leaf_indices = np.where(leaf_mask)[0]  # Get integer positions
-        
-        if len(leaf_indices) == 0:
-            continue
-        
-        # Get labels and probabilities for this subgroup
-        y_subgroup = y_test_aligned.iloc[leaf_indices]
-        proba_vanilla_subgroup = vanilla_probas.iloc[leaf_indices]
-        
-        # Calculate vanilla metrics for this subgroup (ROC AUC and PR-AUC)
-        vanilla_roc_auc = np.nan
-        vanilla_pr_auc = np.nan
-        if len(y_subgroup.unique()) < 2:
-            n_pos = len(y_subgroup[y_subgroup == 1])
-            n_neg = len(y_subgroup[y_subgroup == 0])
-        else:
-            try:
-                vanilla_roc_auc = roc_auc_score(y_subgroup, proba_vanilla_subgroup)
-                vanilla_pr_auc = average_precision_score(y_subgroup, proba_vanilla_subgroup)
-                n_pos = int((y_subgroup == 1).sum())
-                n_neg = int((y_subgroup == 0).sum())
-            except ValueError:
-                n_pos = int((y_subgroup == 1).sum())
-                n_neg = int((y_subgroup == 0).sum())
-        
-        # Calculate balanced metrics if provided (ROC AUC and PR-AUC)
-        balanced_roc_auc = np.nan
-        balanced_pr_auc = np.nan
-        test_model_proba_mean = np.nan
-        test_model_proba_std = np.nan
-        test_model_proba_min = np.nan
-        test_model_proba_max = np.nan
-        if balanced_probas_aligned is not None:
-            proba_balanced_subgroup = balanced_probas_aligned.iloc[leaf_indices]
-            # Remove NaN values (samples not in balanced predictions)
-            valid_mask = ~proba_balanced_subgroup.isna()
-            if valid_mask.sum() > 0:
-                valid_positions = np.where(valid_mask)[0]
-                valid_leaf_indices = leaf_indices[valid_positions]
-                y_subgroup_balanced = y_test_aligned.iloc[valid_leaf_indices]
-                proba_balanced_subgroup_valid = proba_balanced_subgroup.iloc[valid_positions]
-                
-                # Calculate probability distribution statistics
-                test_model_proba_mean = float(proba_balanced_subgroup_valid.mean())
-                test_model_proba_std = float(proba_balanced_subgroup_valid.std())
-                test_model_proba_min = float(proba_balanced_subgroup_valid.min())
-                test_model_proba_max = float(proba_balanced_subgroup_valid.max())
-                
-                if len(y_subgroup_balanced.unique()) >= 2:
-                    try:
-                        balanced_roc_auc = roc_auc_score(y_subgroup_balanced, proba_balanced_subgroup_valid)
-                        balanced_pr_auc = average_precision_score(y_subgroup_balanced, proba_balanced_subgroup_valid)
-                    except ValueError:
-                        pass
-        
-        results.append({
-            'subgroup_id': leaf_id,
-            'n_samples': len(leaf_indices),
-            'n_positive': n_pos,
-            'n_negative': n_neg,
-            'positive_rate': n_pos / len(leaf_indices) if len(leaf_indices) > 0 else 0,
-            'anchor_model_roc_auc': vanilla_roc_auc,  # Will be 0.5 if constant (expected for trees)
-            'anchor_model_pr_auc': vanilla_pr_auc,
-            'test_model_roc_auc': balanced_roc_auc,  # Can be >0.5 if probabilities vary within leaf
-            'test_model_pr_auc': balanced_pr_auc,
-            'test_model_proba_mean': test_model_proba_mean,  # Mean probability in subgroup
-            'test_model_proba_std': test_model_proba_std,  # Std of probabilities (low = homogeneous)
-            'test_model_proba_range': test_model_proba_max - test_model_proba_min  # Range (high = heterogeneous)
-        })
-    
-    results_df = pd.DataFrame(results)
-    results_df = results_df[results_df['n_samples'] > 0].sort_values('subgroup_id')
-    
-    # Calculate overall AUC for comparison (on all test samples, not just within subgroups)
-    overall_vanilla_auc = roc_auc_score(y_test_aligned, vanilla_probas)
-    overall_vanilla_pr_auc = average_precision_score(y_test_aligned, vanilla_probas)
-    
-    overall_balanced_auc = np.nan
-    overall_balanced_pr_auc = np.nan
-    if balanced_probas_aligned is not None:
-        valid_balanced = ~balanced_probas_aligned.isna()
-        if valid_balanced.sum() > 0:
-            overall_balanced_auc = roc_auc_score(y_test_aligned[valid_balanced], balanced_probas_aligned[valid_balanced])
-            overall_balanced_pr_auc = average_precision_score(y_test_aligned[valid_balanced], balanced_probas_aligned[valid_balanced])
-    
-    # Create summary dictionaries
-    vanilla_roc_auc_dict = dict(zip(results_df['subgroup_id'], results_df['anchor_model_roc_auc']))
-    vanilla_pr_auc_dict = dict(zip(results_df['subgroup_id'], results_df['anchor_model_pr_auc']))
-    balanced_roc_auc_dict = dict(zip(results_df['subgroup_id'], results_df['test_model_roc_auc'])) if balanced_preds is not None else {}
-    balanced_pr_auc_dict = dict(zip(results_df['subgroup_id'], results_df['test_model_pr_auc'])) if balanced_preds is not None else {}
-    
-    return {
-        'subgroups': results_df,
-        'overall_anchor_model_roc_auc': overall_vanilla_auc,
-        'overall_anchor_model_pr_auc': overall_vanilla_pr_auc,
-        'overall_test_model_roc_auc': overall_balanced_auc,
-        'overall_test_model_pr_auc': overall_balanced_pr_auc,
-        'anchor_model_roc_auc_by_subgroup': vanilla_roc_auc_dict,
-        'anchor_model_pr_auc_by_subgroup': vanilla_pr_auc_dict,
-        'test_model_roc_auc_by_subgroup': balanced_roc_auc_dict,
-        'test_model_pr_auc_by_subgroup': balanced_pr_auc_dict
-    }
 
 
