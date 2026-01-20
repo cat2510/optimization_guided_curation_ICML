@@ -36,9 +36,9 @@ from sklearn.impute import SimpleImputer
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-TRAIN_TEST_SEED = 9012
+TRAIN_TEST_SEED = 123
 # Hyperparameter grid
-MATCHING_RATIO = 1  # Fixed for now, can be added to grid if needed
+MATCHING_RATIO = 2  # Fixed for now, can be added to grid if needed
 HYPERPARAMETER_GRID = {
     'case_weighting': [None, "boundary", "uncertainty", "density_inverse"],
     'use_adaptive_pool': [True, False],
@@ -51,8 +51,8 @@ OCT_MINBUCKETS = [50, 100, 120, 150]
 OCT_CPS = [0.00001, 0.0001, 0.001, 0.01]
 
 # Paths
-PN_H5_PATH = f"./precomputed_distances/distances_majority_minority_seed_{TRAIN_TEST_SEED}.h5"
-RESULTS_DIR = f"./kcenter_hyperparameter_search_results_global_seed_{TRAIN_TEST_SEED}"
+PN_H5_PATH = f"./precomputed_distances/distances_majority_minority.h5" #_seed_{TRAIN_TEST_SEED}
+RESULTS_DIR = f"./kcenter_hyperparameter_search_results_global_seed_{TRAIN_TEST_SEED}_matching_ratio_{MATCHING_RATIO}"
 DNN_OUT_DIR = f"./precomputed_distances/global_dnn_seed_{TRAIN_TEST_SEED}"
 
 # Target column
