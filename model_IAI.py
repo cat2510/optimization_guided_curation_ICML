@@ -5,6 +5,7 @@ import pandas as pd
 from interpretableai import iai
 import itertools
 from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score, precision_recall_curve, confusion_matrix, brier_score_loss, roc_curve, roc_auc_score
+from sklearn.exceptions import NotFittedError
 from model_pipeline import get_preprocessor, train_test_split_enrol
 from sklearn.calibration import calibration_curve
 import matplotlib.pyplot as plt
@@ -147,8 +148,16 @@ def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
     feature_names = []
     for name, transformer, columns in preprocessor.transformers_:
         if name == 'ohe':
-            ohe_features = transformer.get_feature_names_out(columns)
-            feature_names.extend(ohe_features)
+            # Only get feature names if OneHotEncoder exists, has columns, and is fitted
+            # Skip if columns is empty (old get_preprocessor bug) or transformer not fitted
+            if columns:  # Only process if there are actual columns to encode
+                try:
+                    # Check if fitted by trying to access categories_ or calling get_feature_names_out
+                    ohe_features = transformer.get_feature_names_out(columns)
+                    feature_names.extend(ohe_features)
+                except (NotFittedError, AttributeError, ValueError):
+                    # Skip if not fitted or other error (shouldn't happen with fixed get_preprocessor)
+                    pass
         elif name == 'num':
             feature_names.extend(columns)
         elif name == 'remainder' and preprocessor.remainder == 'passthrough':

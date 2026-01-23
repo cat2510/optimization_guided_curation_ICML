@@ -23,6 +23,13 @@ import numpy as np
 import pandas as pd
 from itertools import product
 from datetime import datetime
+import time
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("Warning: psutil not available. Resource tracking will be limited.")
 
 # Import custom modules
 import model_pipeline
@@ -40,7 +47,7 @@ TRAIN_TEST_SEED = 123
 # Hyperparameter grid
 MATCHING_RATIO = 2  # Fixed for now, can be added to grid if needed
 HYPERPARAMETER_GRID = {
-    'case_weighting': [None, "boundary", "uncertainty", "density_inverse"],
+    'case_weighting': [None, "boundary"],
     'use_adaptive_pool': [True, False],
     'seed_method': ["smart", "centroid", "density", "random"],
 }
@@ -61,6 +68,43 @@ TARGET_COL = "highcost_gt_200000"
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
+
+def get_resource_usage():
+    """
+    Get current CPU and memory usage.
+    
+    Returns:
+        dict: Dictionary with 'cpu_percent', 'memory_mb', 'memory_percent'
+    """
+    if PSUTIL_AVAILABLE:
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        return {
+            'cpu_percent': process.cpu_percent(interval=0.1),
+            'memory_mb': memory_info.rss / (1024 * 1024),  # RSS in MB
+            'memory_percent': process.memory_percent(),
+        }
+    else:
+        return {
+            'cpu_percent': None,
+            'memory_mb': None,
+            'memory_percent': None,
+        }
+
+
+def format_time(seconds):
+    """
+    Format time in a readable way.
+    For times < 0.1s, report with more precision.
+    For times >= 0.1s, report with 2 decimal places.
+    """
+    if seconds < 0.1:
+        return f"{seconds:.4f}"
+    elif seconds < 1.0:
+        return f"{seconds:.3f}"
+    else:
+        return f"{seconds:.2f}"
+
 
 def get_model_probabilities_for_uncertainty(
     train_pd,
@@ -114,6 +158,7 @@ def run_global_kcenter_matching(
     CAT_COLUMNS=None,
     TRUE_NUM_COLUMNS=None,
     COST_COLUMNS=None,
+    dnn_out_dir=None,  # Optional: dataset-specific DNN output directory
 ):
     """
     Run global k-center matching (single call) with specified hyperparameters.
@@ -152,6 +197,10 @@ def run_global_kcenter_matching(
         print(f"\n  ⚠️ WARNING: More cases ({n_cases:,}) than controls ({n_controls:,})")
         print(f"     Strategy: SKIP k-center matching - keep ALL minority and ALL majority as-is")
         
+        # Track timing even for skipped case
+        resources_after = get_resource_usage()
+        sampling_time = 0.0  # No actual matching performed
+        
         return {
             'n_cases_total': n_cases,
             'n_cases_matched': 0,
@@ -161,7 +210,9 @@ def run_global_kcenter_matching(
             'match_costs': np.array([]),
             'candidate_majority_enrolids': controls["ENROLID"].to_numpy(),
             'case_to_control_map': {},
-            'skipped_reason': 'more_cases_than_controls'
+            'skipped_reason': 'more_cases_than_controls',
+            'sampling_time_seconds': sampling_time,
+            'sampling_memory_mb': resources_after['memory_mb'] if PSUTIL_AVAILABLE else None,
         }
     
     # Preprocess controls to get feature matrix
@@ -200,21 +251,47 @@ def run_global_kcenter_matching(
     print(f"\n  Preparing control-control distances (global)...")
     majority_enrolids = controls["ENROLID"].to_numpy()
 
+    # Use dataset-specific DNN directory if provided, otherwise use global default
+    if dnn_out_dir is None:
+        dnn_out_dir = DNN_OUT_DIR
+    
     # Paths used by precompute_leaf_dnn_memmap for the global run
-    dnn_matrix_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_matrix.npy")
-    dnn_enrolids_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_enrolids.npy")
+    dnn_matrix_npy = os.path.join(dnn_out_dir, "leaf_global_dnn_matrix.npy")
+    dnn_enrolids_npy = os.path.join(dnn_out_dir, "leaf_global_dnn_enrolids.npy")
 
+    # Check if existing files match current ENROLIDs
+    should_recompute = False
     if os.path.exists(dnn_matrix_npy) and os.path.exists(dnn_enrolids_npy):
-        print(f"    ✓ Found existing global d_nn files, loading paths:")
-        print(f"      d_nn matrix: {dnn_matrix_npy}")
-        print(f"      d_nn enrolids: {dnn_enrolids_npy}")
+        try:
+            existing_dnn_ids = np.load(dnn_enrolids_npy)
+            existing_set = set(existing_dnn_ids.astype(int))
+            current_set = set(majority_enrolids.astype(int))
+            
+            if existing_set != current_set:
+                print(f"    ⚠️  Existing DNN files have different ENROLIDs!")
+                print(f"       Existing: {len(existing_set):,} ENROLIDs")
+                print(f"       Current: {len(current_set):,} ENROLIDs")
+                print(f"       Mismatch: {len(existing_set - current_set):,} extra, {len(current_set - existing_set):,} missing")
+                print(f"       Forcing recomputation...")
+                should_recompute = True
+            else:
+                print(f"    ✓ Found existing global d_nn files with matching ENROLIDs:")
+                print(f"      d_nn matrix: {dnn_matrix_npy}")
+                print(f"      d_nn enrolids: {dnn_enrolids_npy}")
+        except Exception as e:
+            print(f"    ⚠️  Error checking existing DNN files: {e}")
+            print(f"       Forcing recomputation...")
+            should_recompute = True
     else:
+        should_recompute = True
+    
+    if should_recompute:
         print(f"    ⚙️  Computing global control-control distances (this is done once)...")
         dnn_matrix_npy, dnn_enrolids_npy = precompute_leaf_dnn_memmap(
             X_majority_leaf=X_majority,
             majority_enrolids_leaf=majority_enrolids,
-            out_dir=DNN_OUT_DIR,
-            leaf_id="global",  # Use \"global\" as leaf_id
+            out_dir=dnn_out_dir,
+            leaf_id="global",  # Use "global" as leaf_id
             batch_size=750,
         )
         print(f"    ✓ Control-control distances computed and saved")
@@ -244,6 +321,11 @@ def run_global_kcenter_matching(
     
     # Run two-stage k-center matching
     print(f"\n  Running two-stage k-center matching (1:{matching_ratio})...")
+    
+    # Track resources before matching
+    resources_before = get_resource_usage()
+    sampling_start_time = time.perf_counter()
+    
     try:
         out = two_stage_kcenter_then_match(
             leaf_controls_enrolids=controls["ENROLID"].to_numpy(),
@@ -265,6 +347,10 @@ def run_global_kcenter_matching(
             predicted_probs=predicted_probs,
         )
         
+        sampling_end_time = time.perf_counter()
+        sampling_time = sampling_end_time - sampling_start_time
+        resources_after = get_resource_usage()
+        
         # Extract results
         selected_control_enrolids = out["selected_control_enrolids"]
         all_match_costs = out["match_costs"]
@@ -275,6 +361,10 @@ def run_global_kcenter_matching(
         print(f"    Cases matched: {n_cases:,}")
         print(f"    Total selected controls: {len(selected_control_enrolids):,} (unique: {len(set(selected_control_enrolids)):,})")
         print(f"    Mean matching cost: {all_match_costs.mean():.4f}")
+        print(f"    Sampling time: {format_time(sampling_time)}s")
+        if PSUTIL_AVAILABLE:
+            memory_delta = resources_after['memory_mb'] - resources_before['memory_mb']
+            print(f"    Memory used: {resources_after['memory_mb']:.1f} MB (Δ {memory_delta:+.1f} MB)")
         
         return {
             'n_cases_total': n_cases,
@@ -286,7 +376,9 @@ def run_global_kcenter_matching(
             'match_costs': all_match_costs,
             'candidate_majority_enrolids': candidate_majority_enrolids,
             'case_to_control_map': case_to_control_map,
-            'skipped_reason': None
+            'skipped_reason': None,
+            'sampling_time_seconds': sampling_time,
+            'sampling_memory_mb': resources_after['memory_mb'] if PSUTIL_AVAILABLE else None,
         }
         
     except Exception as e:
@@ -362,6 +454,10 @@ def train_and_evaluate_oct(
     
     from model_IAI import finetune_oct, evaluate_binary_oct
     
+    # Track resources before training
+    resources_before = get_resource_usage()
+    oct_start_time = time.perf_counter()
+    
     # Train OCT
     balanced_model, balanced_params, _, preprocessor, feature_names = finetune_oct(
         X_train=undersampled_training_data[feature_cols],
@@ -375,6 +471,10 @@ def train_and_evaluate_oct(
         cps=OCT_CPS,
     )
     
+    oct_end_time = time.perf_counter()
+    oct_time = oct_end_time - oct_start_time
+    resources_after = get_resource_usage()
+    
     # Evaluate
     metrics = evaluate_binary_oct(
         balanced_model, X_test, y_test, preprocessor, feature_names,
@@ -383,6 +483,10 @@ def train_and_evaluate_oct(
     
     print(f"\n✓ Model training complete:")
     print(f"   Best params: {balanced_params}")
+    print(f"   OCT training time: {format_time(oct_time)}s")
+    if PSUTIL_AVAILABLE:
+        memory_delta = resources_after['memory_mb'] - resources_before['memory_mb']
+        print(f"   Memory used: {resources_after['memory_mb']:.1f} MB (Δ {memory_delta:+.1f} MB)")
     
     if isinstance(metrics, dict):
         print(f"   AUC: {metrics.get('auc', 'N/A'):.4f}" if isinstance(metrics.get('auc'), (int, float)) else f"   AUC: {metrics.get('auc', 'N/A')}")
@@ -393,6 +497,12 @@ def train_and_evaluate_oct(
         print(f"   Specificity (G-mean threshold): {metrics.get('balanced_specificity_gmean', 'N/A'):.4f}" if isinstance(metrics.get('balanced_specificity_gmean'), (int, float)) else f"   Specificity: {metrics.get('specificity_f1', 'N/A')}")
     else:
         print(f"   WARNING: metrics is not a dict, type={type(metrics)}")
+    
+    # Add timing and resource info to metrics
+    if isinstance(metrics, dict):
+        metrics['oct_training_time_seconds'] = oct_time
+        metrics['oct_training_memory_mb'] = resources_after['memory_mb'] if PSUTIL_AVAILABLE else None
+        metrics['oct_training_cpu_percent'] = resources_after['cpu_percent'] if PSUTIL_AVAILABLE else None
     
     return balanced_model, balanced_params, metrics
 
@@ -515,6 +625,10 @@ def main():
         print(f"CONFIGURATION {idx}/{len(all_combinations)}: {config_name}")
         print(f"{'#'*80}")
         
+        # Track total time for this configuration
+        config_start_time = time.perf_counter()
+        config_resources_start = get_resource_usage()
+        
         try:
             # Run global k-center matching
             matching_result = run_global_kcenter_matching(
@@ -557,6 +671,10 @@ def main():
                 results_dir=RESULTS_DIR,
             )
             
+            config_end_time = time.perf_counter()
+            config_total_time = config_end_time - config_start_time
+            config_resources_end = get_resource_usage()
+            
             # Collect results
             # Handle balanced_params (tuple of depth, minbucket, cp)
             if isinstance(balanced_params, tuple) and len(balanced_params) == 3:
@@ -580,9 +698,31 @@ def main():
                 **params_dict,
             }
             
+            # Add timing metrics
+            row['sampling_time_seconds'] = matching_result.get('sampling_time_seconds', None)
+            row['oct_training_time_seconds'] = metrics.get('oct_training_time_seconds', None) if isinstance(metrics, dict) else None
+            row['total_config_time_seconds'] = config_total_time
+            
+            # Add resource metrics
+            if PSUTIL_AVAILABLE:
+                row['sampling_memory_mb'] = matching_result.get('sampling_memory_mb', None)
+                row['oct_training_memory_mb'] = metrics.get('oct_training_memory_mb', None) if isinstance(metrics, dict) else None
+                row['config_peak_memory_mb'] = config_resources_end['memory_mb']
+                row['config_peak_cpu_percent'] = config_resources_end['cpu_percent']
+                row['config_memory_delta_mb'] = config_resources_end['memory_mb'] - config_resources_start['memory_mb']
+            else:
+                row['sampling_memory_mb'] = None
+                row['oct_training_memory_mb'] = None
+                row['config_peak_memory_mb'] = None
+                row['config_peak_cpu_percent'] = None
+                row['config_memory_delta_mb'] = None
+            
             # Add metrics (handle both dict and non-dict cases)
             if isinstance(metrics, dict):
-                row.update(metrics)
+                # Remove timing/resource keys that we've already added separately
+                metrics_clean = {k: v for k, v in metrics.items() 
+                               if k not in ['oct_training_time_seconds', 'oct_training_memory_mb', 'oct_training_cpu_percent']}
+                row.update(metrics_clean)
             else:
                 row['metrics_error'] = str(metrics)
             
@@ -597,6 +737,12 @@ def main():
             )
             
             print(f"\n✓ Configuration {idx}/{len(all_combinations)} complete")
+            print(f"  Total time: {format_time(config_total_time)}s")
+            print(f"    - Sampling: {format_time(row.get('sampling_time_seconds', 0))}s")
+            print(f"    - OCT training: {format_time(row.get('oct_training_time_seconds', 0))}s")
+            if PSUTIL_AVAILABLE and row.get('config_peak_memory_mb'):
+                print(f"  Peak memory: {row['config_peak_memory_mb']:.1f} MB")
+            
             if isinstance(metrics, dict):
                 auc = metrics.get('auc', 0)
                 pr_auc = metrics.get('pr_auc', 0)
@@ -612,19 +758,28 @@ def main():
                 print(f"  Specificity: {spec:.4f}" if isinstance(spec, (int, float)) else f"  Specificity: {spec}")
             
         except Exception as e:
+            config_end_time = time.perf_counter()
+            config_total_time = config_end_time - config_start_time
+            config_resources_end = get_resource_usage()
+            
             print(f"\n✗ ERROR in configuration {config_name}:")
             print(f"  {e}")
+            print(f"  Time before error: {format_time(config_total_time)}s")
             import traceback
             traceback.print_exc()
             
-            # Log error
+            # Log error with timing info
             row = {
                 'config_name': config_name,
                 'case_weighting': config['case_weighting'],
                 'use_adaptive_pool': config['use_adaptive_pool'],
                 'seed_method': config['seed_method'],
                 'error': str(e),
+                'total_config_time_seconds': config_total_time,
             }
+            if PSUTIL_AVAILABLE:
+                row['config_peak_memory_mb'] = config_resources_end['memory_mb']
+                row['config_peak_cpu_percent'] = config_resources_end['cpu_percent']
             all_results.append(row)
             continue
     

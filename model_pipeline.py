@@ -1,6 +1,6 @@
 from sklearn import calibration
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler,label_binarize
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, FunctionTransformer, label_binarize
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
@@ -31,6 +31,7 @@ def get_preprocessor(df,categorical_cols, numeric_cols,verbose: bool = True,
     """
     Returns a ColumnTransformer that one-hot-encodes categorical columns
     and scales numeric columns.  If verbose=True, prints which cols go where.
+    Only includes transformers for non-empty column lists.
     """
     # Filter columns to those present in df
     categorical_cols = [col for col in categorical_cols if col in df.columns]
@@ -41,13 +42,24 @@ def get_preprocessor(df,categorical_cols, numeric_cols,verbose: bool = True,
         print(f"   • OneHotEncoder on: {categorical_cols}")
         print(f"   • StandardScaler on: {numeric_cols}")
 
-    preprocessor = ColumnTransformer(
-        [
-            ("ohe", OneHotEncoder(drop="first", handle_unknown="ignore"), categorical_cols),
-            ("num", StandardScaler(), numeric_cols),
-        ],
-        remainder="passthrough",
-    )
+    # Build transformers list - only include transformers for non-empty column lists
+    transformers = []
+    if categorical_cols:
+        transformers.append(("ohe", OneHotEncoder(drop="first", handle_unknown="ignore"), categorical_cols))
+    if numeric_cols:
+        transformers.append(("num", StandardScaler(), numeric_cols))
+    
+    # If no transformers, return a passthrough transformer
+    if not transformers:
+        preprocessor = ColumnTransformer(
+            [("passthrough", FunctionTransformer(), list(df.columns))],
+            remainder="drop"
+        )
+    else:
+        preprocessor = ColumnTransformer(
+            transformers,
+            remainder="passthrough",
+        )
     return preprocessor
 
 def get_stratifier_model(df, categorical_cols, numeric_cols, model_type='xgb_multiclass', 
