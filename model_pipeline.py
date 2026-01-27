@@ -53,7 +53,7 @@ def get_preprocessor(df,categorical_cols, numeric_cols,verbose: bool = True,
     if not transformers:
         preprocessor = ColumnTransformer(
             [("passthrough", FunctionTransformer(), list(df.columns))],
-            remainder="drop"
+            remainder="passthrough"
         )
     else:
         preprocessor = ColumnTransformer(

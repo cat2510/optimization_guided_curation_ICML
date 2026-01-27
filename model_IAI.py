@@ -10,66 +10,10 @@ from model_pipeline import get_preprocessor, train_test_split_enrol
 from sklearn.calibration import calibration_curve
 import matplotlib.pyplot as plt
 import os
-def train_opt_with_feature_names(X_train, treatments, outcomes,
-                                 categorical_cols, numeric_cols,
-                                 max_depth=5, minbucket=50, cp=0.001):
-   
-    # Step 1: Create and fit preprocessor
-    from model_pipeline import get_preprocessor
-    preprocessor = get_preprocessor(X_train, categorical_cols, numeric_cols)
-    
-    # Step 2: Fit and transform
-    X_train_transformed = preprocessor.fit_transform(X_train)
-    
-    # Step 3: Get feature names after transformation
-    feature_names = []
-    
-    for name, transformer, columns in preprocessor.transformers_:
-        if name == 'ohe':
-            # OneHotEncoder - get encoded feature names
-            ohe_features = transformer.get_feature_names_out(columns)
-            feature_names.extend(ohe_features)
-        elif name == 'num':
-            # StandardScaler - keeps same names
-            feature_names.extend(columns)
-        elif name == 'remainder':
-            # Passthrough features
-            if preprocessor.remainder == 'passthrough':
-                # Get columns not in other transformers
-                all_cols = X_train.columns.tolist()
-                used_cols = []
-                for _, _, cols in preprocessor.transformers_[:-1]:
-                    used_cols.extend(cols)
-                remainder_cols = [c for c in all_cols if c not in used_cols]
-                feature_names.extend(remainder_cols)
-    
-    # Step 4: Create DataFrames with proper feature names
-    X_train_df = pd.DataFrame(X_train_transformed, columns=feature_names)
-
-    (train_X, train_treatments, train_outcomes), (test_X, test_treatments, test_outcomes) = (
-        iai.split_data('policy_maximize', X_train_df, treatments, outcomes, seed=123, train_proportion=0.5))
-    reward_lnr = iai.CategoricalClassificationRewardEstimator(
-        propensity_estimator=iai.RandomForestClassifier(),
-        outcome_estimator=iai.RandomForestClassifier(),
-        reward_estimator='direct_method',
-        random_seed=123,
-    )
-    train_predictions, train_reward_score = reward_lnr.fit_predict(
-        train_X, train_treatments, train_outcomes,
-        propensity_score_criterion='auc', outcome_score_criterion='auc')
-    train_rewards = train_predictions['reward']
-    grid = iai.GridSearch(
-    iai.OptimalTreePolicyMaximizer(
-        random_seed=121,
-        max_categoric_levels_before_warning=20,
-    ),
-    max_depth=range(6),
-    )
-    grid.fit(train_X, train_rewards)
-    opt_learner = grid.get_learner()
-    
-    return opt_learner, preprocessor, feature_names
-
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 def train_oct_with_feature_names(X_train, y_train, 
                                  categorical_cols, numeric_cols,
@@ -125,6 +69,82 @@ def train_oct_with_feature_names(X_train, y_train,
      
     return iai_model, preprocessor, feature_names
 
+
+def get_preprocessor_with_impute(categorical_cols, numeric_cols, verbose=True):
+    if verbose:
+        print("→ Building preprocessor w/ imputation:")
+        print(f"   • Cat: impute(most_frequent) + OHE on: {categorical_cols}")
+        print(f"   • Num: impute(median) + scale on: {numeric_cols}")
+
+    transformers = []
+    if categorical_cols:
+        cat_pipe = Pipeline(steps=[
+            ("impute", SimpleImputer(strategy="most_frequent")),
+            ("ohe", OneHotEncoder(drop="first", handle_unknown="ignore")),
+        ])
+        transformers.append(("cat", cat_pipe, categorical_cols))
+    if numeric_cols:
+        num_pipe = Pipeline(steps=[
+            ("impute", SimpleImputer(strategy="median")),
+            ("scale", StandardScaler()),
+        ])
+        transformers.append(("num", num_pipe, numeric_cols))
+
+    return ColumnTransformer(transformers=transformers, remainder="drop")
+
+def finetune_oct_impute(
+    X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
+    depths=[5, 7, 9], minbuckets=[50, 100, 150], cps=[1e-6, 1e-5, 1e-4]
+):
+    """
+    Same as finetune_oct but with imputation inside the preprocessor.
+    Selects best hyperparameters by PR-AUC on validation.
+    Returns: best_model, best_params, results_df, preprocessor, feature_names
+    """
+    print(f"Finetuning OCT (with imputation) for best PR-AUC")
+    best_score = -np.inf
+    best_params = None
+    best_model = None
+    results = []
+
+    # Build and fit preprocessor on TRAIN only (important)
+    preprocessor = get_preprocessor_with_impute(categorical_cols, numeric_cols, verbose=True)
+    X_train_t = preprocessor.fit_transform(X_train)
+    X_val_t = preprocessor.transform(X_val)
+
+    # Feature names
+    feature_names = []
+    if categorical_cols:
+        ohe = preprocessor.named_transformers_["cat"].named_steps["ohe"]
+        feature_names.extend(list(ohe.get_feature_names_out(categorical_cols)))
+    if numeric_cols:
+        feature_names.extend(list(numeric_cols))
+
+    X_train_df = pd.DataFrame(X_train_t, columns=feature_names)
+    X_val_df = pd.DataFrame(X_val_t, columns=feature_names)
+
+    for depth, minbucket, cp in itertools.product(depths, minbuckets, cps):
+        model = iai.OptimalTreeClassifier(
+            max_depth=depth,
+            minbucket=minbucket,
+            cp=cp,
+            random_seed=123
+        )
+        model.fit(X_train_df, y_train)
+
+        # Validation PR-AUC (threshold-free) for selection
+        y_val_proba = model.predict_proba(X_val_df).iloc[:, 1]
+        pr = average_precision_score(y_val, y_val_proba)
+
+        results.append((depth, minbucket, cp, pr))
+        if pr > best_score:
+            best_score = pr
+            best_params = (depth, minbucket, cp)
+            best_model = model
+
+    results_df = pd.DataFrame(results, columns=["depth", "minbucket", "cp", "val_pr_auc"])
+    print(f"Best params: {best_params} @ val PR-AUC: {best_score:.4f}")
+    return best_model, best_params, results_df, preprocessor, feature_names
 
 def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
                  depths=[5, 7,9],
@@ -367,8 +387,41 @@ def evaluate_binary_oct(
     preprocessor,
     feature_names,
     results_dir=None,
-    ratio=None
+    save_suffix=None,
+    X_val_df=None,
+    y_val=None
 ):
+    """
+    Evaluate OCT model on test set.
+    
+    Parameters
+    ----------
+    iai_model : IAI OptimalTreeClassifier
+        Trained model
+    X_test_df : DataFrame
+        Test set features for evaluation
+    y_test : array-like
+        Test set labels
+    preprocessor : sklearn Pipeline
+        Fitted preprocessor
+    feature_names : list
+        Feature names after preprocessing
+    results_dir : str, optional
+        Directory to save results
+    ratio : float, optional
+        Matching ratio (for file naming)
+    X_val_df : DataFrame, optional
+        Validation set features for threshold selection. If provided, thresholds
+        (MCC, G-mean, F1) will be computed on validation set and applied to test set.
+        This is recommended for proper evaluation: use validation set during
+        hyperparameter tuning, and test set only for final evaluation.
+    y_val : array-like, optional
+        Validation set labels (required if X_val_df is provided)
+    
+    Returns
+    -------
+    dict : Evaluation metrics
+    """
     print(f"Test dataset for OCT application: {len(X_test_df):,} samples")
 
     # ------------------------------------------------------------
@@ -381,9 +434,10 @@ def evaluate_binary_oct(
         # Base predictions from OCT
         y_pred_default = iai_model.predict(X_test_processed)
         y_proba = iai_model.predict_proba(X_test_processed).iloc[:, 1]
+        out = X_test_processed.copy()
 
-        X_test_processed["predicted_proba"] = y_proba
-        X_test_processed["predicted_class_default"] = y_pred_default
+        out["predicted_proba"] = y_proba
+        out["predicted_class_default"] = y_pred_default
         leaf_assignments = iai_model.apply(X_test_processed)
 
         print("✓ Predictions completed")
@@ -392,8 +446,8 @@ def evaluate_binary_oct(
         print(f"✗ Error applying OCT: {e}")
         raise e
 
-    X_test_processed["leaf_assignment"] = leaf_assignments
-    X_test_processed["predicted_cost_stratum_default"] = y_pred_default
+    out["leaf_assignment"] = leaf_assignments
+    out["predicted_cost_stratum_default"] = y_pred_default
 
     y_test_series = pd.Series(y_test).reset_index(drop=True)
 
@@ -404,25 +458,60 @@ def evaluate_binary_oct(
     pr_auc = average_precision_score(y_test_series, y_proba)
 
     # ------------------------------------------------------------
-    # F1-optimal thresholding
+    # Threshold selection: use validation set if provided, otherwise test set
     # ------------------------------------------------------------
-    precision_curve, recall_curve, thresholds = precision_recall_curve(y_test_series, y_proba)
-    f1_scores = 2 * precision_curve * recall_curve / (precision_curve + recall_curve + 1e-10)
-
-    best_idx = int(np.argmax(f1_scores))
-    best_threshold = float(thresholds[best_idx]) if best_idx < len(thresholds) else 0.5
-    # ------------------------------------------------------------
-    # Balanced recall/specificity thresholds (Gmean or min-side)
-    # ------------------------------------------------------------
-    balanced = best_balanced_threshold(y_test_series.values, y_proba)
-
-    # ------------------------------------------------------------
-    # MCC (balanced precision/recall trade-off) at multiple thresholds
-    # ------------------------------------------------------------
-    mcc_best = best_mcc_threshold(y_test_series.values, y_proba.values if hasattr(y_proba, "values") else y_proba)
-    best_mcc_threshold_value = mcc_best["threshold"]
-    best_mcc_value = mcc_best["mcc"]
-    y_pred_opt_mcc = mcc_best["y_pred"]
+    if X_val_df is not None and y_val is not None:
+        # Compute thresholds on validation set (proper evaluation)
+        print(f"Computing optimal thresholds on validation set ({len(X_val_df):,} samples)")
+        X_val_processed = preprocessor.transform(X_val_df)
+        X_val_processed = pd.DataFrame(X_val_processed, columns=feature_names)
+        y_proba_val = iai_model.predict_proba(X_val_processed).iloc[:, 1]
+        y_val_series = pd.Series(y_val).reset_index(drop=True)
+        
+        # F1-optimal thresholding on validation set
+        precision_curve_val, recall_curve_val, thresholds_val = precision_recall_curve(y_val_series, y_proba_val)
+        f1_scores_val = 2 * precision_curve_val * recall_curve_val / (precision_curve_val + recall_curve_val + 1e-10)
+        best_idx_val = int(np.argmax(f1_scores_val))
+        best_threshold_f1 = float(thresholds_val[best_idx_val]) if best_idx_val < len(thresholds_val) else 0.5
+        
+        # Balanced recall/specificity thresholds on validation set
+        balanced = best_balanced_threshold(y_val_series.values, y_proba_val.values if hasattr(y_proba_val, "values") else y_proba_val)
+        
+        # MCC threshold on validation set
+        mcc_best = best_mcc_threshold(y_val_series.values, y_proba_val.values if hasattr(y_proba_val, "values") else y_proba_val)
+        best_mcc_threshold_value = mcc_best["threshold"]
+        
+        # Apply validation-set thresholds to test set for evaluation
+        y_pred_opt_mcc = (y_proba >= best_mcc_threshold_value).astype(int)
+        print(f"  Applied validation-set thresholds to test set for evaluation")
+    else:
+        # Compute thresholds on test set (less rigorous, but sometimes used for final reporting)
+        print(f"Computing optimal thresholds on test set (not recommended for hyperparameter tuning)")
+        # F1-optimal thresholding
+        precision_curve, recall_curve, thresholds = precision_recall_curve(y_test_series, y_proba)
+        f1_scores = 2 * precision_curve * recall_curve / (precision_curve + recall_curve + 1e-10)
+        best_idx = int(np.argmax(f1_scores))
+        best_threshold_f1 = float(thresholds[best_idx]) if best_idx < len(thresholds) else 0.5
+        
+        # Balanced recall/specificity thresholds
+        balanced = best_balanced_threshold(y_test_series.values, y_proba.values if hasattr(y_proba, "values") else y_proba)
+        
+        # MCC threshold
+        mcc_best = best_mcc_threshold(y_test_series.values, y_proba.values if hasattr(y_proba, "values") else y_proba)
+        best_mcc_threshold_value = mcc_best["threshold"]
+        y_pred_opt_mcc = mcc_best["y_pred"]
+    
+    # Evaluate metrics on test set using selected thresholds
+    if X_val_df is not None:
+        # Thresholds computed on validation set, evaluate on test set
+        best_mcc_value = matthews_corrcoef(y_test_series, y_pred_opt_mcc)
+        # Compute F1 on test set using validation-set F1 threshold
+        y_pred_f1 = (y_proba >= best_threshold_f1).astype(int)
+        optimal_f1 = f1_score(y_test_series, y_pred_f1, zero_division=0)
+    else:
+        # Thresholds computed on test set
+        best_mcc_value = mcc_best["mcc"]
+        optimal_f1 = float(f1_scores[best_idx])
     
     # Compute recall, precision, and specificity at best MCC threshold from confusion matrix
     tn_mcc, fp_mcc, fn_mcc, tp_mcc = confusion_matrix(y_test_series, y_pred_opt_mcc).ravel()
@@ -430,40 +519,63 @@ def evaluate_binary_oct(
     precision_mcc = tp_mcc / (tp_mcc + fp_mcc) if (tp_mcc + fp_mcc) else 0.0
     specificity_mcc = tn_mcc / (tn_mcc + fp_mcc) if (tn_mcc + fp_mcc) else 0.0
     
+    # Compute precision, recall, and specificity at G-mean threshold on test set
+    precision_gmean = None
+    balanced_recall_gmean_test = None
+    balanced_specificity_gmean_test = None
+    if 'gmean_opt' in balanced and 'threshold' in balanced['gmean_opt']:
+        gmean_threshold = balanced['gmean_opt']['threshold']
+        y_pred_gmean = (y_proba >= gmean_threshold).astype(int)
+        tn_gmean, fp_gmean, fn_gmean, tp_gmean = confusion_matrix(y_test_series, y_pred_gmean).ravel()
+        precision_gmean = tp_gmean / (tp_gmean + fp_gmean) if (tp_gmean + fp_gmean) else 0.0
+        balanced_recall_gmean_test = tp_gmean / (tp_gmean + fn_gmean) if (tp_gmean + fn_gmean) else 0.0
+        balanced_specificity_gmean_test = tn_gmean / (tn_gmean + fp_gmean) if (tn_gmean + fp_gmean) else 0.0
+    
     # ------------------------------------------------------------
     # WRITE OUT PREDICTIONS TO DISK
     # ------------------------------------------------------------
     if results_dir is not None:
         os.makedirs(results_dir, exist_ok=True)
         os.makedirs(f"{results_dir}/predictions", exist_ok=True)
-        if ratio is not None:
-            pred_path = f"{results_dir}/predictions/oct_predictions_ratio_{ratio:.2f}.csv"
-            tree_path = f"{results_dir}/oct_tree_ratio_{ratio:.2f}.json"
+        if save_suffix is not None:
+            pred_path = f"{results_dir}/predictions/oct_predictions_{save_suffix}.csv"
+            tree_path = f"{results_dir}/oct_tree_{save_suffix}.json"
         else:
             pred_path = f"{results_dir}/predictions/oct_predictions.csv"
             tree_path = f"{results_dir}/oct_tree.json"
-        X_test_processed.to_csv(pred_path, index=False)
+        # after creating out = X_test_processed.copy()
+        if "ENROLID" in X_test_df.columns:
+            out.insert(0, "ENROLID", X_test_df.reset_index(drop=True)["ENROLID"].values)
+        out.to_csv(pred_path, index=False)
         print(f"✓ Saved OCT predictions to: {pred_path}")
         _save_tree_splits(iai_model, tree_path)
 
     print(f"AUC score: {auc:.3f}")
     print(f"PR-AUC (Average Precision): {pr_auc:.3f}")
-    print(f"Best MCC: {best_mcc_value:.3f} @ threshold={best_mcc_threshold_value:.6f}")
+    if X_val_df is not None:
+        print(f"Best MCC (test set, threshold from val): {best_mcc_value:.3f} @ threshold={best_mcc_threshold_value:.6f}")
+    else:
+        print(f"Best MCC: {best_mcc_value:.3f} @ threshold={best_mcc_threshold_value:.6f}")
     print(f"Sensitivity (Recall) @MCC*: {recall_mcc:.3f}")
     print(f"Specificity @MCC*: {specificity_mcc:.3f}")
-    print(f"Balanced (G-mean) recall: {balanced['gmean_opt']['recall']:.3f}")
-    print(f"Balanced (G-mean) specificity: {balanced['gmean_opt']['specificity']:.3f}")
+    if X_val_df is not None and balanced_recall_gmean_test is not None:
+        print(f"Balanced (G-mean) recall (test set, threshold from val): {balanced_recall_gmean_test:.3f}")
+        print(f"Balanced (G-mean) specificity (test set, threshold from val): {balanced_specificity_gmean_test:.3f}")
+    else:
+        print(f"Balanced (G-mean) recall: {balanced['gmean_opt']['recall']:.3f}")
+        print(f"Balanced (G-mean) specificity: {balanced['gmean_opt']['specificity']:.3f}")
     print("Number of leaves:", len(pd.unique(leaf_assignments)))
 
     # ------------------------------------------------------------
     # Return dictionary for logging
     # ------------------------------------------------------------
-    # Compute precision at G-mean threshold
-    precision_gmean = None
-    if 'gmean_opt' in balanced and 'threshold' in balanced['gmean_opt']:
-        y_pred_gmean = (y_proba >= balanced['gmean_opt']['threshold']).astype(int)
-        tn_gmean, fp_gmean, fn_gmean, tp_gmean = confusion_matrix(y_test_series, y_pred_gmean).ravel()
-        precision_gmean = tp_gmean / (tp_gmean + fp_gmean) if (tp_gmean + fp_gmean) else 0.0
+    # Use test-set metrics when validation set was provided, otherwise use original values
+    if X_val_df is not None and balanced_recall_gmean_test is not None:
+        balanced_recall_gmean = balanced_recall_gmean_test
+        balanced_specificity_gmean = balanced_specificity_gmean_test
+    else:
+        balanced_recall_gmean = balanced["gmean_opt"]["recall"]
+        balanced_specificity_gmean = balanced["gmean_opt"]["specificity"]
     
     return {
         "auc": auc,
@@ -472,11 +584,11 @@ def evaluate_binary_oct(
         "best_mcc_threshold": best_mcc_threshold_value,
         "recall_mcc": float(recall_mcc),
         "precision_mcc": float(precision_mcc),
-        "optimal_f1": float(f1_scores[best_idx]),
-        "balanced_recall_gmean": float(balanced["gmean_opt"]["recall"]),
-        "balanced_specificity_gmean": float(balanced["gmean_opt"]["specificity"]),
+        "optimal_f1": float(optimal_f1),
+        "balanced_recall_gmean": float(balanced_recall_gmean),
+        "balanced_specificity_gmean": float(balanced_specificity_gmean),
         "precision_gmean": float(precision_gmean) if precision_gmean is not None else None,
-}
+    }
 
 # -------------------------------
 # Expected Calibration Error (ECE)

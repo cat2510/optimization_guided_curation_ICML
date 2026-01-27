@@ -45,11 +45,11 @@ from sklearn.impute import SimpleImputer
 # ============================================================================
 TRAIN_TEST_SEED = 123
 # Hyperparameter grid
-MATCHING_RATIO = 2  # Fixed for now, can be added to grid if needed
+MATCHING_RATIO = 1  # Fixed for now, can be added to grid if needed
 HYPERPARAMETER_GRID = {
-    'case_weighting': [None, "boundary"],
-    'use_adaptive_pool': [True, False],
-    'seed_method': ["smart", "centroid", "density", "random"],
+    'case_weighting': ["boundary",None], #, "boundary",None
+    'use_adaptive_pool': [True,False],
+    'seed_method': ["density","smart","centroid","random"],#"smart", "centroid", "density", 
 }
 
 # OCT hyperparameters for model training
@@ -104,46 +104,6 @@ def format_time(seconds):
         return f"{seconds:.3f}"
     else:
         return f"{seconds:.2f}"
-
-
-def get_model_probabilities_for_uncertainty(
-    train_pd,
-    feature_cols,
-    target_col,
-    CAT_COLUMNS,
-    TRUE_NUM_COLUMNS,
-    X_cases,
-):
-    """
-    Train a simple model on full training data to get probabilities for uncertainty weighting.
-    Uses a Random Forest for quick training.
-    """
-    from sklearn.ensemble import RandomForestClassifier
-    from model_pipeline import get_preprocessor
-    
-    print(f"\n  Training Random Forest for uncertainty weighting...")
-    
-    # Preprocess training data
-    preprocessor = get_preprocessor(
-        df=train_pd[feature_cols],
-        categorical_cols=CAT_COLUMNS,
-        numeric_cols=TRUE_NUM_COLUMNS,
-        verbose=False
-    )
-    X_train_processed = preprocessor.transform(train_pd[feature_cols])
-    y_train = train_pd[target_col]
-    
-    # Train RF
-    rf = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
-    rf.fit(X_train_processed, y_train)
-    
-    # Get probabilities for cases
-    X_cases_processed = preprocessor.transform(X_cases)
-    predicted_probs = rf.predict_proba(X_cases_processed)
-    
-    print(f"    ✓ Got probabilities for {len(predicted_probs)} cases")
-    
-    return predicted_probs
 
 
 def run_global_kcenter_matching(
@@ -297,7 +257,7 @@ def run_global_kcenter_matching(
         print(f"    ✓ Control-control distances computed and saved")
     
     # Normal case: n_controls >= n_cases
-    M = max(n_cases * matching_ratio, min(8000, n_controls))
+    M = n_controls//2
     
     print(f"\n  K-Center Configuration:")
     print(f"    M (candidate pool size): {M:,} / {n_controls:,} ({M/n_controls*100:.1f}%)")
@@ -305,19 +265,6 @@ def run_global_kcenter_matching(
     print(f"    Seed method: {seed_method}")
     print(f"    Adaptive pool: {use_adaptive_pool}")
     print(f"    Case weighting: {case_weighting}")
-    
-    # Get probabilities if needed for uncertainty weighting
-    predicted_probs = None
-    if case_weighting == "uncertainty":
-        print(f"\n  Computing probabilities for uncertainty weighting...")
-        predicted_probs = get_model_probabilities_for_uncertainty(
-            train_pd=train_pd,
-            feature_cols=feature_cols,
-            target_col=target_col,
-            CAT_COLUMNS=CAT_COLUMNS,
-            TRUE_NUM_COLUMNS=TRUE_NUM_COLUMNS,
-            X_cases=cases[feature_cols],
-        )
     
     # Run two-stage k-center matching
     print(f"\n  Running two-stage k-center matching (1:{matching_ratio})...")
@@ -344,7 +291,6 @@ def run_global_kcenter_matching(
             matching_ratio=matching_ratio,
             X_majority_leaf=X_majority,
             case_weighting=case_weighting,
-            predicted_probs=predicted_probs,
         )
         
         sampling_end_time = time.perf_counter()
@@ -475,10 +421,11 @@ def train_and_evaluate_oct(
     oct_time = oct_end_time - oct_start_time
     resources_after = get_resource_usage()
     
-    # Evaluate
+    # Evaluate (use validation set for threshold tuning)
     metrics = evaluate_binary_oct(
         balanced_model, X_test, y_test, preprocessor, feature_names,
-        results_dir=results_dir, ratio=1.0
+        results_dir=results_dir, save_suffix="ckd_best_oct_curated",
+        X_val_df=X_val, y_val=y_val  # Use validation set for threshold tuning
     )
     
     print(f"\n✓ Model training complete:")
@@ -802,10 +749,24 @@ def main():
     if all_results:
         results_df = pd.DataFrame(all_results)
         
+        # Calculate and print average times
+        sampling_times = results_df['sampling_time_seconds'].dropna()
+        oct_training_times = results_df['oct_training_time_seconds'].dropna()
+        
+        if len(sampling_times) > 0:
+            avg_sampling_time = sampling_times.mean()
+            print(f"\n⏱️  Average Runtime Across All Configurations:")
+            print(f"   Average sampling time: {format_time(avg_sampling_time)}s")
+            if len(oct_training_times) > 0:
+                avg_oct_time = oct_training_times.mean()
+                print(f"   Average OCT training time: {format_time(avg_oct_time)}s")
+                total_avg_time = avg_sampling_time + avg_oct_time
+                print(f"   Average total time per configuration: {format_time(total_avg_time)}s")
+        
         # Sort by AUC (primary metric from evaluate_binary_oct)
-        if 'auc' in results_df.columns:
-            results_df_sorted = results_df.sort_values('auc', ascending=False)
-            print(f"\nTop 5 configurations by AUC:")
+        if 'pr_auc' in results_df.columns:
+            results_df_sorted = results_df.sort_values('pr_auc', ascending=False)
+            print(f"\nTop 5 configurations by PR-AUC:")
             
             # Display relevant metrics
             display_cols = ['config_name']
@@ -814,22 +775,6 @@ def main():
                     display_cols.append(col)
             
             print(results_df_sorted[display_cols].head())
-            
-            # Also show by MCC if available
-            if 'best_mcc' in results_df.columns:
-                print(f"\n{'='*80}")
-                print("TOP 10 CONFIGURATIONS BY MCC (MATTHEWS CORRELATION COEFFICIENT)")
-                print(f"{'='*80}\n")
-                results_df_sorted_mcc = results_df.sort_values('best_mcc', ascending=False)
-                print(results_df_sorted_mcc[display_cols].head(10).to_string(index=False))
-            
-            # Also show by optimal F1 if available
-            if 'balanced_recall_gmean' in results_df.columns:
-                print(f"\n{'='*80}")
-                print("TOP 10 CONFIGURATIONS BY BALANCED RECALL G-MEAN")
-                print(f"{'='*80}\n")
-                results_df_sorted_f1 = results_df.sort_values('balanced_recall_gmean', ascending=False)
-                print(results_df_sorted_f1[display_cols].head(10).to_string(index=False))
             
         else:
             print(f"\nAll configurations completed. Available columns: {list(results_df.columns)}")

@@ -291,53 +291,6 @@ def compute_case_weights_boundary(
     return weights.astype(np.float32)
 
 
-def compute_case_weights_uncertainty(
-    predicted_probs: np.ndarray,
-    normalize: bool = True
-) -> np.ndarray:
-    """
-    Uncertainty weighting: w_i = H(p(y|x_i)) (Shannon entropy)
-    
-    Cases with high prediction uncertainty get higher weight.
-    Intuition: Uncertain cases are near decision boundary, need better matches.
-    
-    Parameters
-    ----------
-    predicted_probs : np.ndarray, shape (n_cases, n_classes)
-        Predicted class probabilities from a classifier for each case
-    normalize : bool, default=True
-        Whether to normalize weights to sum to n_cases
-    
-    Returns
-    -------
-    weights : np.ndarray, shape (n_cases,)
-        Weight for each case based on prediction entropy
-    
-    Examples
-    --------
-    >>> # From a trained classifier
-    >>> probs = clf.predict_proba(X_cases)
-    >>> weights = compute_case_weights_uncertainty(probs)
-    """
-    # Shannon entropy: H(p) = -Σ p_c log(p_c)
-    # Add small epsilon to avoid log(0)
-    eps = 1e-10
-    probs_safe = np.clip(predicted_probs, eps, 1.0)
-    
-    # Compute entropy for each case
-    entropy = -np.sum(probs_safe * np.log2(probs_safe), axis=1)
-    
-    # Entropy is already non-negative and bounded
-    # Higher entropy = higher uncertainty = higher weight
-    weights = entropy
-    
-    if normalize:
-        # Normalize to sum to n_cases
-        weights = weights * (len(weights) / (weights.sum() + 1e-10))
-    
-    return weights.astype(np.float32)
-
-
 def compute_case_weights_density_inverse(
     d_pn_leaf: np.ndarray,
     epsilon: Optional[float] = None,
