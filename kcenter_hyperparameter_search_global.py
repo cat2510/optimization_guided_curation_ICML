@@ -115,6 +115,7 @@ def run_global_kcenter_matching(
     case_weighting,
     use_adaptive_pool,
     seed_method,
+    candidate_pool_size=None,
     CAT_COLUMNS=None,
     TRUE_NUM_COLUMNS=None,
     COST_COLUMNS=None,
@@ -257,8 +258,10 @@ def run_global_kcenter_matching(
         print(f"    ✓ Control-control distances computed and saved")
     
     # Normal case: n_controls >= n_cases
-    M = n_controls//2
-    
+    if not candidate_pool_size:
+        M = n_controls//2
+    else:
+        M = candidate_pool_size
     print(f"\n  K-Center Configuration:")
     print(f"    M (candidate pool size): {M:,} / {n_controls:,} ({M/n_controls*100:.1f}%)")
     print(f"    Cases to match: {n_cases:,}")

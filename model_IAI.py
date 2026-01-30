@@ -61,7 +61,8 @@ def train_oct_with_feature_names(X_train, y_train,
         max_depth=max_depth,
         minbucket=minbucket,
         cp=cp,
-        random_seed=42
+        random_seed=42,
+        missingdatamode='always_left'  # Handle missing data: always_left, always_right, or separate_class
     )
     
     iai_model.fit(X_train_df, y_train)
@@ -128,7 +129,8 @@ def finetune_oct_impute(
             max_depth=depth,
             minbucket=minbucket,
             cp=cp,
-            random_seed=123
+            random_seed=123,
+            missingdatamode='always_left'  # Handle missing data: always_left, always_right, or separate_class
         )
         model.fit(X_train_df, y_train)
 
@@ -163,6 +165,10 @@ def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
     preprocessor = get_preprocessor(X_train, categorical_cols, numeric_cols)
     X_train_transformed = preprocessor.fit_transform(X_train)
     X_val_transformed = preprocessor.transform(X_val)
+    
+    # Check for remaining missing values
+    if pd.DataFrame(X_train_transformed).isna().any().any():
+        print("⚠️  Warning: Missing values still present after preprocessing. Using missingdatamode='always_left' in OCT.")
 
     # Get feature names
     feature_names = []
@@ -198,7 +204,8 @@ def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
             max_depth=depth,
             minbucket=minbucket,
             cp=cp,
-            random_seed=123
+            random_seed=123,
+            missingdatamode='always_left'  # Handle missing data: always_left, always_right, or separate_class
         )
         model.fit(X_train_df, y_train)
 
