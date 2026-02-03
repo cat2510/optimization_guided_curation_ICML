@@ -12,4 +12,4 @@ To scale to large datasets, we derive a two-stage approximation: a farthest-firs
 Furthermore, we introduce a leaf-level evaluation metric that quantifies the residual discriminative power of one model within the subgroups induced by another, enabling direct comparison of tree partition quality beyond global accuracy.
 Experiments on a large medical spending prediction task of kidney-disease patients and a credit card fraud benchmark demonstrate that decision trees trained on curated subsets achieve improved minority-class performance on held-out test sets and yield more informative partitions under the proposed leaf-level evaluation, compared to training on the original imbalanced data or standard data resampling baselines.
 
-
+README_REQUIREMENTS.md contains instructions on how to use this framework.
