@@ -15,14 +15,11 @@ def get_bin_flag_columns(df):
     return [col for col in df.columns if col.startswith("has_") or "THRCLS" in col.upper()
     or col.endswith("adherent") or col.startswith("early_")
     or col.startswith("is_")]
-def get_true_num_columns(df, CAT_COLUMNS):
+def get_true_num_columns(df, CAT_COLUMNS,BIN_FLAG_COLUMNS):
     return [
         col for col in df.columns
-        if (
-            ("cost" in col.lower() or 
-             "quarterly" in col.lower() or 
-             "claims" in col.lower())
-            and col not in CAT_COLUMNS
+        if (col not in ['ENROLID']
+            and col not in CAT_COLUMNS+BIN_FLAG_COLUMNS
         )
     ]
 

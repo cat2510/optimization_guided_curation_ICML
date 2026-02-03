@@ -20,34 +20,56 @@ from tqdm import tqdm
 
 
 
-def get_preprocessor(X, cat_cols, num_cols):
+def get_preprocessor(X, cat_cols, num_cols, binary_cols=None, verbose=False):
     """
-    Create preprocessor matching OCT model preprocessing
+    Create preprocessor matching OCT model preprocessing.
+    
+    This function now uses model_IAI.get_preprocessor_with_impute for consistency
+    with the model training pipeline.
     
     Parameters:
     -----------
     X : DataFrame
-        Feature matrix
+        Feature matrix (used as X_train for imputation check)
     cat_cols : list
         Categorical column names
     num_cols : list
-        Numeric column names
+        Numeric column names (will be scaled)
+    binary_cols : list, optional
+        Binary flag column names (0/1). These will be passed through
+        without scaling. If None, binary columns are dropped.
+    verbose : bool, default=False
+        Whether to print preprocessing details
     
     Returns:
     --------
     preprocessor : ColumnTransformer
     
-    Note: Uses remainder='passthrough' to match model_pipeline.py
-          Binary flag columns will be kept unchanged.
+    Note: Uses get_preprocessor_with_impute from model_IAI for consistency
+          with the model training pipeline. Binary flag columns are handled
+          explicitly if provided.
     """
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ('cat', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'), cat_cols),
-            ('num', StandardScaler(), num_cols)
-        ],
-        remainder='passthrough'  # Keep remaining columns (e.g., binary flags) unchanged
-    )
-    return preprocessor
+    # Try to import from model_IAI, fall back to local implementation if not available
+    try:
+        import model_IAI
+        return model_IAI.get_preprocessor_with_impute(
+            X_train=X,
+            categorical_cols=cat_cols,
+            numeric_cols=num_cols,
+            binary_cols=binary_cols,
+            verbose=verbose
+        )
+    except (ImportError, AttributeError):
+        # Fallback to original implementation if model_IAI is not available
+        # This maintains backward compatibility
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ('cat', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'), cat_cols),
+                ('num', StandardScaler(), num_cols)
+            ],
+            remainder='passthrough'  # Keep remaining columns (e.g., binary flags) unchanged
+        )
+        return preprocessor
 
 
 def compute_distances_batched(X_majority, X_minority, batch_size=1000, dtype=np.float32):

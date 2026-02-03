@@ -4,16 +4,64 @@ import numpy as np
 import pandas as pd
 from interpretableai import iai
 import itertools
-from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score, precision_recall_curve, confusion_matrix, brier_score_loss, roc_curve, roc_auc_score
-from sklearn.exceptions import NotFittedError
-from model_pipeline import get_preprocessor, train_test_split_enrol
-from sklearn.calibration import calibration_curve
 import matplotlib.pyplot as plt
-import os
+import os,time
+import time
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("Warning: psutil not available. Resource tracking will be limited.")
+
+from sklearn.metrics import roc_curve, roc_auc_score,f1_score, average_precision_score, precision_recall_curve, confusion_matrix, matthews_corrcoef
+from sklearn.exceptions import NotFittedError
+from sklearn.model_selection import train_test_split
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, FunctionTransformer
+def train_test_split_enrol(df, target_col, test_size=0.3, random_state=42,verbose=True):
+    """
+    Splits df by ENROLID into train/test, stratifying on target_col.
+    Returns: train_df, test_df
+    """
+    # Ensure ENROLID is unique per row
+    assert df["ENROLID"].is_unique, "DataFrame must have one row per ENROLID"
+
+    # Stratified split on ENROLID
+    train_ids, test_ids = train_test_split(
+        df["ENROLID"],
+        test_size=test_size,
+        random_state=random_state,
+        stratify=df[target_col]
+    )
+    train = df[df["ENROLID"].isin(train_ids)].reset_index(drop=True)
+    test  = df[df["ENROLID"].isin(test_ids)].reset_index(drop=True)
+    if verbose:
+        # Debug prints
+        print("Train/Test shapes:", train.shape, test.shape)
+        print("Train distribution of {}:".format(target_col))
+        print(train[target_col].value_counts(normalize=True))
+        print("Test distribution of {}:".format(target_col))
+        print(test[target_col].value_counts(normalize=True))
+
+    return train_ids, test_ids, train, test
+
+def get_cat_columns(df):
+    cols= df.select_dtypes(include=["object","category","string"]).columns.tolist()
+    return [col for col in cols if col != "ENROLID"]
+def get_bin_flag_columns(df):
+    return [col for col in df.columns if col.startswith("has_") or "THRCLS" in col.upper()
+    or col.endswith("adherent") or col.startswith("early_")
+    or col.startswith("is_")]
+def get_true_num_columns(df, CAT_COLUMNS,BIN_FLAG_COLUMNS):
+    return [
+        col for col in df.columns
+        if (col not in ['ENROLID']
+            and col not in CAT_COLUMNS+BIN_FLAG_COLUMNS
+        )
+    ]
 
 def train_oct_with_feature_names(X_train, y_train, 
                                  categorical_cols, numeric_cols,
@@ -25,7 +73,7 @@ def train_oct_with_feature_names(X_train, y_train,
     """
     
     # Step 1: Create and fit preprocessor
-    preprocessor = get_preprocessor(X_train, categorical_cols, numeric_cols)
+    preprocessor = get_preprocessor_with_impute(X_train, categorical_cols, numeric_cols)
     
     # Step 2: Fit and transform
     X_train_transformed = preprocessor.fit_transform(X_train)
@@ -71,120 +119,179 @@ def train_oct_with_feature_names(X_train, y_train,
     return iai_model, preprocessor, feature_names
 
 
-def get_preprocessor_with_impute(categorical_cols, numeric_cols, verbose=True):
+def get_preprocessor_with_impute(X_train, categorical_cols, numeric_cols, binary_cols=None, verbose=True):
+    """
+    Build preprocessor with conditional imputation.
+    Only includes SimpleImputer if there are missing values in the data.
+    
+    Binary flag columns are passed through without scaling (they're already 0/1).
+    
+    Parameters:
+    -----------
+    X_train : pd.DataFrame
+        Training data to check for missing values
+    categorical_cols : list
+        List of categorical column names
+    numeric_cols : list
+        List of numeric column names (will be scaled)
+    binary_cols : list, optional
+        List of binary flag column names (0/1). These will be passed through
+        without scaling. If None, binary columns are dropped.
+    verbose : bool
+        Whether to print preprocessing details
+    """
+    # Filter columns to only those present in X_train
+    # This handles cases where column lists include columns not in the actual data
+    cat_cols_present = [col for col in categorical_cols if col in X_train.columns] if categorical_cols else []
+    num_cols_present = [col for col in numeric_cols if col in X_train.columns] if numeric_cols else []
+    binary_cols_present = [col for col in binary_cols if col in X_train.columns] if binary_cols else []
+    
+    # Check for missing values (only on columns that actually exist)
+    cat_has_missing = False
+    num_has_missing = False
+    
+    if cat_cols_present:
+        cat_has_missing = X_train[cat_cols_present].isnull().any().any()
+    
+    if num_cols_present:
+        num_has_missing = X_train[num_cols_present].isnull().any().any()
+    
     if verbose:
-        print("→ Building preprocessor w/ imputation:")
-        print(f"   • Cat: impute(most_frequent) + OHE on: {categorical_cols}")
-        print(f"   • Num: impute(median) + scale on: {numeric_cols}")
+        print("→ Building preprocessor w/ conditional imputation:")
+        if cat_cols_present:
+            impute_status = "impute(most_frequent) + " if cat_has_missing else ""
+            print(f"   • Cat: {impute_status}OHE on: {cat_cols_present}")
+        if num_cols_present:
+            impute_status = "impute(median) + " if num_has_missing else ""
+            print(f"   • Num: {impute_status}scale on: {num_cols_present}")
+        if binary_cols_present:
+            print(f"   • Binary: passthrough (no scaling) on: {binary_cols_present}")
 
     transformers = []
-    if categorical_cols:
-        cat_pipe = Pipeline(steps=[
-            ("impute", SimpleImputer(strategy="most_frequent")),
-            ("ohe", OneHotEncoder(drop="first", handle_unknown="ignore")),
-        ])
-        transformers.append(("cat", cat_pipe, categorical_cols))
-    if numeric_cols:
-        num_pipe = Pipeline(steps=[
-            ("impute", SimpleImputer(strategy="median")),
-            ("scale", StandardScaler()),
-        ])
-        transformers.append(("num", num_pipe, numeric_cols))
+    if cat_cols_present:
+        cat_steps = []
+        if cat_has_missing:
+            cat_steps.append(("impute", SimpleImputer(strategy="most_frequent")))
+        cat_steps.append(("ohe", OneHotEncoder(drop="first", handle_unknown="ignore")))
+        cat_pipe = Pipeline(steps=cat_steps)
+        transformers.append(("cat", cat_pipe, cat_cols_present))  # Use filtered list
+    
+    if num_cols_present:
+        num_steps = []
+        if num_has_missing:
+            num_steps.append(("impute", SimpleImputer(strategy="median")))
+        num_steps.append(("scale", StandardScaler()))
+        num_pipe = Pipeline(steps=num_steps)
+        transformers.append(("num", num_pipe, num_cols_present))  # Use filtered list
+    
+    # Binary columns: passthrough (no imputation, no scaling)
+    if binary_cols_present:
+        # Use FunctionTransformer with identity function for passthrough
+        transformers.append(("binary", FunctionTransformer(), binary_cols_present))
 
     return ColumnTransformer(transformers=transformers, remainder="drop")
 
-def finetune_oct_impute(
-    X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
-    depths=[5, 7, 9], minbuckets=[50, 100, 150], cps=[1e-6, 1e-5, 1e-4]
-):
+def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
+                 binary_cols=None,
+                 depths=[5, 7, 9],
+                 minbuckets=[50, 100, 150],
+                 cps=[1e-6, 1e-5, 1e-4, 1e-3],
+                 verbose=True,
+                 random_seed=123):
     """
-    Same as finetune_oct but with imputation inside the preprocessor.
-    Selects best hyperparameters by PR-AUC on validation.
-    Returns: best_model, best_params, results_df, preprocessor, feature_names
+    Hyperparameter tuning for IAI OptimalTreeClassifier with conditional imputation.
+    
+    Selects best hyperparameters based on PR-AUC on validation set.
+    Uses conditional imputation (only when missing values are present).
+    
+    Parameters
+    ----------
+    X_train : pd.DataFrame
+        Training features
+    y_train : array-like
+        Training labels
+    X_val : pd.DataFrame
+        Validation features
+    y_val : array-like
+        Validation labels
+    categorical_cols : list
+        List of categorical column names
+    numeric_cols : list
+        List of numeric column names (will be scaled)
+    binary_cols : list, optional
+        List of binary flag column names (0/1). These will be passed through
+        without scaling. If None, binary columns are dropped.
+    depths : list, default=[5, 7, 9]
+        Tree depths to try
+    minbuckets : list, default=[50, 100, 150]
+        Minimum bucket sizes to try
+    cps : list, default=[1e-6, 1e-5, 1e-4, 1e-3]
+        Complexity parameters to try
+    verbose : bool, default=True
+        Whether to print preprocessing details
+    random_seed : int, default=123
+        Random seed for OCT training
+    
+    Returns
+    -------
+    best_model : IAI OptimalTreeClassifier
+        Best model from hyperparameter search
+    best_params : tuple
+        (depth, minbucket, cp) of best model
+    results_df : pd.DataFrame
+        Results for all hyperparameter combinations, sorted by PR-AUC
+    preprocessor : sklearn ColumnTransformer
+        Fitted preprocessor
+    feature_names : list
+        Feature names after preprocessing
     """
-    print(f"Finetuning OCT (with imputation) for best PR-AUC")
+    print(f"Finetuning OCT with depths: {depths}, minbuckets: {minbuckets}, cps: {cps}, for best PR-AUC")
     best_score = -np.inf
     best_params = None
     best_model = None
     results = []
-
-    # Build and fit preprocessor on TRAIN only (important)
-    preprocessor = get_preprocessor_with_impute(categorical_cols, numeric_cols, verbose=True)
-    X_train_t = preprocessor.fit_transform(X_train)
-    X_val_t = preprocessor.transform(X_val)
-
-    # Feature names
-    feature_names = []
-    if categorical_cols:
-        ohe = preprocessor.named_transformers_["cat"].named_steps["ohe"]
-        feature_names.extend(list(ohe.get_feature_names_out(categorical_cols)))
-    if numeric_cols:
-        feature_names.extend(list(numeric_cols))
-
-    X_train_df = pd.DataFrame(X_train_t, columns=feature_names)
-    X_val_df = pd.DataFrame(X_val_t, columns=feature_names)
-
-    for depth, minbucket, cp in itertools.product(depths, minbuckets, cps):
-        model = iai.OptimalTreeClassifier(
-            max_depth=depth,
-            minbucket=minbucket,
-            cp=cp,
-            random_seed=123,
-            missingdatamode='always_left'  # Handle missing data: always_left, always_right, or separate_class
-        )
-        model.fit(X_train_df, y_train)
-
-        # Validation PR-AUC (threshold-free) for selection
-        y_val_proba = model.predict_proba(X_val_df).iloc[:, 1]
-        pr = average_precision_score(y_val, y_val_proba)
-
-        results.append((depth, minbucket, cp, pr))
-        if pr > best_score:
-            best_score = pr
-            best_params = (depth, minbucket, cp)
-            best_model = model
-
-    results_df = pd.DataFrame(results, columns=["depth", "minbucket", "cp", "val_pr_auc"])
-    print(f"Best params: {best_params} @ val PR-AUC: {best_score:.4f}")
-    return best_model, best_params, results_df, preprocessor, feature_names
-
-def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
-                 depths=[5, 7,9],
-                 minbuckets=[50, 100,150],
-                 cps=[1e-6,1e-5,1e-4]):
-    """
-    Hyperparameter tuning for IAI OptimalTreeClassifier
-    Selects best hyperparameters based on F1 score
-    """
-    print(f"Finetuning OCT with depths: {depths}, minbuckets: {minbuckets}, cps: {cps}, for best PR-AUC!!!")
-    best_score = -1
-    best_params = None
-    best_model = None
-    results = []
     
-    preprocessor = get_preprocessor(X_train, categorical_cols, numeric_cols)
+    # Build and fit preprocessor on TRAIN only (important)
+    # Uses conditional imputation (only when missing values are present)
+    preprocessor = get_preprocessor_with_impute(X_train, categorical_cols, numeric_cols, binary_cols=binary_cols, verbose=verbose)
     X_train_transformed = preprocessor.fit_transform(X_train)
     X_val_transformed = preprocessor.transform(X_val)
     
-    # Check for remaining missing values
+    # Check for remaining missing values after preprocessing
     if pd.DataFrame(X_train_transformed).isna().any().any():
         print("⚠️  Warning: Missing values still present after preprocessing. Using missingdatamode='always_left' in OCT.")
 
-    # Get feature names
+    # Get feature names - robust extraction that handles all transformer types
     feature_names = []
     for name, transformer, columns in preprocessor.transformers_:
-        if name == 'ohe':
-            # Only get feature names if OneHotEncoder exists, has columns, and is fitted
-            # Skip if columns is empty (old get_preprocessor bug) or transformer not fitted
+        if name == 'cat':
+            # Handle categorical pipeline (may have impute + ohe)
+            try:
+                # Try to get OHE from pipeline
+                if hasattr(transformer, 'named_steps') and 'ohe' in transformer.named_steps:
+                    ohe = transformer.named_steps['ohe']
+                    ohe_features = ohe.get_feature_names_out(columns)
+                    feature_names.extend(ohe_features)
+                elif hasattr(transformer, 'get_feature_names_out'):
+                    # Direct OHE transformer
+                    ohe_features = transformer.get_feature_names_out(columns)
+                    feature_names.extend(ohe_features)
+            except (NotFittedError, AttributeError, ValueError) as e:
+                if verbose:
+                    print(f"  ⚠️  Could not extract categorical feature names: {e}")
+                pass
+        elif name == 'ohe':
+            # Direct OHE transformer (legacy format)
             if columns:  # Only process if there are actual columns to encode
                 try:
-                    # Check if fitted by trying to access categories_ or calling get_feature_names_out
                     ohe_features = transformer.get_feature_names_out(columns)
                     feature_names.extend(ohe_features)
                 except (NotFittedError, AttributeError, ValueError):
-                    # Skip if not fitted or other error (shouldn't happen with fixed get_preprocessor)
                     pass
         elif name == 'num':
+            feature_names.extend(columns)
+        elif name == 'binary':
+            # Binary columns pass through with original names
             feature_names.extend(columns)
         elif name == 'remainder' and preprocessor.remainder == 'passthrough':
             all_cols = X_train.columns.tolist()
@@ -197,24 +304,24 @@ def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
     X_train_df = pd.DataFrame(X_train_transformed, columns=feature_names)
     X_val_df = pd.DataFrame(X_val_transformed, columns=feature_names)
 
-    # Grid search
+    # Grid search over hyperparameters
     for depth, minbucket, cp in itertools.product(depths, minbuckets, cps):
-
         model = iai.OptimalTreeClassifier(
             max_depth=depth,
             minbucket=minbucket,
             cp=cp,
-            random_seed=123,
+            random_seed=random_seed,
             missingdatamode='always_left'  # Handle missing data: always_left, always_right, or separate_class
         )
         model.fit(X_train_df, y_train)
 
+        # Get predictions and probabilities
         y_pred = model.predict(X_val_df)
+        y_val_proba = model.predict_proba(X_val_df).iloc[:, 1]
 
-        #precision = precision_score(y_val, y_pred, zero_division=0)
-        #recall = recall_score(y_val, y_pred, zero_division=0)
+        # Compute metrics
         f1 = f1_score(y_val, y_pred, zero_division=0)
-        pr_auc = average_precision_score(y_val, y_pred)
+        pr_auc = average_precision_score(y_val, y_val_proba)  # Use probabilities for PR-AUC
 
         results.append({
             "depth": depth,
@@ -224,14 +331,31 @@ def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
             "pr_auc": pr_auc
         })
 
+        # Select best model based on PR-AUC
         if pr_auc > best_score:
             best_score = pr_auc
             best_params = (depth, minbucket, cp)
             best_model = model
 
+    # Sort results by PR-AUC (descending)
     results_df = pd.DataFrame(results).sort_values("pr_auc", ascending=False)
-    print(f"Best params: {best_params} @ PR-AUC: {best_score:.3f}")
-    return best_model, best_params, results_df,preprocessor, feature_names
+    print(f"Best params: {best_params} @ PR-AUC: {best_score:.4f}")
+    return best_model, best_params, results_df, preprocessor, feature_names
+
+
+# Alias for backward compatibility
+def finetune_oct_impute(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
+                        binary_cols=None,
+                        depths=[5, 7, 9], minbuckets=[50, 100, 150], cps=[1e-5, 1e-4, 1e-3],
+                        verbose=True, random_seed=123):
+    """
+    Alias for finetune_oct() for backward compatibility.
+    Same functionality, different default hyperparameters.
+    """
+    return finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
+                       binary_cols=binary_cols,
+                       depths=depths, minbuckets=minbuckets, cps=cps,
+                       verbose=verbose, random_seed=random_seed)
 
 
 def _save_tree_splits(learner, out_path):
@@ -338,7 +462,6 @@ def _save_tree_splits(learner, out_path):
         if methods:
             print(f"   Split-related: {methods[:5]}")
 
-from sklearn.metrics import matthews_corrcoef
 
 def best_mcc_threshold(y_true, y_proba):
     """
@@ -597,43 +720,6 @@ def evaluate_binary_oct(
         "precision_gmean": float(precision_gmean) if precision_gmean is not None else None,
     }
 
-# -------------------------------
-# Expected Calibration Error (ECE)
-# -------------------------------
-def expected_calibration_error(y_true, y_prob, n_bins=10):
-    bins = np.linspace(0, 1, n_bins + 1)
-    ece = 0.0
-    for i in range(n_bins):
-        mask = (y_prob >= bins[i]) & (y_prob < bins[i + 1])
-        if mask.sum() == 0:
-            continue
-        avg_conf = y_prob[mask].mean()
-        avg_acc = y_true[mask].mean()
-        ece += np.abs(avg_conf - avg_acc) * (mask.sum() / len(y_prob))
-    return ece
-
-
-# ------------------------------------------------------------
-# Find threshold satisfying constraints (precision/recall)
-# ------------------------------------------------------------
-def find_feasible_threshold(y_true, y_prob, min_precision=0.8, min_recall=0.8):
-    precision_curve, recall_curve, thresholds = precision_recall_curve(y_true, y_prob)
-
-    valid = []
-    # thresholds has len-1 relative to precision/recall curves
-    thr_padded = list(thresholds) + [thresholds[-1]]
-
-    for p, r, t in zip(precision_curve, recall_curve, thr_padded):
-        if p >= min_precision and r >= min_recall:
-            valid.append((t, p, r))
-
-    if len(valid) == 0:
-        return None
-
-    # choose maximum F1 in feasible region
-    best = max(valid, key=lambda x: 2 * x[1] * x[2] / (x[1] + x[2] + 1e-12))
-    return {"threshold": best[0], "precision": best[1], "recall": best[2]}
-
 def best_balanced_threshold(y_true, y_prob):
     """
     Find thresholds that balance recall and specificity without F1/Youden.
@@ -661,6 +747,33 @@ def best_balanced_threshold(y_true, y_prob):
         }
 
     return {"gmean_opt": pack(idx_g), "minside_opt": pack(idx_min)}
+
+
+def format_time(seconds):
+    """Format time in a readable way."""
+    if seconds < 0.1:
+        return f"{seconds:.4f}"
+    elif seconds < 1.0:
+        return f"{seconds:.3f}"
+    else:
+        return f"{seconds:.2f}"
+
+def get_resource_usage():
+    """Get current CPU and memory usage."""
+    if PSUTIL_AVAILABLE:
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        return {
+            'cpu_percent': process.cpu_percent(interval=0.1),
+            'memory_mb': memory_info.rss / (1024 * 1024),  # RSS in MB
+            'memory_percent': process.memory_percent(),
+        }
+    else:
+        return {
+            'cpu_percent': None,
+            'memory_mb': None,
+            'memory_percent': None,
+        }
 
 
 
