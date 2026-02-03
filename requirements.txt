@@ -1,0 +1,24 @@
+# Requirements for running msk_analysis/two_stage_approach.ipynb
+# 
+# Core Data Science Libraries
+pandas>=1.5.0
+numpy>=1.21.0
+
+# Machine Learning
+scikit-learn>=1.0.0
+interpretableai>=3.0.0  # For Optimal Classification Trees (OCT)
+
+# Big Data Processing
+pyspark>=3.0.0
+
+# Data Storage
+h5py>=3.0.0
+pyarrow>=10.0.0
+
+# Optimization
+ortools>=9.0.0  # For min-cost flow matching in two_stage_kcenter_match
+
+# Utilities
+tqdm>=4.60.0  # Progress bars
+matplotlib>=3.5.0  # Plotting
+psutil>=5.8.0  # Optional: Resource tracking (gracefully handles if missing)

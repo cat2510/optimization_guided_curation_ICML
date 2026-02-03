@@ -11,7 +11,6 @@ The script tests all combinations of:
 1. **Case Weighting** (4 options):
    - `None`: Uniform weights (all cases treated equally)
    - `"boundary"`: Weight by inverse distance to nearest majority sample
-   - `"uncertainty"`: Weight by Shannon entropy from OCT probabilities
    - `"density_inverse"`: Weight by inverse local density
 
 2. **Adaptive Pool** (2 options):
@@ -39,7 +38,7 @@ For each configuration:
 ### Basic Usage
 
 ```bash
-cd /Users/cat2510/my_projects
+cd /Users/
 python kcenter_hyperparameter_search.py
 ```
 
@@ -48,11 +47,7 @@ python kcenter_hyperparameter_search.py
 - Pre-computed distance files:
   - `./precomputed_distances/distances_majority_minority.h5`
   - Control-control distances will be computed per-leaf if not cached
-- Saved OCT stratifier model:
-  - `saved_models/oct_stratifier_model.pkl`
-  - `saved_models/df_with_leaves.csv`
-- Original Parquet data:
-  - `0917_2017_18_with_2017_cost.parquet`
+- Original Parquet dataset
 
 ### Configuration
 
@@ -64,7 +59,7 @@ MATCHING_RATIO = 1  # Can change to 2, 3, etc. for 1:k matching
 
 # Hyperparameter grid
 HYPERPARAMETER_GRID = {
-    'case_weighting': [None, "boundary", "uncertainty", "density_inverse"],
+    'case_weighting': [None, "boundary", "density_inverse"],
     'use_adaptive_pool': [True, False],
     'seed_method': ["smart", "centroid", "density", "random"],
 }
@@ -160,12 +155,6 @@ plt.tight_layout()
 plt.savefig('f1_heatmap.png', dpi=300)
 ```
 
-## Runtime Estimates
-
-- **Per configuration**: ~10-30 minutes (depends on leaf sizes)
-- **Total for 32 configurations**: ~5-16 hours
-- Runs incrementally - results saved after each config (safe to interrupt)
-
 ## Tips
 
 1. **Start with subset**: Test a few configs first by modifying `HYPERPARAMETER_GRID`
@@ -181,32 +170,3 @@ If you run out of memory:
 - Reduce batch size in `precompute_leaf_dnn_memmap()` (line 106)
 - Process leaves sequentially (already done)
 - Close Spark session after loading data
-
-### Missing Files
-
-Ensure these exist:
-```bash
-ls precomputed_distances/distances_majority_minority.h5
-ls saved_models/oct_stratifier_model.pkl
-ls saved_models/df_with_leaves.csv
-ls 0917_2017_18_with_2017_cost.parquet
-```
-
-### Configuration Errors
-
-If a specific config fails, the script will log the error and continue to the next configuration. Check `metrics_master.csv` for the `error` column.
-
-## Next Steps
-
-After identifying the best configuration:
-
-1. **Retrain on full data**: Use the best hyperparameters to create final undersampled dataset
-2. **Ensemble models**: Train multiple OCTs with top-5 configs and ensemble
-3. **Feature importance**: Analyze which features are most important in the best model
-4. **Cost-benefit analysis**: Evaluate if the improved metrics justify the added complexity
-
-## References
-
-- **K-Center Matching**: See `two_stage_kcenter_match.py` for implementation
-- **Case Weighting**: See `README_weighted_matching.md` for details
-- **Seed Methods**: See `README_kcenter_seed_methods.md` for details
