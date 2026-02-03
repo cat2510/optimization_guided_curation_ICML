@@ -690,12 +690,9 @@ def two_stage_kcenter_then_match(
         # so this keeps everything aligned.
 
     # ---- Load d^pn ----
-    f_pn = h5py.File(pn_h5_path, "r")
-    d_pn = f_pn["distances"]
-    pn_maj_ids = f_pn["majority_enrolids"][:]
-    pn_min_ids = f_pn["minority_enrolids"][:]
-    pn_maj_id2idx = {int(x): i for i, x in enumerate(pn_maj_ids)}
-    pn_min_id2idx = {int(x): i for i, x in enumerate(pn_min_ids)}
+    f_pn, d_pn, pn_maj_ids, pn_min_ids = load_pn_hdf5(pn_h5_path)
+    pn_maj_id2idx = build_id_to_index(pn_maj_ids)
+    pn_min_id2idx = build_id_to_index(pn_min_ids)
 
     try:
         pn_rows = np.array([pn_maj_id2idx[int(e)] for e in leaf_controls_enrolids], dtype=np.int64)
@@ -818,12 +815,6 @@ def two_stage_kcenter_then_match(
                 weights_to_use = compute_case_weights_boundary(d_pn_leaf, normalize=True)
                 print(f"    Boundary weights: min={weights_to_use.min():.3f}, max={weights_to_use.max():.3f}, mean={weights_to_use.mean():.3f}")
                 
-            elif case_weighting == "uncertainty":
-                if predicted_probs is None:
-                    raise ValueError("case_weighting='uncertainty' requires predicted_probs parameter")
-                weights_to_use = compute_case_weights_uncertainty(predicted_probs, normalize=True)
-                print(f"    Uncertainty weights: min={weights_to_use.min():.3f}, max={weights_to_use.max():.3f}, mean={weights_to_use.mean():.3f}")
-                
             elif case_weighting == "density_inverse":
                 weights_to_use = compute_case_weights_density_inverse(
                     d_pn_leaf, 
@@ -835,7 +826,7 @@ def two_stage_kcenter_then_match(
                 
             else:
                 raise ValueError(f"Unknown case_weighting method: '{case_weighting}'. "
-                               f"Must be 'boundary', 'uncertainty', 'density_inverse', or None.")
+                               f"Must be 'boundary','density_inverse', or None.")
 
         # Stage B exact matching (topk_start=None => full graph exact)
         cost = d_pn_leaf[cand_idx_final, :].T  # (n_cases, n_candidates)

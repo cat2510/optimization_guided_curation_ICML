@@ -5,9 +5,9 @@ import sys,os,time
 parent_dir = os.path.abspath(os.path.join(os.getcwd(), '..'))
 sys.path.insert(0, parent_dir)
 import importlib
-import model_IAI
-importlib.reload(model_IAI)
-from model_IAI import *
+import public.model_IAI
+importlib.reload(public.model_IAI)
+from public.model_IAI import *
 import pandas as pd
 import numpy as np
 
@@ -19,16 +19,13 @@ df_og = df_msk_spark.toPandas()
 
 # MSK-specific feature column definitions
 # Binary flag columns: comorbidity flags, MSK category flags, medication flags
-BIN_FLAG_COLUMNS = model_IAI.get_bin_flag_columns(df_og)
-
+BIN_FLAG_COLUMNS = get_bin_flag_columns(df_og)
 # MSK doesn't have stage columns like CKD, but we can identify categorical cost pattern/stability columns
 STAGE_COLUMNS = []  # MSK doesn't use stage columns
-
 # Categorical columns
-CAT_COLUMNS = df_og.select_dtypes(include=["object","category","string"]).columns.tolist()
-
+CAT_COLUMNS = get_cat_columns(df_og)
 # True numeric columns (excluding binary flags and categorical)
-TRUE_NUM_COLUMNS = model_IAI.get_true_num_columns(df_og, CAT_COLUMNS,BIN_FLAG_COLUMNS)
+TRUE_NUM_COLUMNS = get_true_num_columns(df_og, CAT_COLUMNS,BIN_FLAG_COLUMNS)
 
 # Cost columns (2017 only - exclude 2018 to prevent leakage)
 COST_COLUMNS = [
@@ -96,7 +93,7 @@ TRAIN_TEST_SEED = 123
 
 # Split data into train/test/val (same as multiobjective_bilevel.ipynb)
 # Use the target_col defined in cell 0
-train_ids, test_ids, train_pd, test_pd = model_IAI.train_test_split_enrol(
+train_ids, test_ids, train_pd, test_pd = train_test_split_enrol(
     df_og,
     target_col=target_col,  # Use target_col from cell 0 (e.g., "top_2_pct_cost_2018")
     test_size=0.3,
@@ -106,7 +103,7 @@ train_ids, test_ids, train_pd, test_pd = model_IAI.train_test_split_enrol(
 print(f"Train shape: {train_pd.shape}, Test shape: {test_pd.shape}")
 print("Feature cols:", len(feature_cols))
 
-val_ids, test_ids, val_pd, test_pd = model_IAI.train_test_split_enrol(
+val_ids, test_ids, val_pd, test_pd = train_test_split_enrol(
     test_pd, 
     target_col=target_col,
     test_size=0.5,
