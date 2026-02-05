@@ -41,11 +41,7 @@ if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
 # Import custom modules from public package
-from public.model_IAI import (
-    finetune_oct, evaluate_binary_oct, train_test_split_enrol,
-    get_bin_flag_columns, get_cat_columns, get_true_num_columns,
-    get_preprocessor_with_impute
-)
+from public.model_IAI import *
 from public.two_stage_kcenter_match import two_stage_kcenter_then_match
 from public.precompute_distances import (
     get_preprocessor, compute_distances_batched, 
@@ -208,7 +204,6 @@ def run_global_kcenter_matching(
         print(f"\n  ⚠️ WARNING: More cases ({n_cases:,}) than controls ({n_controls:,})")
         print(f"     Strategy: Keep ALL minority and ALL majority as-is")
         
-        resources_after = get_resource_usage()
         sampling_time = 0.0
         
         return {

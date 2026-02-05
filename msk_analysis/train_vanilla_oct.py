@@ -129,6 +129,7 @@ vanilla_model, best_params, _, preprocessor, feature_names = finetune_oct(
     y_val=y_val,
     categorical_cols=CAT_COLUMNS,
     numeric_cols=TRUE_NUM_COLUMNS,
+    binary_cols=BIN_FLAG_COLUMNS,
     depths=[5, 7],
     minbuckets = [100, 200, 300],
     cps = [0.00001, 0.0001, 0.001, 0.01]

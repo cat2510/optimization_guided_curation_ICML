@@ -59,7 +59,7 @@ def farthest_first_adaptive_pool(
     nN = d_nn.shape[0]
     nP = d_pn_leaf.shape[1]
     if M_min is None:
-        M_min = max(2*nP, int(np.ceil(0.1*nN)))
+        M_min = nP  #max(2*nP, int(np.ceil(0.1*nN)))
 
     # state for k-center
     selected = []
