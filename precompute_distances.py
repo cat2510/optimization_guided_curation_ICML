@@ -11,7 +11,7 @@ import h5py
 import pyarrow.parquet as pq
 import pyarrow as pa
 from sklearn.metrics import pairwise_distances
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, FunctionTransformer
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 import time
@@ -51,22 +51,44 @@ def get_preprocessor(X, cat_cols, num_cols, binary_cols=None, verbose=False):
     """
     # Try to import from model_IAI, fall back to local implementation if not available
     try:
-        import model_IAI
-        return model_IAI.get_preprocessor_with_impute(
+        # Try multiple import paths for flexibility
+        try:
+            from public.model_IAI import get_preprocessor_with_impute
+        except ImportError:
+            try:
+                import model_IAI
+                get_preprocessor_with_impute = model_IAI.get_preprocessor_with_impute
+            except ImportError:
+                # Try relative import
+                from .model_IAI import get_preprocessor_with_impute
+        
+        return get_preprocessor_with_impute(
             X_train=X,
             categorical_cols=cat_cols,
             numeric_cols=num_cols,
             binary_cols=binary_cols,
             verbose=verbose
         )
-    except (ImportError, AttributeError):
+    except (ImportError, AttributeError) as e:
         # Fallback to original implementation if model_IAI is not available
+        print(f"Error importing get_preprocessor_with_impute: {e}")
         # This maintains backward compatibility
+        # IMPORTANT: Filter columns to only those present in X to avoid KeyErrors
+        cat_cols_filtered = [col for col in cat_cols if col in X.columns] if cat_cols else []
+        num_cols_filtered = [col for col in num_cols if col in X.columns] if num_cols else []
+        binary_cols_filtered = [col for col in binary_cols if col in X.columns] if binary_cols else []
+        
+        transformers = []
+        if cat_cols_filtered:
+            transformers.append(('cat', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'), cat_cols_filtered))
+        if num_cols_filtered:
+            transformers.append(('num', StandardScaler(), num_cols_filtered))
+        if binary_cols_filtered:
+            # Binary columns pass through unchanged
+            transformers.append(('binary', FunctionTransformer(), binary_cols_filtered))
+        
         preprocessor = ColumnTransformer(
-            transformers=[
-                ('cat', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'), cat_cols),
-                ('num', StandardScaler(), num_cols)
-            ],
+            transformers=transformers,
             remainder='passthrough'  # Keep remaining columns (e.g., binary flags) unchanged
         )
         return preprocessor
