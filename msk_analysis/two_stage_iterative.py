@@ -48,7 +48,7 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 MATCHING_RATIO = 1  # 1:1 matching (can be changed)
 CASE_WEIGHTING = None  # Options: None, "boundary"
 USE_ADAPTIVE_POOL = False  # Options: True, False
-SEED_METHOD = "random"  # Options: "smart", "centroid", "density", "random"
+SEED_METHOD = "smart"  # Options: "smart", "centroid", "density", "random"
 
 # MSK-specific feature column definitions
 # Binary flag columns: comorbidity flags, MSK category flags, medication flags
@@ -139,98 +139,95 @@ y_val = val_pd[target_col]
 print(f"Train: {train_pd.shape}, Val: {val_pd.shape}, Test: {test_pd.shape}")
 
 # ============================================================================
-# CONFIGURATION: Different precomputed distance directories to test
+# CONFIGURATION: Pool size sensitivity analysis
 # ============================================================================
 
-# List of precomputed distance directories to iterate over
-# Each directory should contain:
-#   - distances_majority_minority.h5
-#   - global_dnn_seed_{TRAIN_TEST_SEED}/leaf_global_dnn_matrix.npy
-#   - global_dnn_seed_{TRAIN_TEST_SEED}/leaf_global_dnn_enrolids.npy
-DISTANCE_DIRS = [
-    "./precomputed_distances_msk_medical_only",
-    "./precomputed_distances_msk_cost_only",
-    "./precomputed_distances_msk_less_cost",
-    "./precomputed_distances_msk_with_cost_features",
-    "./precomputed_distances_msk_with_target_no_cost",
-]
+# Use a single precomputed distance directory
+DISTANCES_DIR = "./precomputed_distances_msk_less_cost"  # Change this to your preferred directory
+PN_H5_PATH = os.path.join(DISTANCES_DIR, "distances_majority_minority.h5")
+DNN_OUT_DIR = os.path.join(DISTANCES_DIR, f"global_dnn_seed_{TRAIN_TEST_SEED}")
+dnn_matrix_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_matrix.npy")
+dnn_enrolids_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_enrolids.npy")
 
-# Filter to only directories that actually exist
-DISTANCE_DIRS = [d for d in DISTANCE_DIRS if os.path.exists(d)]
+# Check if required files exist
+if not os.path.exists(PN_H5_PATH):
+    raise FileNotFoundError(f"Distance file not found: {PN_H5_PATH}")
+if not os.path.exists(dnn_matrix_npy) or not os.path.exists(dnn_enrolids_npy):
+    raise FileNotFoundError(f"DNN files not found in {DNN_OUT_DIR}")
 
 print(f"\n{'='*80}")
-print(f"ITERATING OVER {len(DISTANCE_DIRS)} PRECOMPUTED DISTANCE DIRECTORIES")
+print("POOL SIZE SENSITIVITY ANALYSIS")
 print(f"{'='*80}")
-print(f"Directories to test:")
-for i, d in enumerate(DISTANCE_DIRS, 1):
-    print(f"  {i}. {d}")
-print()
+print(f"Using precomputed distances from: {DISTANCES_DIR}")
+print(f"  Minority-Majority: {PN_H5_PATH}")
+print(f"  Majority-Majority: {dnn_matrix_npy}\n")
 
-# Separate minority (cases) and majority (controls) - same for all iterations
+# Separate minority (cases) and majority (controls)
 cases = train_pd[train_pd[target_col] == 1].copy()
 controls = train_pd[train_pd[target_col] == 0].copy()
 
-print(f"\nDataset split (same for all iterations):")
-print(f"  Cases (minority): {len(cases):,}")
-print(f"  Controls (majority): {len(controls):,}")
-print(f"  Ratio: {len(controls)/len(cases):.2f}:1")
-
-# Determine candidate pool size M
 n_cases = len(cases)
 n_controls = len(controls)
-M = n_controls // 2  # Use half of controls as candidate pool
+
+print(f"Dataset split:")
+print(f"  Cases (minority): {n_cases:,}")
+print(f"  Controls (majority): {n_controls:,}")
+print(f"  Ratio: {n_controls/n_cases:.2f}:1\n")
+
+# Generate pool sizes M to test
+# Range from n_cases to n_controls//2 in reasonably separated steps
+M_min = 44790 #n_cases
+M_max = n_controls // 2
+
+# Create steps: use approximately 10-15 steps, with larger steps for larger ranges
+num_steps = 6
+if M_max - M_min < num_steps:
+    # If range is small, test every value
+    M_values = list(range(M_min, M_max + 1))
+else:
+    # Create evenly spaced steps (logarithmic might be better, but linear is simpler)
+    step_size = max(1, (M_max - M_min) // num_steps)
+    M_values = list(range(M_min, M_max + 1, step_size))
+    # Ensure we include M_max
+    if M_values[-1] != M_max:
+        M_values.append(M_max)
+
+print(f"Pool sizes (M) to test: {len(M_values)} values")
+print(f"  Range: {M_min:,} to {M_max:,}")
+print(f"  Values: {M_values[:5]} ... {M_values[-2:]} (showing first 5 and last 2)")
+print(f"  Full list: {M_values}\n")
 
 # Store results for all configurations
 all_results = []
 
 # ============================================================================
-# ITERATE OVER DIFFERENT DISTANCE DIRECTORIES
+# ITERATE OVER DIFFERENT POOL SIZES (M) WITH ADAPTIVE_POOL=False
 # ============================================================================
 
-for dist_idx, DISTANCES_DIR in enumerate(DISTANCE_DIRS, 1):
+print(f"{'='*80}")
+print("PHASE 1: Testing fixed pool sizes (adaptive_pool=False)")
+print(f"{'='*80}\n")
+
+for m_idx, M in enumerate(M_values, 1):
     print(f"\n{'#'*80}")
-    print(f"ITERATION {dist_idx}/{len(DISTANCE_DIRS)}: {os.path.basename(DISTANCES_DIR)}")
+    print(f"ITERATION {m_idx}/{len(M_values)}: M = {M:,} (fixed pool)")
     print(f"{'#'*80}\n")
     
-    # Extract feature subset name from directory
-    feature_subset_name = os.path.basename(DISTANCES_DIR).replace("precomputed_distances_msk", "").replace("_", " ").strip()
-    if not feature_subset_name:
-        feature_subset_name = "medical_only"
-    
     iteration_start_time = time.perf_counter()
-    
-    # Paths for this iteration
-    PN_H5_PATH = os.path.join(DISTANCES_DIR, "distances_majority_minority.h5")
-    DNN_OUT_DIR = os.path.join(DISTANCES_DIR, f"global_dnn_seed_{TRAIN_TEST_SEED}")
-    dnn_matrix_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_matrix.npy")
-    dnn_enrolids_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_enrolids.npy")
-    
-    # Check if required files exist
-    if not os.path.exists(PN_H5_PATH):
-        print(f"  ⚠️  Skipping: {PN_H5_PATH} not found")
-        continue
-    
-    if not os.path.exists(dnn_matrix_npy) or not os.path.exists(dnn_enrolids_npy):
-        print(f"  ⚠️  Skipping: DNN files not found in {DNN_OUT_DIR}")
-        continue
-    
-    print(f"  ✓ Found precomputed distances:")
-    print(f"    Minority-Majority: {PN_H5_PATH}")
-    print(f"    Majority-Majority: {dnn_matrix_npy}")
     
     try:
         # ====================================================================
         # STEP 1: K-CENTER UNDERSAMPLING
         # ====================================================================
-        print(f"\n  {'='*76}")
+        print(f"  {'='*76}")
         print(f"  K-CENTER UNDERSAMPLING")
         print(f"  {'='*76}")
         print(f"  Configuration:")
         print(f"    Matching ratio: 1:{MATCHING_RATIO}")
         print(f"    Case weighting: {CASE_WEIGHTING}")
-        print(f"    Adaptive pool: {USE_ADAPTIVE_POOL}")
+        print(f"    Adaptive pool: False (fixed pool size)")
         print(f"    Seed method: {SEED_METHOD}")
-        print(f"    Candidate pool size (M): {M:,}")
+        print(f"    Candidate pool size (M): {M:,} ({M/n_controls*100:.1f}% of controls)")
         
         matching_start_time = time.perf_counter()
         
@@ -241,8 +238,8 @@ for dist_idx, DISTANCES_DIR in enumerate(DISTANCE_DIRS, 1):
             leaf_nn_enrolids_npy=dnn_enrolids_npy,
             pn_h5_path=PN_H5_PATH,
             M=M,
-            use_adaptive_pool=USE_ADAPTIVE_POOL,
-            tau=None,  # Auto-compute from 95th percentile
+            use_adaptive_pool=False,  # Fixed pool size
+            tau=None,  # Not used when adaptive_pool=False
             plateau_eps=0.01,
             force_nearest_per_case=True,
             force_topm=1,
@@ -300,8 +297,8 @@ for dist_idx, DISTANCES_DIR in enumerate(DISTANCE_DIRS, 1):
             numeric_cols=TRUE_NUM_COLUMNS,
             binary_cols=BIN_FLAG_COLUMNS,
             depths=[5, 7],
-            minbuckets=[50, 100, 150],
-            cps=[0.0001, 0.001]
+            minbuckets=[100],
+            cps=[0.0001, 0.001, 0.01]
         )
         
         training_end_time = time.perf_counter()
@@ -310,15 +307,15 @@ for dist_idx, DISTANCES_DIR in enumerate(DISTANCE_DIRS, 1):
         # Evaluate
         evaluation_start_time = time.perf_counter()
         
-        # Create results directory for this feature subset
-        results_dir = f"msk_balanced_{feature_subset_name.replace(' ', '_')}"
+        # Create results directory
+        results_dir = f"msk_balanced_pool_size_M{M}"
         os.makedirs(results_dir, exist_ok=True)
         
         metrics = evaluate_binary_oct(
             balanced_model, X_test, y_test, preprocessor, feature_names, 
             X_val_df=X_val, y_val=y_val,
             results_dir=results_dir, 
-            save_suffix=f"{balanced_params[0]}_{balanced_params[1]}_{balanced_params[2]}"
+            save_suffix=f"M{M}_{balanced_params[0]}_{balanced_params[1]}_{balanced_params[2]}"
         )
         
         evaluation_end_time = time.perf_counter()
@@ -338,8 +335,9 @@ for dist_idx, DISTANCES_DIR in enumerate(DISTANCE_DIRS, 1):
         
         # Store results
         result_row = {
-            'feature_subset': feature_subset_name,
-            'distance_dir': DISTANCES_DIR,
+            'M': M,
+            'M_pct_of_controls': M / n_controls * 100,
+            'adaptive_pool': False,
             'n_train_samples': len(undersampled_training_data),
             'n_train_minority': (undersampled_training_data[target_col] == 1).sum(),
             'n_train_majority': (undersampled_training_data[target_col] == 0).sum(),
@@ -359,8 +357,8 @@ for dist_idx, DISTANCES_DIR in enumerate(DISTANCE_DIRS, 1):
         all_results.append(result_row)
         
         # Save undersampled dataset
-        config_name = f"cw_{CASE_WEIGHTING}_pool_{USE_ADAPTIVE_POOL}_seed_{SEED_METHOD}"
-        undersample_path = os.path.join(RESULTS_DIR, f"{feature_subset_name.replace(' ', '_')}_{config_name}.csv")
+        config_name = f"cw_{CASE_WEIGHTING}_pool_False_seed_{SEED_METHOD}"
+        undersample_path = os.path.join(RESULTS_DIR, f"M{M}_{config_name}.csv")
         undersampled_training_data.to_csv(undersample_path, index=False)
         print(f"     ✓ Saved undersampled dataset: {undersample_path}")
         
@@ -372,49 +370,234 @@ for dist_idx, DISTANCES_DIR in enumerate(DISTANCE_DIRS, 1):
         
         # Store error result
         all_results.append({
-            'feature_subset': feature_subset_name,
-            'distance_dir': DISTANCES_DIR,
+            'M': M,
+            'M_pct_of_controls': M / n_controls * 100,
+            'adaptive_pool': False,
             'error': str(e),
         })
         continue
+
+# ============================================================================
+# PHASE 2: Test with adaptive pool to find stopping size
+# ============================================================================
+
+print(f"\n{'='*80}")
+print("PHASE 2: Testing adaptive pool (adaptive_pool=True)")
+print(f"{'='*80}\n")
+
+print(f"Running adaptive pool to find stopping size M...")
+print(f"  Configuration:")
+print(f"    Matching ratio: 1:{MATCHING_RATIO}")
+print(f"    Case weighting: {CASE_WEIGHTING}")
+print(f"    Adaptive pool: True")
+print(f"    Seed method: {SEED_METHOD}")
+print(f"    Initial candidate pool size (M): {M_max:,} (will stop early if criteria met)")
+
+iteration_start_time = time.perf_counter()
+matching_start_time = time.perf_counter()
+
+try:
+    matching_result = two_stage_kcenter_then_match(
+        leaf_controls_enrolids=controls['ENROLID'].values.astype(np.int64),
+        leaf_cases_enrolids=cases['ENROLID'].values.astype(np.int64),
+        leaf_nn_matrix_npy=dnn_matrix_npy,
+        leaf_nn_enrolids_npy=dnn_enrolids_npy,
+        pn_h5_path=PN_H5_PATH,
+        M=M_max,  # Start with max, but will stop early
+        use_adaptive_pool=True,  # Adaptive pool enabled
+        tau=None,  # Auto-compute from 95th percentile
+        plateau_eps=0.01,
+        force_nearest_per_case=True,
+        force_topm=1,
+        assignment_topk_start=None,  # Exact matching
+        seed_method=SEED_METHOD,
+        matching_ratio=MATCHING_RATIO,
+        X_majority_leaf=None,  # Not needed when using precomputed distances
+        case_weighting=CASE_WEIGHTING,
+    )
+    
+    matching_end_time = time.perf_counter()
+    matching_time = matching_end_time - matching_start_time
+    
+    # Extract results
+    selected_control_enrolids = matching_result["selected_control_enrolids"]
+    candidate_majority_enrolids = matching_result.get("candidate_majority_enrolids", [])
+    actual_M = len(candidate_majority_enrolids) if len(candidate_majority_enrolids) > 0 else len(set(selected_control_enrolids))
+    all_match_costs = matching_result["match_costs"]
+    
+    print(f"\n  ✓ Adaptive pool matching complete!")
+    print(f"    Cases matched: {n_cases:,}")
+    print(f"    Actual pool size (M): {actual_M:,} (stopped at {actual_M/n_controls*100:.1f}% of controls)")
+    print(f"    Total selected controls: {len(selected_control_enrolids):,}")
+    print(f"    Unique selected controls: {len(set(selected_control_enrolids)):,}")
+    print(f"    Mean matching cost: {all_match_costs.mean():.4f}")
+    print(f"    Matching time: {matching_time:.2f}s")
+    
+    # Build undersampled dataset
+    all_minority = train_pd[train_pd[target_col] == 1].copy()
+    unique_majority_enrolids = list(set(selected_control_enrolids))
+    selected_majority = train_pd[
+        (train_pd[target_col] == 0) & 
+        (train_pd['ENROLID'].isin(unique_majority_enrolids))
+    ].copy()
+    
+    undersampled_training_data = pd.concat([all_minority, selected_majority], axis=0, ignore_index=True)
+    
+    print(f"\n  ✓ Undersampled dataset created:")
+    print(f"     Total samples: {len(undersampled_training_data):,}")
+    print(f"     Class distribution:")
+    print(undersampled_training_data[target_col].value_counts().sort_index())
+    
+    # Train and evaluate OCT
+    print(f"\n  {'='*76}")
+    print(f"  TRAINING OCT MODEL")
+    print(f"  {'='*76}")
+    
+    training_start_time = time.perf_counter()
+    
+    balanced_model, balanced_params, _, preprocessor, feature_names = finetune_oct(
+        X_train=undersampled_training_data[[col for col in feature_cols]],
+        y_train=undersampled_training_data[target_col],
+        X_val=X_val,
+        y_val=y_val,
+        categorical_cols=CAT_COLUMNS,
+        numeric_cols=TRUE_NUM_COLUMNS,
+        binary_cols=BIN_FLAG_COLUMNS,
+        depths=[5, 7],
+        minbuckets=[100],
+        cps=[0.0001, 0.001, 0.01]
+    )
+    
+    training_end_time = time.perf_counter()
+    training_time = training_end_time - training_start_time
+    
+    # Evaluate
+    evaluation_start_time = time.perf_counter()
+    
+    results_dir = f"msk_balanced_pool_size_adaptive"
+    os.makedirs(results_dir, exist_ok=True)
+    
+    metrics = evaluate_binary_oct(
+        balanced_model, X_test, y_test, preprocessor, feature_names, 
+        X_val_df=X_val, y_val=y_val,
+        results_dir=results_dir, 
+        save_suffix=f"adaptive_{balanced_params[0]}_{balanced_params[1]}_{balanced_params[2]}"
+    )
+    
+    evaluation_end_time = time.perf_counter()
+    evaluation_time = evaluation_end_time - evaluation_start_time
+    total_time = time.perf_counter() - iteration_start_time
+    
+    print(f"\n  ✓ Model training and evaluation complete:")
+    print(f"     Best params: depth={balanced_params[0]}, minbucket={balanced_params[1]}, cp={balanced_params[2]}")
+    print(f"     Training time: {training_time:.2f}s")
+    print(f"     Evaluation time: {evaluation_time:.2f}s")
+    print(f"     Total iteration time: {total_time:.2f}s")
+    
+    if isinstance(metrics, dict):
+        print(f"     Test PR-AUC: {metrics.get('pr_auc', 'N/A'):.4f}" if isinstance(metrics.get('pr_auc'), (int, float)) else f"     Test PR-AUC: {metrics.get('pr_auc', 'N/A')}")
+        print(f"     Test AUC: {metrics.get('auc', 'N/A'):.4f}" if isinstance(metrics.get('auc'), (int, float)) else f"     Test AUC: {metrics.get('auc', 'N/A')}")
+        print(f"     Test Best MCC: {metrics.get('best_mcc', 'N/A'):.4f}" if isinstance(metrics.get('best_mcc'), (int, float)) else f"     Test Best MCC: {metrics.get('best_mcc', 'N/A')}")
+    
+    # Store results
+    result_row = {
+        'M': actual_M,
+        'M_pct_of_controls': actual_M / n_controls * 100,
+        'adaptive_pool': True,
+        'n_train_samples': len(undersampled_training_data),
+        'n_train_minority': (undersampled_training_data[target_col] == 1).sum(),
+        'n_train_majority': (undersampled_training_data[target_col] == 0).sum(),
+        'best_depth': balanced_params[0],
+        'best_minbucket': balanced_params[1],
+        'best_cp': balanced_params[2],
+        'matching_time_seconds': matching_time,
+        'training_time_seconds': training_time,
+        'evaluation_time_seconds': evaluation_time,
+        'total_time_seconds': total_time,
+    }
+    
+    # Add metrics
+    if isinstance(metrics, dict):
+        result_row.update(metrics)
+    
+    all_results.append(result_row)
+    
+    # Save undersampled dataset
+    config_name = f"cw_{CASE_WEIGHTING}_pool_True_seed_{SEED_METHOD}"
+    undersample_path = os.path.join(RESULTS_DIR, f"adaptive_M{actual_M}_{config_name}.csv")
+    undersampled_training_data.to_csv(undersample_path, index=False)
+    print(f"     ✓ Saved undersampled dataset: {undersample_path}")
+    
+except Exception as e:
+    print(f"\n  ✗ ERROR in adaptive pool iteration:")
+    print(f"    {e}")
+    import traceback
+    traceback.print_exc()
+    
+    all_results.append({
+        'M': None,
+        'M_pct_of_controls': None,
+        'adaptive_pool': True,
+        'error': str(e),
+    })
 
 # ============================================================================
 # FINAL COMPARISON
 # ============================================================================
 
 print(f"\n{'='*80}")
-print("COMPARISON OF ALL FEATURE SUBSETS")
+print("POOL SIZE SENSITIVITY ANALYSIS RESULTS")
 print(f"{'='*80}\n")
 
 if all_results:
     results_df = pd.DataFrame(all_results)
     
     # Save results to CSV
-    results_path = os.path.join(RESULTS_DIR, "feature_subset_comparison_results.csv")
+    results_path = os.path.join(RESULTS_DIR, "sensitivity_pool_size.csv")
     results_df.to_csv(results_path, index=False)
-    print(f"✓ Saved comparison results to: {results_path}\n")
+    print(f"✓ Saved results to: {results_path}\n")
     
     # Display comparison
     if 'pr_auc' in results_df.columns:
+        # Sort by M (pool size) for fixed pools, then show adaptive
+        results_df_fixed = results_df[results_df['adaptive_pool'] == False].copy()
+        results_df_adaptive = results_df[results_df['adaptive_pool'] == True].copy()
+        
+        if len(results_df_fixed) > 0:
+            results_df_fixed = results_df_fixed.sort_values('M')
+            
+            print("Results for fixed pool sizes (sorted by M):")
+            print("="*80)
+            
+            display_cols = ['M', 'M_pct_of_controls']
+            metric_cols = ['pr_auc', 'auc', 'best_mcc', 'balanced_recall_gmean', 'balanced_specificity_gmean']
+            for col in metric_cols:
+                if col in results_df_fixed.columns:
+                    display_cols.append(col)
+            
+            print(results_df_fixed[display_cols].to_string(index=False))
+        
+        if len(results_df_adaptive) > 0:
+            print(f"\n{'='*80}")
+            print("Adaptive pool result:")
+            print("="*80)
+            adaptive_row = results_df_adaptive.iloc[0]
+            print(f"  Stopping pool size (M): {adaptive_row['M']:,} ({adaptive_row['M_pct_of_controls']:.1f}% of controls)")
+            if isinstance(adaptive_row.get('pr_auc'), (int, float)):
+                print(f"  PR-AUC: {adaptive_row['pr_auc']:.4f}")
+            if isinstance(adaptive_row.get('auc'), (int, float)):
+                print(f"  AUC: {adaptive_row['auc']:.4f}")
+            if isinstance(adaptive_row.get('best_mcc'), (int, float)):
+                print(f"  Best MCC: {adaptive_row['best_mcc']:.4f}")
+        
+        # Find best configuration
         results_df_sorted = results_df.sort_values('pr_auc', ascending=False)
-        
-        print("Results sorted by PR-AUC (best to worst):")
-        print("="*80)
-        
-        display_cols = ['feature_subset']
-        metric_cols = ['pr_auc', 'auc', 'best_mcc', 'balanced_recall_gmean', 'balanced_specificity_gmean']
-        for col in metric_cols:
-            if col in results_df.columns:
-                display_cols.append(col)
-        
-        print(results_df_sorted[display_cols].to_string(index=False))
-        
         print(f"\n{'='*80}")
-        print("BEST FEATURE SUBSET:")
+        print("BEST CONFIGURATION:")
         print(f"{'='*80}")
         best_row = results_df_sorted.iloc[0]
-        print(f"  Feature subset: {best_row['feature_subset']}")
-        print(f"  Distance directory: {best_row['distance_dir']}")
+        print(f"  Pool size (M): {best_row['M']:,} ({best_row['M_pct_of_controls']:.1f}% of controls)")
+        print(f"  Adaptive pool: {best_row['adaptive_pool']}")
         if isinstance(best_row.get('pr_auc'), (int, float)):
             print(f"  PR-AUC: {best_row['pr_auc']:.4f}")
         if isinstance(best_row.get('auc'), (int, float)):
