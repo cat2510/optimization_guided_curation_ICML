@@ -54,7 +54,7 @@ def get_cat_columns(df):
 def get_bin_flag_columns(df):
     return [col for col in df.columns if col.startswith("has_") or "THRCLS" in col.upper()
     or col.endswith("adherent") or col.startswith("early_")
-    or col.startswith("is_")]
+    or col.startswith("is_") or "is_increasing" in col.lower() or "is_decreasing" in col.lower()]
 def get_true_num_columns(df, CAT_COLUMNS,BIN_FLAG_COLUMNS):
     return [
         col for col in df.columns
