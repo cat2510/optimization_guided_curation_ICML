@@ -32,7 +32,8 @@ Instead of blending probabilities (which doesn't help when OCT is less accurate)
 
 2. **Sample weighting**: Weight samples based on rule confidence:
    - Samples where OCT's rules are clear/confident get higher weights
-   - Encourages XGBoost to pay attention to interpretable patterns
+   - Encourages XGBoost to pay attention to interpretable patterns  
+   - **Default is boost-only** (`weight_min=1.0`): low-confidence samples keep weight 1.0; only confident (high-purity) leaves get weight > 1. When leaf purity is moderate (e.g. P(class=1) ≈ 0.6), confidence is low and the old downweighting scheme (min 0.5) was shrinking the training signal for most samples; boost-only avoids that.
    - Strategies: `confidence`, `agreement` (OCT-label agreement), `minority_boost`
 
 **Key advantages:**
@@ -87,6 +88,9 @@ python train_student.py --distill --use_rule_features --use_sample_weights --wei
 - `--use_rule_features`: Add OCT rule features to XGBoost (default: True)
 - `--use_sample_weights`: Use rule-based sample weighting (default: True)
 - `--weight_strategy`: Sample weighting strategy - `confidence`, `agreement`, or `minority_boost` (default: `confidence`)
+- `--weight_min`, `--weight_max`: Sample weight range (defaults 1.0 and 2.0). Use `weight_min=1.0` so only confident samples are upweighted; avoid values below 1.0 or most data gets downweighted when purity is moderate.
+- `--confidence_exponent`: Use confidence**exponent when mapping to weights (default 1.0). Use **&gt; 1** (e.g. 2.0) so only high-confidence samples get a strong boost; low-confidence samples stay near weight 1.0.
+- `--rule_feature_scale`: Multiply rule features by this before concatenating (default 1.0). Use **&gt; 1** (e.g. 2.0 or 3.0) so OCT rule columns have larger magnitude and XGBoost uses them more in splits.
 
 **Training:**
 - `--n_estimators`: Maximum number of trees (default: 500)
@@ -197,6 +201,11 @@ The training script saves:
 
 **Tuning strategy**: Start with `confidence` strategy. If minority recall is low, try `minority_boost`. If OCT is very accurate, try `agreement`.
 
+**Making OCT rules affect the student more strongly:**
+- **`--rule_feature_scale 2` or `3`**: Scale up the rule-derived features (leaf id, rule indicators, confidence) so they have larger magnitude; XGBoost is more likely to split on them.
+- **`--confidence_exponent 2`**: Use a steeper weight curve so only high-confidence (high-purity) leaves get a real boost; moderate-confidence samples stay near weight 1.0.
+- **`--weight_max 3`**: Allow confident samples to get up to 3× weight instead of 2×.
+
 ### Early Stopping Metric
 
 - **`pr_auc`** (recommended): Best for imbalanced data, focuses on precision-recall trade-off
@@ -262,7 +271,8 @@ So: **leaf probabilities → purity → oct_rule_confidence**. That confidence i
 **4. Confidence-based sample weights**  
 `compute_rule_based_sample_weights(..., weight_strategy='confidence')` calls `extract_oct_rule_features(..., include_rule_confidence=True)` and reads **the same `oct_rule_confidence`** column. It then turns that into a weight per sample:
 
-- **weights = min_weight + (max_weight − min_weight) × confidences**
+- **weights = min_weight + (max_weight − min_weight) × confidences**  
+  Defaults: **min_weight=1.0, max_weight=2.0** (boost-only). When leaf purity is moderate (e.g. p_positive ≈ 0.6), confidence is low (purity = |p−0.5|×2 is small), so with min_weight=0.5 most samples were downweighted (weight below 1) and the training signal was weakened. With min_weight=1.0, only confident samples get weight above 1.
 
 So: **higher rule confidence → higher sample weight** in the XGBoost loss. The student is trained on **true labels**, with **rule features** (including `oct_rule_confidence`) as extra inputs, and **sample_weights** so that high-confidence (high-purity, reasonably large) leaves count more in the gradient. Leaf probabilities are used only to compute that confidence (and thus both the extra feature and the weights), not as a direct input or soft label.
 

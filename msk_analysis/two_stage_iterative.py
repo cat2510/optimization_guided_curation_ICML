@@ -39,8 +39,8 @@ df_msk_spark = spark.read.format("parquet").load("msk_2017_18_full.parquet")
 df_og = df_msk_spark.toPandas()
 
 TRAIN_TEST_SEED = 123
-
-RESULTS_DIR = "./sensitivity_pool_size_all_cost_features/results" #undersampled dataset directory
+BASE_DIR = "./sensitivity_pool_size_all_cost_features_150_minbucket"
+RESULTS_DIR = os.path.join(BASE_DIR, "results") #undersampled dataset directory
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # Configuration for k-center matching
@@ -139,6 +139,8 @@ print(f"Train: {train_pd.shape}, Val: {val_pd.shape}, Test: {test_pd.shape}")
 # Use a single precomputed distance directory
 DISTANCES_DIR = "./precomputed_distances_msk_with_cost_features"  # Change this to your preferred directory
 PN_H5_PATH = os.path.join(DISTANCES_DIR, "distances_majority_minority.h5")
+# Distance metric for precompute_distances: 'euclidean' (L2), 'manhattan' (L1), 'chebyshev' (L_infinity)
+DISTANCE_METRIC = "manhattan"  # or "chebyshev" for L_infinity; pass to compute_distances_batched / precompute_leaf_dnn_memmap
 DNN_OUT_DIR = os.path.join(DISTANCES_DIR, f"global_dnn_seed_{TRAIN_TEST_SEED}")
 dnn_matrix_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_matrix.npy")
 dnn_enrolids_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_enrolids.npy")
@@ -163,9 +165,9 @@ print(f"  Ratio: {n_controls/n_cases:.2f}:1\n")
 
 # Generate pool sizes M to test
 # Range from n_cases to n_controls//2 in reasonably separated steps
-M_min = n_cases
-M_max = n_controls // 2
-
+#M_min = n_cases
+M_min = n_controls // 2
+M_max = n_controls
 # Create steps: use approximately 10-15 steps, with larger steps for larger ranges
 num_steps = 12
 if M_max - M_min < num_steps:
@@ -287,8 +289,10 @@ for m_idx, M in enumerate(M_values, 1):
             numeric_cols=TRUE_NUM_COLUMNS,
             binary_cols=BIN_FLAG_COLUMNS,
             depths=[5, 7],
-            minbuckets=[100],
-            cps=[0.0001, 0.001, 0.01]
+            minbuckets=[150],
+            cps=[0.0001, 0.001, 0.01],
+            verbose=False,
+            random_seed=TRAIN_TEST_SEED
         )
         
         training_end_time = time.perf_counter()
@@ -298,7 +302,7 @@ for m_idx, M in enumerate(M_values, 1):
         evaluation_start_time = time.perf_counter()
         
         # Create results directory
-        results_dir = f"sensitivity_pool_size_all_cost_features/pool_size_M{M}"
+        results_dir = f"{BASE_DIR}/pool_size_M{M}"
         os.makedirs(results_dir, exist_ok=True)
         
         metrics = evaluate_binary_oct(
@@ -436,7 +440,7 @@ try:
         numeric_cols=TRUE_NUM_COLUMNS,
         binary_cols=BIN_FLAG_COLUMNS,
         depths=[5, 7],
-        minbuckets=[100],
+        minbuckets=[150],
         cps=[0.0001, 0.001, 0.01],
         verbose=False,
         random_seed=TRAIN_TEST_SEED
@@ -448,13 +452,10 @@ try:
     # Evaluate
     evaluation_start_time = time.perf_counter()
     
-    results_dir = f"msk_balanced_pool_size_adaptive"
-    os.makedirs(results_dir, exist_ok=True)
-    
     metrics = evaluate_binary_oct(
         balanced_model, X_test, y_test, preprocessor, feature_names, 
         X_val_df=X_val, y_val=y_val,
-        results_dir=results_dir, 
+        results_dir=BASE_DIR, 
         save_suffix=f"adaptive_{balanced_params[0]}_{balanced_params[1]}_{balanced_params[2]}"
     )
     
@@ -526,9 +527,10 @@ print(f"{'='*80}\n")
 if all_results:
     results_df = pd.DataFrame(all_results)
     
-    # Save results to CSV
+    # Save results to CSV (append if file exists)
     results_path = os.path.join(RESULTS_DIR, "sensitivity_pool_size.csv")
-    results_df.to_csv(results_path, index=False)
+    write_header = not os.path.exists(results_path)
+    results_df.to_csv(results_path, mode='a', index=False, header=write_header)
     print(f"✓ Saved results to: {results_path}\n")
     
     # Display comparison

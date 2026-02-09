@@ -30,9 +30,9 @@ TRAIN_TEST_SEED = 123
 target_col = "top_2_pct_cost_2018"
 
 # Results directory
-base_dir = "./sensitivity_pool_size_all_cost_features"
+base_dir = "./sensitivity_pool_size_all_cost_features_150_minbucket"
 RESULTS_DIR = os.path.join(base_dir, "results")
-OUTPUT_CSV = os.path.join(RESULTS_DIR, "sensitivity_pool_size.csv")
+OUTPUT_CSV = os.path.join(RESULTS_DIR, "sensitivity_pool_size_extended.csv")
 
 # ============================================================================
 # LOAD TEST SET LABELS
@@ -327,7 +327,7 @@ if len(all_results) > 0:
                         ha='center', fontsize=8)
     
     plt.tight_layout()
-    plot_path = os.path.join(RESULTS_DIR, "sensitivity_pool_size_plots.png")
+    plot_path = os.path.join(RESULTS_DIR, "sensitivity_pool_size_extended.png")
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     print(f"✓ Saved plots to: {plot_path}")
     plt.close()

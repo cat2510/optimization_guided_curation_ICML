@@ -121,6 +121,16 @@ def main():
     parser.add_argument('--weight_strategy', type=str, default='confidence',
                        choices=['confidence', 'agreement', 'minority_boost'],
                        help='Sample weighting strategy: confidence (rule confidence), agreement (OCT-label agreement), minority_boost (boost minority in confident leaves)')
+    parser.add_argument('--weight_min', type=float, default=1.0,
+                       help='Min sample weight (default 1.0 = boost-only; no downweighting)')
+    parser.add_argument('--weight_max', type=float, default=2.0,
+                       help='Max sample weight for confident leaves')
+    parser.add_argument('--confidence_exponent', type=float, default=1.0,
+                       help='Use confidence**exponent for weights; >1 strengthens high-confidence samples (default 1.0)')
+    parser.add_argument('--rule_feature_scale', type=float, default=1.0,
+                       help='Scale rule features by this factor; >1 makes OCT rules count more in splits (default 1.0)')
+    parser.add_argument('--no_rule_confidence_feature', action='store_true',
+                       help='Do not add oct_rule_confidence as a feature (only leaf id and rule indicators); sample weights still use confidence if enabled')
     
     # Training arguments
     parser.add_argument('--n_estimators', type=int, default=500,
@@ -317,6 +327,11 @@ def main():
             use_rule_features=args.use_rule_features,
             use_sample_weights=args.use_sample_weights,
             weight_strategy=args.weight_strategy,
+            weight_min=args.weight_min,
+            weight_max=args.weight_max,
+            confidence_exponent=args.confidence_exponent,
+            rule_feature_scale=args.rule_feature_scale,
+            include_rule_confidence_feature=not args.no_rule_confidence_feature,
             scale_pos_weight=args.scale_pos_weight,
             early_stop_metric=args.early_stop_metric,
             early_stop_rounds=args.early_stop_rounds,
@@ -330,14 +345,18 @@ def main():
         if args.use_rule_features:
             rule_test, _ = extract_oct_rule_features(
                 teacher, X_test, include_leaf_assignment=True,
-                include_rule_indicators=True, include_rule_confidence=True
+                include_rule_indicators=True, include_rule_confidence=not args.no_rule_confidence_feature
             )
-            X_test_p = np.hstack([X_test_p, rule_test.values])
+            rtest = rule_test.values.astype(np.float64) * args.rule_feature_scale
+            X_test_p = np.hstack([X_test_p, rtest])
         y_test_p = model.predict_proba(X_test_p)[:, 1]
         test_m = compute_minority_metrics(y_test, y_test_p, verbose=False)
         cal = check_calibration(y_test, y_test_p)
         # Enriched feature names (base + rule features from train_student_distilled internals)
-        rule_train, _ = extract_oct_rule_features(teacher, X_train, True, True, True)
+        rule_train, _ = extract_oct_rule_features(
+            teacher, X_train, include_leaf_assignment=True,
+            include_rule_indicators=True, include_rule_confidence=not args.no_rule_confidence_feature
+        )
         enriched_names = feature_names + list(rule_train.columns)
         return model, val_m, test_m, cal, enriched_names
 
@@ -447,6 +466,11 @@ def main():
             use_rule_features=args.use_rule_features,
             use_sample_weights=args.use_sample_weights,
             weight_strategy=args.weight_strategy,
+            weight_min=args.weight_min,
+            weight_max=args.weight_max,
+            confidence_exponent=args.confidence_exponent,
+            rule_feature_scale=args.rule_feature_scale,
+            include_rule_confidence_feature=not args.no_rule_confidence_feature,
             scale_pos_weight=args.scale_pos_weight,
             early_stop_metric=args.early_stop_metric,
             early_stop_rounds=args.early_stop_rounds,
@@ -460,9 +484,10 @@ def main():
         if teacher is not None and args.use_rule_features:
             rule_features_test, _ = extract_oct_rule_features(
                 teacher, X_test, include_leaf_assignment=True,
-                include_rule_indicators=True, include_rule_confidence=True
+                include_rule_indicators=True, include_rule_confidence=not args.no_rule_confidence_feature
             )
-            X_test_processed = np.hstack([X_test_processed, rule_features_test.values])
+            rtest = rule_features_test.values.astype(np.float64) * args.rule_feature_scale
+            X_test_processed = np.hstack([X_test_processed, rtest])
         y_test_pred_proba = student_model.predict_proba(X_test_processed)[:, 1]
         test_metrics = compute_minority_metrics(y_test, y_test_pred_proba, verbose=args.verbose)
         calibration_info = check_calibration(y_test, y_test_pred_proba)
@@ -482,7 +507,10 @@ def main():
         model_path = f"{args.output_dir}/models/student_model.pkl"
         fnames = feature_names
         if args.distill and args.use_rule_features:
-            rule_train, _ = extract_oct_rule_features(teacher, X_train, True, True, True)
+            rule_train, _ = extract_oct_rule_features(
+                teacher, X_train, include_leaf_assignment=True,
+                include_rule_indicators=True, include_rule_confidence=not args.no_rule_confidence_feature
+            )
             fnames = feature_names + list(rule_train.columns)
         with open(model_path, 'wb') as f:
             pickle.dump({
@@ -536,7 +564,10 @@ def main():
     if hasattr(student_model, 'feature_importances_'):
         fnames = feature_names
         if args.distill and args.use_rule_features:
-            rule_train, _ = extract_oct_rule_features(teacher, X_train, True, True, True)
+            rule_train, _ = extract_oct_rule_features(
+                teacher, X_train, include_leaf_assignment=True,
+                include_rule_indicators=True, include_rule_confidence=not args.no_rule_confidence_feature
+            )
             fnames = feature_names + list(rule_train.columns)
         importance_df = pd.DataFrame({
             'feature': fnames,

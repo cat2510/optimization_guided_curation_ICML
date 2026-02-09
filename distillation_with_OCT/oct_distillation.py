@@ -469,7 +469,9 @@ def compute_rule_based_sample_weights(
     y: np.ndarray,
     weight_strategy: str = 'confidence',
     min_weight: float = 1.0,
-    max_weight: float = 2.0
+    max_weight: float = 2.0,
+    confidence_exponent: float = 1.0,
+    **kwargs
 ) -> np.ndarray:
     """
     Compute sample weights based on OCT's rule confidence.
@@ -498,6 +500,9 @@ def compute_rule_based_sample_weights(
         Minimum sample weight (default 1.0 = no downweighting)
     max_weight : float
         Maximum sample weight (samples in high-purity leaves can get this)
+    confidence_exponent : float, default 1.0
+        Map confidence to weight via confidence ** exponent. Use > 1 (e.g. 2.0)
+        to boost only high-confidence samples more strongly.
     
     Returns:
     --------
@@ -515,6 +520,10 @@ def compute_rule_based_sample_weights(
         # Fallback: uniform weights
         return np.ones(len(X))
     
+    # Steepen the confidence→weight curve when exponent > 1
+    if confidence_exponent != 1.0:
+        confidences = np.power(np.clip(confidences, 0.0, 1.0), confidence_exponent)
+
     if weight_strategy == 'confidence':
         # Weight by confidence directly
         weights = min_weight + (max_weight - min_weight) * confidences
@@ -591,6 +600,11 @@ def train_student_distilled(
     use_rule_features: bool = True,
     use_sample_weights: bool = True,
     weight_strategy: str = 'confidence',
+    weight_min: float = 1.0,
+    weight_max: float = 2.0,
+    confidence_exponent: float = 1.0,
+    rule_feature_scale: float = 1.0,
+    include_rule_confidence_feature: bool = True,
     scale_pos_weight: Optional[float] = None,
     early_stop_metric: str = 'pr_auc',
     early_stop_rounds: int = 50,
@@ -628,6 +642,16 @@ def train_student_distilled(
         Use rule-based sample weighting
     weight_strategy : str, default 'confidence'
         Sample weighting strategy ('confidence', 'agreement', 'minority_boost')
+    weight_min : float, default 1.0
+        Minimum sample weight (1.0 = no downweighting; only boost confident samples)
+    weight_max : float, default 2.0
+        Maximum sample weight (samples in high-purity leaves can get this)
+    confidence_exponent : float, default 1.0
+        Use confidence ** exponent for weighting; > 1 strengthens effect for high-confidence samples
+    rule_feature_scale : float, default 1.0
+        Multiply rule features by this before concatenating; > 1 makes OCT rules count more in splits
+    include_rule_confidence_feature : bool, default True
+        If False, do not add oct_rule_confidence as a feature (only leaf id and rule indicators); sample weights can still use confidence
     scale_pos_weight : float, optional
         XGBoost scale_pos_weight (auto-computed if None)
     early_stop_metric : str, default 'pr_auc'
@@ -683,16 +707,18 @@ def train_student_distilled(
             print("Extracting OCT rule-based features...")
         rule_features_train, rule_metadata = extract_oct_rule_features(
             teacher, X_train, include_leaf_assignment=True,
-            include_rule_indicators=True, include_rule_confidence=True
+            include_rule_indicators=True, include_rule_confidence=include_rule_confidence_feature
         )
         rule_features_val, _ = extract_oct_rule_features(
             teacher, X_val, include_leaf_assignment=True,
-            include_rule_indicators=True, include_rule_confidence=True
+            include_rule_indicators=True, include_rule_confidence=include_rule_confidence_feature
         )
         
-        # Concatenate with original features
-        X_train_processed = np.hstack([X_train_processed, rule_features_train.values])
-        X_val_processed = np.hstack([X_val_processed, rule_features_val.values])
+        # Scale rule features so OCT rules can affect splits more (rule_feature_scale > 1)
+        rtrain = rule_features_train.values.astype(np.float64) * rule_feature_scale
+        rval = rule_features_val.values.astype(np.float64) * rule_feature_scale
+        X_train_processed = np.hstack([X_train_processed, rtrain])
+        X_val_processed = np.hstack([X_val_processed, rval])
         
         # Update feature names
         rule_feature_names = list(rule_features_train.columns)
@@ -700,6 +726,8 @@ def train_student_distilled(
         
         if verbose:
             print(f"  Added {len(rule_feature_names)} rule features")
+            if rule_feature_scale != 1.0:
+                print(f"  Rule feature scale: {rule_feature_scale} (OCT rules emphasized in splits)")
             print(f"  Total features: {len(feature_names)}")
             print(f"  Rule metadata: {len(rule_metadata.get('rule_names', []))} rule indicators")
     
@@ -708,8 +736,12 @@ def train_student_distilled(
     if use_sample_weights:
         if verbose:
             print(f"Computing rule-based sample weights (strategy: {weight_strategy})...")
+            if confidence_exponent != 1.0:
+                print(f"  Confidence exponent: {confidence_exponent} (steeper boost for high-confidence samples)")
         sample_weights = compute_rule_based_sample_weights(
-            teacher, X_train, y_train, weight_strategy=weight_strategy
+            teacher, X_train, y_train, weight_strategy=weight_strategy,
+            min_weight=weight_min, max_weight=weight_max,
+            confidence_exponent=confidence_exponent
         )
         if verbose:
             print(f"  Weight range: [{sample_weights.min():.3f}, {sample_weights.max():.3f}]")
