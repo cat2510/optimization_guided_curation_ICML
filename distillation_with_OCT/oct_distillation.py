@@ -29,7 +29,7 @@ import xgboost as xgb
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, precision_recall_curve,
     confusion_matrix, recall_score, precision_score, f1_score,
-    matthews_corrcoef, brier_score_loss
+    matthews_corrcoef, brier_score_loss, roc_curve
 )
 from sklearn.calibration import calibration_curve
 
@@ -326,7 +326,259 @@ def oct_predict_proba(
 
 
 # ============================================================================
-# DISTILLED STUDENT TRAINING
+# RULE-BASED FEATURE EXTRACTION
+# ============================================================================
+
+def extract_oct_rule_features(
+    teacher: OCTTeacher,
+    X: pd.DataFrame,
+    include_leaf_assignment: bool = True,
+    include_rule_indicators: bool = True,
+    include_rule_confidence: bool = True
+) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Extract OCT's interpretable decision rules as features.
+    
+    This captures the structure of OCT's rules (which splits were triggered)
+    rather than just the probabilities, allowing XGBoost to learn from
+    the interpretable patterns while still discovering additional patterns.
+    
+    Parameters:
+    -----------
+    teacher : OCTTeacher
+        Trained OCT teacher
+    X : pd.DataFrame
+        Features (raw, will be preprocessed)
+    include_leaf_assignment : bool
+        Include leaf assignment as a categorical feature
+    include_rule_indicators : bool
+        Include binary indicators for each rule (split) that was triggered
+    include_rule_confidence : bool
+        Include confidence scores based on leaf purity
+    
+    Returns:
+    --------
+    rule_features : pd.DataFrame
+        Rule-based features to concatenate with original features
+    rule_metadata : dict
+        Metadata about the rules (for interpretation)
+    """
+    # Preprocess
+    if teacher.preprocessor is not None:
+        X_processed = teacher.preprocessor.transform(X)
+        if teacher.feature_names:
+            X_processed = pd.DataFrame(X_processed, columns=teacher.feature_names)
+        else:
+            X_processed = pd.DataFrame(X_processed)
+    else:
+        X_processed = X.copy()
+    
+    n_samples = len(X_processed)
+    rule_features_dict = {}
+    rule_metadata = {
+        'n_rules': 0,
+        'rule_names': [],
+        'leaf_stats': {}
+    }
+    
+    # Get leaf assignments
+    if teacher.model is not None:
+        leaf_assignments = teacher.model.apply(X_processed)
+    elif teacher.splits_df is not None:
+        leaf_assignments = teacher._apply_splits_manual(X_processed)
+    else:
+        raise ValueError("Need either model or splits_df to extract rules")
+    
+    # 1. Leaf assignment (categorical feature)
+    if include_leaf_assignment:
+        rule_features_dict['oct_leaf_id'] = leaf_assignments
+        unique_leaves = np.unique(leaf_assignments)
+        rule_metadata['leaf_stats'] = {
+            'n_unique_leaves': len(unique_leaves),
+            'leaf_ids': unique_leaves.tolist()
+        }
+    
+    # 2. Rule indicators (which splits were triggered)
+    if include_rule_indicators and teacher.splits_df is not None:
+        # For each rule (split), create a binary indicator
+        for _, row in teacher.splits_df.iterrows():
+            node_id = int(row['node_id'])
+            feature = row['feature']
+            threshold = float(row['threshold'])
+            
+            # Find matching feature in processed data
+            matching_cols = [c for c in X_processed.columns if feature in str(c)]
+            if not matching_cols:
+                # Try exact match
+                if feature in X_processed.columns:
+                    matching_cols = [feature]
+            
+            if matching_cols:
+                feature_col = matching_cols[0]
+                # Rule: feature <= threshold (left child) or > threshold (right child)
+                # We'll create indicators for both paths
+                rule_name_left = f'oct_rule_{node_id}_left'  # feature <= threshold
+                rule_name_right = f'oct_rule_{node_id}_right'  # feature > threshold
+                
+                values = X_processed[feature_col].values
+                rule_features_dict[rule_name_left] = (values <= threshold).astype(int)
+                rule_features_dict[rule_name_right] = (values > threshold).astype(int)
+                
+                rule_metadata['rule_names'].extend([rule_name_left, rule_name_right])
+                rule_metadata['n_rules'] += 2
+    
+    # 3. Rule confidence (based on leaf purity and size)
+    if include_rule_confidence and teacher.leaf_probs:
+        # Confidence = how "pure" the leaf is (how far from 0.5)
+        # Also consider leaf size (larger leaves = more confident)
+        leaf_confidences = np.zeros(n_samples)
+        leaf_sizes = {}
+        
+        # Compute leaf sizes from training data if available
+        if teacher.X_train_processed is not None:
+            train_leaf_assignments = teacher.model.apply(teacher.X_train_processed) if teacher.model else teacher._apply_splits_manual(teacher.X_train_processed)
+            for leaf_id in np.unique(train_leaf_assignments):
+                leaf_sizes[leaf_id] = np.sum(train_leaf_assignments == leaf_id)
+        
+        for i, leaf_id in enumerate(leaf_assignments):
+            p_positive = teacher.leaf_probs.get(leaf_id, 0.5)
+            # Purity: distance from 0.5 (max at 0 or 1)
+            purity = abs(p_positive - 0.5) * 2  # Scale to [0, 1]
+            
+            # Size confidence: larger leaves are more stable
+            leaf_size = leaf_sizes.get(leaf_id, 1)
+            size_confidence = min(1.0, np.log(leaf_size + 1) / np.log(100))  # Log scale, cap at 100 samples
+            
+            # Combined confidence
+            leaf_confidences[i] = 0.7 * purity + 0.3 * size_confidence
+        
+        rule_features_dict['oct_rule_confidence'] = leaf_confidences
+    
+    # Convert to DataFrame
+    if rule_features_dict:
+        rule_features = pd.DataFrame(rule_features_dict, index=X.index if hasattr(X, 'index') else range(n_samples))
+    else:
+        rule_features = pd.DataFrame(index=X.index if hasattr(X, 'index') else range(n_samples))
+    
+    return rule_features, rule_metadata
+
+
+def compute_rule_based_sample_weights(
+    teacher: OCTTeacher,
+    X: pd.DataFrame,
+    y: np.ndarray,
+    weight_strategy: str = 'confidence',
+    min_weight: float = 1.0,
+    max_weight: float = 2.0
+) -> np.ndarray:
+    """
+    Compute sample weights based on OCT's rule confidence.
+    
+    Samples where OCT's rules are clear/confident get higher weights,
+    encouraging XGBoost to pay more attention to these interpretable patterns.
+    
+    Default min_weight=1.0 (boost-only): low-confidence samples keep weight 1.0;
+    only confident samples get weight > 1. This avoids downweighting most data
+    when leaf purity is moderate (e.g. p_positive ~ 0.6 → low purity → small
+    confidence), which would otherwise shrink the training signal.
+    
+    Parameters:
+    -----------
+    teacher : OCTTeacher
+        Trained OCT teacher
+    X : pd.DataFrame
+        Features
+    y : np.ndarray
+        Labels
+    weight_strategy : str
+        'confidence': Weight by rule confidence (leaf purity + size)
+        'agreement': Higher weight when OCT and label agree
+        'minority_boost': Boost minority class samples in confident leaves
+    min_weight : float
+        Minimum sample weight (default 1.0 = no downweighting)
+    max_weight : float
+        Maximum sample weight (samples in high-purity leaves can get this)
+    
+    Returns:
+    --------
+    weights : np.ndarray
+        Sample weights for training
+    """
+    # Get rule features to compute confidence
+    rule_features, _ = extract_oct_rule_features(
+        teacher, X, include_rule_confidence=True, include_rule_indicators=False
+    )
+    
+    if 'oct_rule_confidence' in rule_features.columns:
+        confidences = rule_features['oct_rule_confidence'].values
+    else:
+        # Fallback: uniform weights
+        return np.ones(len(X))
+    
+    if weight_strategy == 'confidence':
+        # Weight by confidence directly
+        weights = min_weight + (max_weight - min_weight) * confidences
+    
+    elif weight_strategy == 'agreement':
+        # Higher weight when OCT prediction agrees with label
+        leaf_assignments = rule_features['oct_leaf_id'].values if 'oct_leaf_id' in rule_features.columns else None
+        if leaf_assignments is not None and teacher.leaf_probs:
+            oct_predictions = np.array([teacher.leaf_probs.get(leaf_id, 0.5) for leaf_id in leaf_assignments])
+            oct_pred_binary = (oct_predictions >= 0.5).astype(int)
+            agreement = (oct_pred_binary == y).astype(float)
+            # Combine confidence and agreement
+            weights = min_weight + (max_weight - min_weight) * (0.5 * confidences + 0.5 * agreement)
+        else:
+            weights = min_weight + (max_weight - min_weight) * confidences
+    
+    elif weight_strategy == 'minority_boost':
+        # Boost minority class samples in confident leaves; others at min_weight (default 1.0)
+        weights = np.ones(len(X)) * min_weight
+        minority_mask = (y == 1)
+        weights[minority_mask] = min_weight + (max_weight - min_weight) * confidences[minority_mask]
+        weights[~minority_mask] = min_weight + 0.5 * (max_weight - min_weight) * confidences[~minority_mask]
+    
+    else:
+        weights = np.ones(len(X))
+    
+    return np.clip(weights, min_weight, max_weight)
+
+
+# ============================================================================
+# BOOSTER WRAPPER (sklearn-like API without mutating XGBClassifier)
+# ============================================================================
+
+class _BoosterWrapper:
+    """Thin wrapper around xgb.Booster with predict_proba and feature_importances_."""
+
+    def __init__(self, booster, feature_names: List[str], n_features: int):
+        self._booster = booster
+        self.feature_names = feature_names
+        self._n_features = n_features
+
+    def predict_proba(self, X) -> np.ndarray:
+        X = np.asarray(X)
+        dmat = xgb.DMatrix(X, feature_names=self.feature_names if len(self.feature_names) == X.shape[1] else None)
+        p_pos = self._booster.predict(dmat)  # binary:logistic returns P(class=1)
+        p_pos = np.clip(np.asarray(p_pos).ravel(), 0.0, 1.0)
+        return np.column_stack([1 - p_pos, p_pos])
+
+    def predict(self, X) -> np.ndarray:
+        p = self.predict_proba(X)[:, 1]
+        return (p >= 0.5).astype(int)
+
+    @property
+    def feature_importances_(self) -> np.ndarray:
+        score = self._booster.get_score(importance_type="weight")
+        out = np.zeros(self._n_features)
+        for i in range(self._n_features):
+            key = f"f{i}"
+            out[i] = score.get(key, 0.0)
+        return out
+
+
+# ============================================================================
+# DISTILLED STUDENT TRAINING (RULE-BASED)
 # ============================================================================
 
 def train_student_distilled(
@@ -334,10 +586,11 @@ def train_student_distilled(
     y_train: np.ndarray,
     X_val: pd.DataFrame,
     y_val: np.ndarray,
-    teacher_proba: np.ndarray,
+    teacher: OCTTeacher,
     preprocessor=None,
-    alpha: float = 0.3,
-    temperature: float = 1.0,
+    use_rule_features: bool = True,
+    use_sample_weights: bool = True,
+    weight_strategy: str = 'confidence',
     scale_pos_weight: Optional[float] = None,
     early_stop_metric: str = 'pr_auc',
     early_stop_rounds: int = 50,
@@ -346,11 +599,14 @@ def train_student_distilled(
     learning_rate: float = 0.1,
     random_state: int = 42,
     verbose: bool = True
-) -> Tuple[xgb.XGBClassifier, Dict]:
+) -> Tuple[Union[xgb.XGBClassifier, _BoosterWrapper], Dict]:
     """
-    Train XGBoost student with distillation from OCT teacher.
+    Train XGBoost student with rule-based distillation from OCT teacher.
     
-    Uses soft label blending: p_soft = (1-α)*y + α*p_teacher
+    Instead of blending probabilities, this uses OCT's interpretable decision rules:
+    1. Extracts rule-based features (leaf assignments, rule indicators, confidence)
+    2. Uses sample weighting based on rule confidence
+    3. Allows XGBoost to learn from interpretable patterns while discovering additional patterns
     
     Parameters:
     -----------
@@ -362,14 +618,16 @@ def train_student_distilled(
         Validation features
     y_val : np.ndarray
         Validation labels
-    teacher_proba : np.ndarray, shape (n_train, 2)
-        Teacher probabilities for training samples
+    teacher : OCTTeacher
+        Trained OCT teacher
     preprocessor : sklearn transformer, optional
         Preprocessor (will be fitted if None)
-    alpha : float, default 0.3
-        Distillation strength (0 = no distillation, 1 = only teacher)
-    temperature : float, default 1.0
-        Temperature scaling for teacher probabilities (not used in current implementation)
+    use_rule_features : bool, default True
+        Add OCT rule features (leaf assignment, rule indicators) to XGBoost
+    use_sample_weights : bool, default True
+        Use rule-based sample weighting
+    weight_strategy : str, default 'confidence'
+        Sample weighting strategy ('confidence', 'agreement', 'minority_boost')
     scale_pos_weight : float, optional
         XGBoost scale_pos_weight (auto-computed if None)
     early_stop_metric : str, default 'pr_auc'
@@ -392,7 +650,7 @@ def train_student_distilled(
     model : xgb.XGBClassifier
         Trained student model
     metrics : dict
-        Validation metrics
+        Validation metrics and rule metadata
     """
     # Preprocess data
     if preprocessor is None:
@@ -415,13 +673,47 @@ def train_student_distilled(
     else:
         feature_names = [f'f{i}' for i in range(X_train_processed.shape[1])]
     
-    # Create soft labels
-    y_train_soft = (1 - alpha) * y_train.astype(float) + alpha * teacher_proba[:, 1]
-    y_train_soft = np.clip(y_train_soft, 0.0, 1.0)  # Ensure [0, 1]
+    # Extract rule-based features
+    rule_features_train = None
+    rule_features_val = None
+    rule_metadata = {}
     
-    if verbose:
-        print(f"Distillation: α={alpha:.2f}, soft label range: [{y_train_soft.min():.3f}, {y_train_soft.max():.3f}]")
-        print(f"  Original labels: {np.bincount(y_train.astype(int))}")
+    if use_rule_features:
+        if verbose:
+            print("Extracting OCT rule-based features...")
+        rule_features_train, rule_metadata = extract_oct_rule_features(
+            teacher, X_train, include_leaf_assignment=True,
+            include_rule_indicators=True, include_rule_confidence=True
+        )
+        rule_features_val, _ = extract_oct_rule_features(
+            teacher, X_val, include_leaf_assignment=True,
+            include_rule_indicators=True, include_rule_confidence=True
+        )
+        
+        # Concatenate with original features
+        X_train_processed = np.hstack([X_train_processed, rule_features_train.values])
+        X_val_processed = np.hstack([X_val_processed, rule_features_val.values])
+        
+        # Update feature names
+        rule_feature_names = list(rule_features_train.columns)
+        feature_names = feature_names + rule_feature_names
+        
+        if verbose:
+            print(f"  Added {len(rule_feature_names)} rule features")
+            print(f"  Total features: {len(feature_names)}")
+            print(f"  Rule metadata: {len(rule_metadata.get('rule_names', []))} rule indicators")
+    
+    # Compute sample weights based on rule confidence
+    sample_weights = None
+    if use_sample_weights:
+        if verbose:
+            print(f"Computing rule-based sample weights (strategy: {weight_strategy})...")
+        sample_weights = compute_rule_based_sample_weights(
+            teacher, X_train, y_train, weight_strategy=weight_strategy
+        )
+        if verbose:
+            print(f"  Weight range: [{sample_weights.min():.3f}, {sample_weights.max():.3f}]")
+            print(f"  Mean weight: {sample_weights.mean():.3f}")
     
     # Compute scale_pos_weight if not provided
     if scale_pos_weight is None:
@@ -431,11 +723,11 @@ def train_student_distilled(
         if verbose:
             print(f"Auto scale_pos_weight: {scale_pos_weight:.2f}")
     
-    # Prepare DMatrix for XGBoost
-    dtrain = xgb.DMatrix(X_train_processed, label=y_train_soft, feature_names=feature_names)
+    # Prepare DMatrix for XGBoost (use true labels, not soft labels)
+    dtrain = xgb.DMatrix(X_train_processed, label=y_train, feature_names=feature_names, weight=sample_weights)
     dval = xgb.DMatrix(X_val_processed, label=y_val, feature_names=feature_names)
     
-    # Set up parameters
+    # Set up parameters (aligned with baseline XGBClassifier in train_student.py for fair comparison)
     params = {
         'objective': 'binary:logistic',
         'max_depth': max_depth,
@@ -469,17 +761,18 @@ def train_student_distilled(
         verbose_eval=verbose and 10  # Print every 10 rounds
     )
     
-    # Convert to sklearn API for easier use
-    model_sklearn = xgb.XGBClassifier()
-    model_sklearn._Booster = model
-    model_sklearn._le = None  # Binary classification, no label encoder needed
-    model_sklearn.classes_ = np.array([0, 1])
-    model_sklearn.n_classes_ = 2
-    model_sklearn._n_features = X_train_processed.shape[1]
+    # Wrap Booster in an object with sklearn-like predict_proba and feature_importances_
+    # (avoid mutating XGBClassifier.classes_ which is read-only in newer xgboost)
+    model_sklearn = _BoosterWrapper(model, feature_names, n_features=X_train_processed.shape[1])
     
     # Evaluate on validation set
     y_val_pred_proba = model_sklearn.predict_proba(X_val_processed)[:, 1]
     metrics = compute_minority_metrics(y_val, y_val_pred_proba, verbose=verbose)
+    
+    # Add rule metadata to metrics
+    metrics['rule_metadata'] = rule_metadata
+    metrics['n_rule_features'] = len(rule_feature_names) if use_rule_features else 0
+    metrics['used_sample_weights'] = use_sample_weights
     
     return model_sklearn, metrics
 

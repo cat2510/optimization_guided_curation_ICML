@@ -38,10 +38,9 @@ spark = SparkSession.builder.appName("DataLoad").getOrCreate()
 df_msk_spark = spark.read.format("parquet").load("msk_2017_18_full.parquet")
 df_og = df_msk_spark.toPandas()
 
-
 TRAIN_TEST_SEED = 123
 
-RESULTS_DIR = "./two_stage_kcenter_results_msk_static_pool" #undersampled dataset directory
+RESULTS_DIR = "./sensitivity_pool_size_all_cost_features/results" #undersampled dataset directory
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # Configuration for k-center matching
@@ -84,7 +83,6 @@ if len(leftover_cols) > 0:
     print(f"Number of leftover columns: {len(leftover_cols),leftover_cols[:20]}")
 
 
-# Create cost stratum from 2018 target (if available)
 # Check what target columns are available
 target_candidates = [col for col in df_og.columns if "2018" in col and ("top" in col.lower() or "pct" in col.lower() or "cost" in col.lower())]
 
@@ -108,9 +106,6 @@ exclude_cols = ["ENROLID", target_col] + [col for col in df_og.columns
 if "2018" in col]
 feature_cols = [c for c in df_og.columns if c not in exclude_cols]
 
-print(f"\nTotal columns in dataset: {len(df_og.columns)}")
-print(f"Feature columns: {len(feature_cols)}")
-
 
 # Split data into train/test/val (same as multiobjective_bilevel.ipynb)
 # Use the target_col defined in cell 0
@@ -122,7 +117,6 @@ train_ids, test_ids, train_pd, test_pd = train_test_split_enrol(
     random_state=TRAIN_TEST_SEED
 )
 print(f"Train shape: {train_pd.shape}, Test shape: {test_pd.shape}")
-print("Feature cols:", len(feature_cols))
 
 val_ids, test_ids, val_pd, test_pd = train_test_split_enrol(
     test_pd, 
@@ -143,7 +137,7 @@ print(f"Train: {train_pd.shape}, Val: {val_pd.shape}, Test: {test_pd.shape}")
 # ============================================================================
 
 # Use a single precomputed distance directory
-DISTANCES_DIR = "./precomputed_distances_msk_less_cost"  # Change this to your preferred directory
+DISTANCES_DIR = "./precomputed_distances_msk_with_cost_features"  # Change this to your preferred directory
 PN_H5_PATH = os.path.join(DISTANCES_DIR, "distances_majority_minority.h5")
 DNN_OUT_DIR = os.path.join(DISTANCES_DIR, f"global_dnn_seed_{TRAIN_TEST_SEED}")
 dnn_matrix_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_matrix.npy")
@@ -154,13 +148,6 @@ if not os.path.exists(PN_H5_PATH):
     raise FileNotFoundError(f"Distance file not found: {PN_H5_PATH}")
 if not os.path.exists(dnn_matrix_npy) or not os.path.exists(dnn_enrolids_npy):
     raise FileNotFoundError(f"DNN files not found in {DNN_OUT_DIR}")
-
-print(f"\n{'='*80}")
-print("POOL SIZE SENSITIVITY ANALYSIS")
-print(f"{'='*80}")
-print(f"Using precomputed distances from: {DISTANCES_DIR}")
-print(f"  Minority-Majority: {PN_H5_PATH}")
-print(f"  Majority-Majority: {dnn_matrix_npy}\n")
 
 # Separate minority (cases) and majority (controls)
 cases = train_pd[train_pd[target_col] == 1].copy()
@@ -176,11 +163,11 @@ print(f"  Ratio: {n_controls/n_cases:.2f}:1\n")
 
 # Generate pool sizes M to test
 # Range from n_cases to n_controls//2 in reasonably separated steps
-M_min = 44790 #n_cases
+M_min = n_cases
 M_max = n_controls // 2
 
 # Create steps: use approximately 10-15 steps, with larger steps for larger ranges
-num_steps = 6
+num_steps = 12
 if M_max - M_min < num_steps:
     # If range is small, test every value
     M_values = list(range(M_min, M_max + 1))
@@ -258,9 +245,6 @@ for m_idx, M in enumerate(M_values, 1):
         all_match_costs = matching_result["match_costs"]
         
         print(f"\n  ✓ Matching complete!")
-        print(f"    Cases matched: {n_cases:,}")
-        print(f"    Total selected controls: {len(selected_control_enrolids):,}")
-        print(f"    Unique selected controls: {len(set(selected_control_enrolids)):,}")
         print(f"    Mean matching cost: {all_match_costs.mean():.4f}")
         print(f"    Matching time: {matching_time:.2f}s")
         
@@ -278,6 +262,12 @@ for m_idx, M in enumerate(M_values, 1):
         print(f"     Total samples: {len(undersampled_training_data):,}")
         print(f"     Class distribution:")
         print(undersampled_training_data[target_col].value_counts().sort_index())
+        
+        # Save undersampled dataset
+        config_name = f"cw_{CASE_WEIGHTING}_pool_False_seed_{SEED_METHOD}"
+        undersample_path = os.path.join(RESULTS_DIR, f"M{M}_{config_name}.csv")
+        undersampled_training_data.to_csv(undersample_path, index=False)
+        print(f"     ✓ Saved undersampled dataset: {undersample_path}")
         
         # ====================================================================
         # STEP 2: TRAIN AND EVALUATE OCT
@@ -308,7 +298,7 @@ for m_idx, M in enumerate(M_values, 1):
         evaluation_start_time = time.perf_counter()
         
         # Create results directory
-        results_dir = f"msk_balanced_pool_size_M{M}"
+        results_dir = f"sensitivity_pool_size_all_cost_features/pool_size_M{M}"
         os.makedirs(results_dir, exist_ok=True)
         
         metrics = evaluate_binary_oct(
@@ -324,8 +314,6 @@ for m_idx, M in enumerate(M_values, 1):
         
         print(f"\n  ✓ Model training and evaluation complete:")
         print(f"     Best params: depth={balanced_params[0]}, minbucket={balanced_params[1]}, cp={balanced_params[2]}")
-        print(f"     Training time: {training_time:.2f}s")
-        print(f"     Evaluation time: {evaluation_time:.2f}s")
         print(f"     Total iteration time: {total_time:.2f}s")
         
         if isinstance(metrics, dict):
@@ -356,12 +344,6 @@ for m_idx, M in enumerate(M_values, 1):
         
         all_results.append(result_row)
         
-        # Save undersampled dataset
-        config_name = f"cw_{CASE_WEIGHTING}_pool_False_seed_{SEED_METHOD}"
-        undersample_path = os.path.join(RESULTS_DIR, f"M{M}_{config_name}.csv")
-        undersampled_training_data.to_csv(undersample_path, index=False)
-        print(f"     ✓ Saved undersampled dataset: {undersample_path}")
-        
     except Exception as e:
         print(f"\n  ✗ ERROR in iteration:")
         print(f"    {e}")
@@ -386,12 +368,6 @@ print("PHASE 2: Testing adaptive pool (adaptive_pool=True)")
 print(f"{'='*80}\n")
 
 print(f"Running adaptive pool to find stopping size M...")
-print(f"  Configuration:")
-print(f"    Matching ratio: 1:{MATCHING_RATIO}")
-print(f"    Case weighting: {CASE_WEIGHTING}")
-print(f"    Adaptive pool: True")
-print(f"    Seed method: {SEED_METHOD}")
-print(f"    Initial candidate pool size (M): {M_max:,} (will stop early if criteria met)")
 
 iteration_start_time = time.perf_counter()
 matching_start_time = time.perf_counter()
@@ -426,10 +402,6 @@ try:
     all_match_costs = matching_result["match_costs"]
     
     print(f"\n  ✓ Adaptive pool matching complete!")
-    print(f"    Cases matched: {n_cases:,}")
-    print(f"    Actual pool size (M): {actual_M:,} (stopped at {actual_M/n_controls*100:.1f}% of controls)")
-    print(f"    Total selected controls: {len(selected_control_enrolids):,}")
-    print(f"    Unique selected controls: {len(set(selected_control_enrolids)):,}")
     print(f"    Mean matching cost: {all_match_costs.mean():.4f}")
     print(f"    Matching time: {matching_time:.2f}s")
     
@@ -465,7 +437,9 @@ try:
         binary_cols=BIN_FLAG_COLUMNS,
         depths=[5, 7],
         minbuckets=[100],
-        cps=[0.0001, 0.001, 0.01]
+        cps=[0.0001, 0.001, 0.01],
+        verbose=False,
+        random_seed=TRAIN_TEST_SEED
     )
     
     training_end_time = time.perf_counter()

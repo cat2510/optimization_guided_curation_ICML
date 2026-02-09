@@ -16,11 +16,15 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 
-# Add current directory to path
-sys.path.insert(0, os.path.dirname(__file__))
+# Paths: script dir (distillation_with_OCT) and repo root (one level up)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
+sys.path.insert(0, _SCRIPT_DIR)   # oct_distillation
+sys.path.insert(0, _REPO_ROOT)    # model_nonIAI_utils, public
 
 from oct_distillation import (
-    OCTTeacher, train_student_distilled, compute_minority_metrics, check_calibration
+    OCTTeacher, train_student_distilled, compute_minority_metrics, check_calibration,
+    extract_oct_rule_features,
 )
 from model_nonIAI_utils import (
     get_preprocessor_with_impute, train_test_split_enrol,
@@ -33,6 +37,18 @@ try:
 except ImportError:
     def get_cat_columns(df):
         return df.select_dtypes(include=["object", "category", "string"]).columns.tolist()
+
+
+def _resolve_path(path: str, must_exist: bool = False) -> str:
+    """If path is relative and not found in cwd, try repo root (one level up from script)."""
+    if not path or os.path.isabs(path):
+        return path
+    if os.path.exists(path):
+        return path
+    root_path = os.path.join(_REPO_ROOT, path)
+    if os.path.exists(root_path):
+        return root_path
+    return path if not must_exist else root_path
 
 
 def load_data(data_path: str) -> pd.DataFrame:
@@ -53,7 +69,8 @@ def prepare_features(df: pd.DataFrame, target_col: str, exclude_cols: list = Non
     """Prepare feature column lists."""
     if exclude_cols is None:
         exclude_cols = []
-    
+    cutoff_columns = [col for col in df.columns if col.startswith('highcost_gt_')]
+    exclude_cols = exclude_cols + cutoff_columns
     BIN_FLAG_COLUMNS = get_bin_flag_columns(df)
     CAT_COLUMNS = get_cat_columns(df)
     TRUE_NUM_COLUMNS = get_true_num_columns(df, CAT_COLUMNS, BIN_FLAG_COLUMNS)
@@ -80,7 +97,7 @@ def main():
                        help='Path to dataset (parquet or CSV)')
     parser.add_argument('--target_col', type=str, default='highcost_gt_200000',
                        help='Target column name')
-    parser.add_argument('--exclude_cols', type=str, nargs='+', default=None,
+    parser.add_argument('--exclude_cols', type=str, nargs='+', default=['annual_cost_2017', 'annual_cost_2018_deflated', "ENROLID", "cost_stratum_2018"],
                        help='Columns to exclude from features')
     
     # Teacher (OCT) arguments
@@ -93,12 +110,17 @@ def main():
                        help='Path to OCT splits CSV')
     
     # Distillation arguments
-    parser.add_argument('--distill', action='store_true',
-                       help='Enable distillation')
-    parser.add_argument('--alpha', type=float, default=0.3,
-                       help='Distillation strength (0=no distillation, 1=only teacher)')
-    parser.add_argument('--temperature', type=float, default=1.0,
-                       help='Temperature scaling (not used in current implementation)')
+    parser.add_argument('--distill', action='store_true', default=True,
+                       help='Enable rule-based distillation')
+    parser.add_argument('--compare', action='store_true', default=True,
+                       help='Run both baseline (no distill) and distilled; save comparison table')
+    parser.add_argument('--use_rule_features', action='store_true', default=True,
+                       help='Add OCT rule features (leaf assignment, rule indicators) to XGBoost')
+    parser.add_argument('--use_sample_weights', action='store_true', default=True,
+                       help='Use rule-based sample weighting')
+    parser.add_argument('--weight_strategy', type=str, default='confidence',
+                       choices=['confidence', 'agreement', 'minority_boost'],
+                       help='Sample weighting strategy: confidence (rule confidence), agreement (OCT-label agreement), minority_boost (boost minority in confident leaves)')
     
     # Training arguments
     parser.add_argument('--n_estimators', type=int, default=500,
@@ -126,6 +148,12 @@ def main():
                        help='Print progress')
     
     args = parser.parse_args()
+
+    # Resolve paths relative to repo root when running from distillation_with_OCT
+    args.data = _resolve_path(args.data)
+    args.teacher_splits = _resolve_path(args.teacher_splits)
+    if args.teacher_model:
+        args.teacher_model = _resolve_path(args.teacher_model)
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -220,16 +248,13 @@ def main():
     print(f"Processed features: {len(feature_names)}")
     
     # ========================================================================
-    # LOAD TEACHER (OCT)
+    # LOAD TEACHER (OCT) — when using distillation or compare
     # ========================================================================
-    teacher_proba_train = None
-    teacher_proba_val = None
-    
-    if args.distill:
+    teacher = None
+    if args.distill or args.compare:
         print(f"\n{'='*80}")
         print("LOADING OCT TEACHER")
         print(f"{'='*80}\n")
-        
         teacher = OCTTeacher(
             model_path=args.teacher_model,
             splits_csv=args.teacher_splits,
@@ -238,31 +263,60 @@ def main():
             preprocessor=preprocessor,
             feature_names=feature_names
         )
-        
-        teacher_proba_train = teacher.predict_proba(X_train)
-        teacher_proba_val = teacher.predict_proba(X_val)
-        
-        print(f"✓ Teacher probabilities computed")
-        print(f"  Train: mean P(class=1) = {teacher_proba_train[:, 1].mean():.4f}")
-        print(f"  Val: mean P(class=1) = {teacher_proba_val[:, 1].mean():.4f}")
-    
-    # ========================================================================
-    # TRAIN STUDENT
-    # ========================================================================
-    print(f"\n{'='*80}")
-    print("TRAINING STUDENT MODEL")
-    print(f"{'='*80}\n")
-    
-    if args.distill:
-        student_model, val_metrics = train_student_distilled(
-            X_train=X_train,
-            y_train=y_train,
-            X_val=X_val,
-            y_val=y_val,
-            teacher_proba=teacher_proba_train,
-            preprocessor=preprocessor,
-            alpha=args.alpha,
-            temperature=args.temperature,
+        print(f"✓ OCT teacher loaded")
+        if teacher.splits_df is not None:
+            print(f"  Tree splits: {len(teacher.splits_df)} nodes")
+        if teacher.leaf_probs:
+            print(f"  Leaf probabilities computed for {len(teacher.leaf_probs)} leaves")
+
+    def _run_baseline():
+        """Train XGBoost without distillation; return model, val_metrics, test_metrics, calibration.
+        Uses the same hyperparameters as the distilled path for a fair comparison.
+        """
+        import xgboost as xgb
+        X_train_p = preprocessor.transform(X_train)
+        X_val_p = preprocessor.transform(X_val)
+        X_test_p = preprocessor.transform(X_test)
+        n_pos = np.sum(y_train == 1)
+        n_neg = np.sum(y_train == 0)
+        scale_pos_weight = args.scale_pos_weight or (n_neg / n_pos if n_pos > 0 else 1.0)
+        # Match distilled path: same objective, regularization, and tree_method for fair comparison
+        model = xgb.XGBClassifier(
+            n_estimators=args.n_estimators,
+            max_depth=args.max_depth,
+            learning_rate=args.learning_rate,
+            scale_pos_weight=scale_pos_weight,
+            random_state=args.random_state,
+            eval_metric='logloss',
+            subsample=0.8,
+            colsample_bytree=0.8,
+            min_child_weight=1,
+            gamma=0.1,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            tree_method='hist',
+            early_stopping_rounds=args.early_stop_rounds,
+        )
+        model.fit(
+            X_train_p, y_train,
+            eval_set=[(X_val_p, y_val)],
+            verbose=args.verbose
+        )
+        y_val_p = model.predict_proba(X_val_p)[:, 1]
+        y_test_p = model.predict_proba(X_test_p)[:, 1]
+        val_m = compute_minority_metrics(y_val, y_val_p, verbose=False)
+        test_m = compute_minority_metrics(y_test, y_test_p, verbose=False)
+        cal = check_calibration(y_test, y_test_p)
+        return model, val_m, test_m, cal, feature_names
+
+    def _run_distilled():
+        """Train XGBoost with distillation; return model, val_metrics, test_metrics, calibration, feature_names (enriched)."""
+        model, val_m = train_student_distilled(
+            X_train=X_train, y_train=y_train, X_val=X_val, y_val=y_val,
+            teacher=teacher, preprocessor=preprocessor,
+            use_rule_features=args.use_rule_features,
+            use_sample_weights=args.use_sample_weights,
+            weight_strategy=args.weight_strategy,
             scale_pos_weight=args.scale_pos_weight,
             early_stop_metric=args.early_stop_metric,
             early_stop_rounds=args.early_stop_rounds,
@@ -272,78 +326,182 @@ def main():
             random_state=args.random_state,
             verbose=args.verbose
         )
-    else:
-        # Standard XGBoost training (no distillation)
-        import xgboost as xgb
-        
-        X_train_processed = preprocessor.transform(X_train)
-        X_val_processed = preprocessor.transform(X_val)
-        
-        n_pos = np.sum(y_train == 1)
-        n_neg = np.sum(y_train == 0)
-        scale_pos_weight = args.scale_pos_weight or (n_neg / n_pos if n_pos > 0 else 1.0)
-        
-        student_model = xgb.XGBClassifier(
+        X_test_p = preprocessor.transform(X_test)
+        if args.use_rule_features:
+            rule_test, _ = extract_oct_rule_features(
+                teacher, X_test, include_leaf_assignment=True,
+                include_rule_indicators=True, include_rule_confidence=True
+            )
+            X_test_p = np.hstack([X_test_p, rule_test.values])
+        y_test_p = model.predict_proba(X_test_p)[:, 1]
+        test_m = compute_minority_metrics(y_test, y_test_p, verbose=False)
+        cal = check_calibration(y_test, y_test_p)
+        # Enriched feature names (base + rule features from train_student_distilled internals)
+        rule_train, _ = extract_oct_rule_features(teacher, X_train, True, True, True)
+        enriched_names = feature_names + list(rule_train.columns)
+        return model, val_m, test_m, cal, enriched_names
+
+    if args.compare:
+        # ========== COMPARE: run baseline then distilled ==========
+        print(f"\n{'='*80}")
+        print("RUN 1/2: BASELINE (no distillation)")
+        print(f"{'='*80}\n")
+        baseline_model, baseline_val, baseline_test, baseline_cal, _ = _run_baseline()
+        print(f"Baseline test PR-AUC: {baseline_test['pr_auc']:.4f}")
+
+        print(f"\n{'='*80}")
+        print("RUN 2/2: WITH DISTILLATION")
+        print(f"{'='*80}\n")
+        distilled_model, distilled_val, distilled_test, distilled_cal, enriched_feature_names = _run_distilled()
+        print(f"Distilled test PR-AUC: {distilled_test['pr_auc']:.4f}")
+
+        # Build comparison table (same metrics as summary.csv)
+        rows = [
+            {'metric': 'auc', 'baseline_val': baseline_val['auc'], 'baseline_test': baseline_test['auc'],
+             'distilled_val': distilled_val['auc'], 'distilled_test': distilled_test['auc'],
+             'delta_val': distilled_val['auc'] - baseline_val['auc'], 'delta_test': distilled_test['auc'] - baseline_test['auc']},
+            {'metric': 'pr_auc', 'baseline_val': baseline_val['pr_auc'], 'baseline_test': baseline_test['pr_auc'],
+             'distilled_val': distilled_val['pr_auc'], 'distilled_test': distilled_test['pr_auc'],
+             'delta_val': distilled_val['pr_auc'] - baseline_val['pr_auc'], 'delta_test': distilled_test['pr_auc'] - baseline_test['pr_auc']},
+            {'metric': 'recall_mcc', 'baseline_val': baseline_val['mcc_optimal']['recall'], 'baseline_test': baseline_test['mcc_optimal']['recall'],
+             'distilled_val': distilled_val['mcc_optimal']['recall'], 'distilled_test': distilled_test['mcc_optimal']['recall'],
+             'delta_val': distilled_val['mcc_optimal']['recall'] - baseline_val['mcc_optimal']['recall'],
+             'delta_test': distilled_test['mcc_optimal']['recall'] - baseline_test['mcc_optimal']['recall']},
+            {'metric': 'precision_mcc', 'baseline_val': baseline_val['mcc_optimal']['precision'], 'baseline_test': baseline_test['mcc_optimal']['precision'],
+             'distilled_val': distilled_val['mcc_optimal']['precision'], 'distilled_test': distilled_test['mcc_optimal']['precision'],
+             'delta_val': distilled_val['mcc_optimal']['precision'] - baseline_val['mcc_optimal']['precision'],
+             'delta_test': distilled_test['mcc_optimal']['precision'] - baseline_test['mcc_optimal']['precision']},
+            {'metric': 'mcc', 'baseline_val': baseline_val['mcc_optimal']['mcc'], 'baseline_test': baseline_test['mcc_optimal']['mcc'],
+             'distilled_val': distilled_val['mcc_optimal']['mcc'], 'distilled_test': distilled_test['mcc_optimal']['mcc'],
+             'delta_val': distilled_val['mcc_optimal']['mcc'] - baseline_val['mcc_optimal']['mcc'],
+             'delta_test': distilled_test['mcc_optimal']['mcc'] - baseline_test['mcc_optimal']['mcc']},
+            {'metric': 'recall_gmean', 'baseline_val': baseline_val['gmean_optimal']['recall'], 'baseline_test': baseline_test['gmean_optimal']['recall'],
+             'distilled_val': distilled_val['gmean_optimal']['recall'], 'distilled_test': distilled_test['gmean_optimal']['recall'],
+             'delta_val': distilled_val['gmean_optimal']['recall'] - baseline_val['gmean_optimal']['recall'],
+             'delta_test': distilled_test['gmean_optimal']['recall'] - baseline_test['gmean_optimal']['recall']},
+            {'metric': 'gmean', 'baseline_val': baseline_val['gmean_optimal']['gmean'], 'baseline_test': baseline_test['gmean_optimal']['gmean'],
+             'distilled_val': distilled_val['gmean_optimal']['gmean'], 'distilled_test': distilled_test['gmean_optimal']['gmean'],
+             'delta_val': distilled_val['gmean_optimal']['gmean'] - baseline_val['gmean_optimal']['gmean'],
+             'delta_test': distilled_test['gmean_optimal']['gmean'] - baseline_test['gmean_optimal']['gmean']},
+        ]
+        comparison_df = pd.DataFrame(rows)
+        os.makedirs(f"{args.output_dir}/metrics", exist_ok=True)
+        comparison_path = f"{args.output_dir}/metrics/comparison_baseline_vs_distilled.csv"
+        comparison_df.to_csv(comparison_path, index=False)
+        print(f"\n✓ Saved comparison to {comparison_path}")
+
+        print(f"\n{'='*80}")
+        print("COMPARISON: Baseline vs Distilled (test set)")
+        print(f"{'='*80}\n")
+        print(comparison_df.to_string(index=False))
+        print()
+
+        if args.save_model:
+            for name, model, fnames in [
+                ('student_baseline.pkl', baseline_model, feature_names),
+                ('student_distilled.pkl', distilled_model, enriched_feature_names),
+            ]:
+                path = f"{args.output_dir}/models/{name}"
+                with open(path, 'wb') as f:
+                    pickle.dump({
+                        'model': model, 'preprocessor': preprocessor, 'feature_names': fnames,
+                        'feature_cols': feature_cols, 'CAT_COLUMNS': CAT_COLUMNS,
+                        'TRUE_NUM_COLUMNS': TRUE_NUM_COLUMNS, 'BIN_FLAG_COLUMNS': BIN_FLAG_COLUMNS,
+                        'distill': (name == 'student_distilled.pkl'),
+                    }, f)
+                print(f"✓ Saved {path}")
+
+        for label, val_m, test_m, cal in [
+            ('baseline', baseline_val, baseline_test, baseline_cal),
+            ('distilled', distilled_val, distilled_test, distilled_cal),
+        ]:
+            path = f"{args.output_dir}/metrics/metrics_{label}.json"
+            with open(path, 'w') as f:
+                json.dump({'val_metrics': val_m, 'test_metrics': test_m, 'calibration': cal}, f, indent=2)
+            print(f"✓ Saved {path}")
+
+        print(f"\n{'='*80}")
+        print("COMPLETE (compare mode)")
+        print(f"{'='*80}")
+        print(f"Results in {args.output_dir}/")
+        print(f"  comparison_baseline_vs_distilled.csv — side-by-side metrics")
+        print(f"  metrics_baseline.json / metrics_distilled.json")
+        print(f"  student_baseline.pkl / student_distilled.pkl")
+        return
+
+    # ========================================================================
+    # SINGLE RUN: TRAIN STUDENT
+    # ========================================================================
+    print(f"\n{'='*80}")
+    print("TRAINING STUDENT MODEL")
+    print(f"{'='*80}\n")
+
+    if args.distill:
+        student_model, val_metrics = train_student_distilled(
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
+            teacher=teacher,
+            preprocessor=preprocessor,
+            use_rule_features=args.use_rule_features,
+            use_sample_weights=args.use_sample_weights,
+            weight_strategy=args.weight_strategy,
+            scale_pos_weight=args.scale_pos_weight,
+            early_stop_metric=args.early_stop_metric,
+            early_stop_rounds=args.early_stop_rounds,
             n_estimators=args.n_estimators,
             max_depth=args.max_depth,
             learning_rate=args.learning_rate,
-            scale_pos_weight=scale_pos_weight,
             random_state=args.random_state,
-            eval_metric='logloss'
-        )
-        
-        student_model.fit(
-            X_train_processed, y_train,
-            eval_set=[(X_val_processed, y_val)],
-            early_stopping_rounds=args.early_stop_rounds,
             verbose=args.verbose
         )
-        
-        y_val_pred_proba = student_model.predict_proba(X_val_processed)[:, 1]
-        val_metrics = compute_minority_metrics(y_val, y_val_pred_proba, verbose=args.verbose)
-    
+        X_test_processed = preprocessor.transform(X_test)
+        if teacher is not None and args.use_rule_features:
+            rule_features_test, _ = extract_oct_rule_features(
+                teacher, X_test, include_leaf_assignment=True,
+                include_rule_indicators=True, include_rule_confidence=True
+            )
+            X_test_processed = np.hstack([X_test_processed, rule_features_test.values])
+        y_test_pred_proba = student_model.predict_proba(X_test_processed)[:, 1]
+        test_metrics = compute_minority_metrics(y_test, y_test_pred_proba, verbose=args.verbose)
+        calibration_info = check_calibration(y_test, y_test_pred_proba)
+        print(f"\nCalibration (ECE): {calibration_info['ece']:.4f}")
+    else:
+        student_model, val_metrics, test_metrics, calibration_info, _ = _run_baseline()
+        print(f"\nCalibration (ECE): {calibration_info['ece']:.4f}")
+
     # ========================================================================
-    # EVALUATE ON TEST SET
-    # ========================================================================
-    print(f"\n{'='*80}")
-    print("TEST SET EVALUATION")
-    print(f"{'='*80}\n")
-    
-    X_test_processed = preprocessor.transform(X_test)
-    y_test_pred_proba = student_model.predict_proba(X_test_processed)[:, 1]
-    test_metrics = compute_minority_metrics(y_test, y_test_pred_proba, verbose=args.verbose)
-    
-    # Calibration check
-    calibration_info = check_calibration(y_test, y_test_pred_proba)
-    print(f"\nCalibration (ECE): {calibration_info['ece']:.4f}")
-    
-    # ========================================================================
-    # SAVE RESULTS
+    # SAVE RESULTS (single run)
     # ========================================================================
     print(f"\n{'='*80}")
     print("SAVING RESULTS")
     print(f"{'='*80}\n")
-    
-    # Save model
+
     if args.save_model:
         model_path = f"{args.output_dir}/models/student_model.pkl"
+        fnames = feature_names
+        if args.distill and args.use_rule_features:
+            rule_train, _ = extract_oct_rule_features(teacher, X_train, True, True, True)
+            fnames = feature_names + list(rule_train.columns)
         with open(model_path, 'wb') as f:
             pickle.dump({
                 'model': student_model,
                 'preprocessor': preprocessor,
-                'feature_names': feature_names,
+                'feature_names': fnames,
                 'feature_cols': feature_cols,
                 'CAT_COLUMNS': CAT_COLUMNS,
                 'TRUE_NUM_COLUMNS': TRUE_NUM_COLUMNS,
-                'BIN_FLAG_COLUMNS': BIN_FLAG_COLUMNS
+                'BIN_FLAG_COLUMNS': BIN_FLAG_COLUMNS,
             }, f)
         print(f"✓ Saved model to {model_path}")
-    
-    # Save metrics
+
     metrics_dict = {
         'config': {
             'distill': args.distill,
-            'alpha': args.alpha if args.distill else None,
+            'use_rule_features': args.use_rule_features if args.distill else None,
+            'use_sample_weights': args.use_sample_weights if args.distill else None,
+            'weight_strategy': args.weight_strategy if args.distill else None,
             'early_stop_metric': args.early_stop_metric,
             'n_estimators': args.n_estimators,
             'max_depth': args.max_depth,
@@ -355,13 +513,12 @@ def main():
         'test_metrics': test_metrics,
         'calibration': calibration_info
     }
-    
     metrics_path = f"{args.output_dir}/metrics/metrics.json"
+    os.makedirs(f"{args.output_dir}/metrics", exist_ok=True)
     with open(metrics_path, 'w') as f:
         json.dump(metrics_dict, f, indent=2)
     print(f"✓ Saved metrics to {metrics_path}")
-    
-    # Save CSV summary
+
     summary_df = pd.DataFrame({
         'split': ['val', 'test'],
         'auc': [val_metrics['auc'], test_metrics['auc']],
@@ -375,17 +532,20 @@ def main():
     summary_path = f"{args.output_dir}/metrics/summary.csv"
     summary_df.to_csv(summary_path, index=False)
     print(f"✓ Saved summary to {summary_path}")
-    
-    # Feature importance
+
     if hasattr(student_model, 'feature_importances_'):
+        fnames = feature_names
+        if args.distill and args.use_rule_features:
+            rule_train, _ = extract_oct_rule_features(teacher, X_train, True, True, True)
+            fnames = feature_names + list(rule_train.columns)
         importance_df = pd.DataFrame({
-            'feature': feature_names,
+            'feature': fnames,
             'importance': student_model.feature_importances_
         }).sort_values('importance', ascending=False)
         importance_path = f"{args.output_dir}/metrics/feature_importance.csv"
         importance_df.to_csv(importance_path, index=False)
         print(f"✓ Saved feature importance to {importance_path}")
-    
+
     print(f"\n{'='*80}")
     print("TRAINING COMPLETE")
     print(f"{'='*80}")

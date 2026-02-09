@@ -30,7 +30,8 @@ TRAIN_TEST_SEED = 123
 target_col = "top_2_pct_cost_2018"
 
 # Results directory
-RESULTS_DIR = "./two_stage_kcenter_results_msk_static_pool"
+base_dir = "./sensitivity_pool_size_all_cost_features"
+RESULTS_DIR = os.path.join(base_dir, "results")
 OUTPUT_CSV = os.path.join(RESULTS_DIR, "sensitivity_pool_size.csv")
 
 # ============================================================================
@@ -78,10 +79,9 @@ print(f"\n{'='*80}")
 print("FINDING PREDICTION FILES")
 print(f"{'='*80}\n")
 
-# Find all directories matching pattern
-base_dir = "."
-pattern = "msk_balanced_pool_size_M*"
-matching_dirs = [d for d in os.listdir(base_dir) if os.path.isdir(d) and d.startswith("msk_balanced_pool_size_M")]
+# Find all directories matching pattern (under base_dir)
+pattern = "pool_size_M*"
+matching_dirs = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d)) and d.startswith("pool_size_M")]
 
 print(f"Found {len(matching_dirs)} directories matching pattern")
 
@@ -98,8 +98,8 @@ for dir_name in sorted(matching_dirs):
     M = int(match.group(1))
     print(f"\n  Processing {dir_name} (M={M:,})")
     
-    # Find prediction file
-    pred_dir = os.path.join(dir_name, "predictions")
+    # Find prediction file (under base_dir)
+    pred_dir = os.path.join(base_dir, dir_name, "predictions")
     if not os.path.exists(pred_dir):
         print(f"    ⚠️  No predictions directory found, skipping")
         continue
@@ -235,8 +235,8 @@ for dir_name in sorted(matching_dirs):
         traceback.print_exc()
         continue
     
-    # Load split file
-    split_files = glob.glob(os.path.join(dir_name, "oct_tree_*_splits.csv"))
+    # Load split file (under base_dir)
+    split_files = glob.glob(os.path.join(base_dir, dir_name, "oct_tree_*_splits.csv"))
     if len(split_files) > 0:
         split_file = split_files[0]
         try:
@@ -376,8 +376,8 @@ if len(all_splits_data) > 0:
         n_splits = len(splits_M)
         
         # Try to get actual leaf count from prediction file
-        dir_name = f"msk_balanced_pool_size_M{M}"
-        pred_dir = os.path.join(dir_name, "predictions")
+        dir_name = f"pool_size_M{M}"
+        pred_dir = os.path.join(base_dir, dir_name, "predictions")
         pred_files = glob.glob(os.path.join(pred_dir, "oct_predictions_*.csv"))
         
         n_leaves_from_splits = n_splits + 1  # Binary tree property
