@@ -1,6 +1,9 @@
 """
-Precompute pairwise Euclidean distances between majority and minority classes
-Optimized for memory efficiency and fast access
+Precompute pairwise distances between majority and minority classes.
+Optimized for memory efficiency and fast access.
+
+Distance metrics: 'euclidean' (L2, default), 'manhattan' (L1), 'chebyshev' (L_infinity).
+Pass metric= to compute_distances_batched() and precompute_leaf_dnn_memmap().
 
 Usage:
     python precompute_distances.py
@@ -94,7 +97,7 @@ def get_preprocessor(X, cat_cols, num_cols, binary_cols=None, verbose=False):
         return preprocessor
 
 
-def compute_distances_batched(X_majority, X_minority, batch_size=1000, dtype=np.float32):
+def compute_distances_batched(X_majority, X_minority, batch_size=1000, dtype=np.float32, metric='euclidean'):
     """
     Compute pairwise distances in batches to manage memory
     
@@ -104,6 +107,8 @@ def compute_distances_batched(X_majority, X_minority, batch_size=1000, dtype=np.
     X_minority : array (n_minority, n_features)
     batch_size : int, number of majority samples per batch
     dtype : data type for distances (float32 recommended)
+    metric : str, distance metric. One of 'euclidean' (L2), 'manhattan' (L1),
+             'chebyshev' (L_infinity). Default 'euclidean'.
     
     Returns:
     --------
@@ -115,7 +120,7 @@ def compute_distances_batched(X_majority, X_minority, batch_size=1000, dtype=np.
     # Pre-allocate output array
     distances = np.zeros((n_majority, n_minority), dtype=dtype)
     
-    print(f"Computing {n_majority:,} x {n_minority:,} = {n_majority * n_minority:,} distances")
+    print(f"Computing {n_majority:,} x {n_minority:,} = {n_majority * n_minority:,} distances (metric={metric})")
     print(f"Output size: {distances.nbytes / 1e6:.1f} MB ({dtype})")
     
     # Process in batches
@@ -128,7 +133,7 @@ def compute_distances_batched(X_majority, X_minority, batch_size=1000, dtype=np.
         batch_distances = pairwise_distances(
             X_majority[start_idx:end_idx], 
             X_minority,
-            metric='euclidean'
+            metric=metric
         )
         
         distances[start_idx:end_idx] = batch_distances.astype(dtype)
@@ -258,14 +263,19 @@ def precompute_leaf_dnn_memmap(X_majority_leaf: np.ndarray,
                                out_dir: str,
                                leaf_id: str,
                                batch_size: int = 750,
-                               dtype=np.float32):
+                               dtype=np.float32,
+                               metric: str = 'euclidean'):
+    """
+    metric : str
+        Distance metric: 'euclidean' (L2), 'manhattan' (L1), or 'chebyshev' (L_infinity).
+    """
     os.makedirs(out_dir, exist_ok=True)
     n = X_majority_leaf.shape[0]
 
     dnn_matrix_path = os.path.join(out_dir, f"leaf_{leaf_id}_dnn_matrix.npy")
     dnn_enrolids_path = os.path.join(out_dir, f"leaf_{leaf_id}_dnn_enrolids.npy")
 
-    print(f"[leaf {leaf_id}] computing d_nn for n={n:,} -> ~{n*n*4/1e9:.2f} GB float32")
+    print(f"[leaf {leaf_id}] computing d_nn for n={n:,} -> ~{n*n*4/1e9:.2f} GB float32 (metric={metric})")
 
     # Create a writable .npy memmap (so we can fill row blocks)
     dnn_mm = np.lib.format.open_memmap(dnn_matrix_path, mode="w+", dtype=dtype, shape=(n, n))
@@ -274,7 +284,7 @@ def precompute_leaf_dnn_memmap(X_majority_leaf: np.ndarray,
     for b in tqdm(range(n_batches), desc=f"leaf {leaf_id} d_nn"):
         s = b * batch_size
         e = min((b + 1) * batch_size, n)
-        dblock = pairwise_distances(X_majority_leaf[s:e], X_majority_leaf, metric="euclidean")
+        dblock = pairwise_distances(X_majority_leaf[s:e], X_majority_leaf, metric=metric)
         dnn_mm[s:e, :] = dblock.astype(dtype, copy=False)
 
     # Flush to disk
