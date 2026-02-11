@@ -30,9 +30,9 @@ TRAIN_TEST_SEED = 123
 target_col = "top_2_pct_cost_2018"
 
 # Results directory
-base_dir = "./sensitivity_pool_size_all_cost_features_150_minbucket"
+base_dir = "./sensitivity_quota_cfg_pool_size_all_cost_features_150_minbucket"
 RESULTS_DIR = os.path.join(base_dir, "results")
-OUTPUT_CSV = os.path.join(RESULTS_DIR, "sensitivity_pool_size_extended.csv")
+OUTPUT_CSV = os.path.join(RESULTS_DIR, "sensitivity_pool_size.csv")
 
 # ============================================================================
 # LOAD TEST SET LABELS

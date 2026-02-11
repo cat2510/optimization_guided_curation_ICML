@@ -39,7 +39,7 @@ df_msk_spark = spark.read.format("parquet").load("msk_2017_18_full.parquet")
 df_og = df_msk_spark.toPandas()
 
 TRAIN_TEST_SEED = 123
-BASE_DIR = "./sensitivity_pool_size_all_cost_features_150_minbucket"
+BASE_DIR = "./sensitivity_quota_cfg_pool_size_all_cost_features_150_minbucket"
 RESULTS_DIR = os.path.join(BASE_DIR, "results") #undersampled dataset directory
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -49,6 +49,11 @@ CASE_WEIGHTING = None  # Options: None, "boundary"
 USE_ADAPTIVE_POOL = False  # Options: True, False
 SEED_METHOD = "smart"  # Options: "smart", "centroid", "density", "random"
 
+# Bin-quota constraints for representativeness (optional)
+# Set to None to disable, or a dict to enable:
+#   e.g. dict(enabled=True, T=5, mode="pool_mass", K_per_bin=25)
+QUOTA_CFG = {"enabled": True, "T": 5, "mode": "pool_mass", "K_per_bin": 25}
+FORCE_NEAREST_PER_CASE = False #last step in two_stage_kcenter_match.py
 # MSK-specific feature column definitions
 # Binary flag columns: comorbidity flags, MSK category flags, medication flags
 BIN_FLAG_COLUMNS = get_bin_flag_columns(df_og)
@@ -139,7 +144,7 @@ print(f"Train: {train_pd.shape}, Val: {val_pd.shape}, Test: {test_pd.shape}")
 # Use a single precomputed distance directory
 DISTANCES_DIR = "./precomputed_distances_msk_with_cost_features"  # Change this to your preferred directory
 PN_H5_PATH = os.path.join(DISTANCES_DIR, "distances_majority_minority.h5")
-# Distance metric for precompute_distances: 'euclidean' (L2), 'manhattan' (L1), 'chebyshev' (L_infinity)
+#TODO try different distance metrics for precompute_distances: 'euclidean' (L2), 'manhattan' (L1), 'chebyshev' (L_infinity)
 DISTANCE_METRIC = "manhattan"  # or "chebyshev" for L_infinity; pass to compute_distances_batched / precompute_leaf_dnn_memmap
 DNN_OUT_DIR = os.path.join(DISTANCES_DIR, f"global_dnn_seed_{TRAIN_TEST_SEED}")
 dnn_matrix_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_matrix.npy")
@@ -165,9 +170,9 @@ print(f"  Ratio: {n_controls/n_cases:.2f}:1\n")
 
 # Generate pool sizes M to test
 # Range from n_cases to n_controls//2 in reasonably separated steps
-#M_min = n_cases
-M_min = n_controls // 2
-M_max = n_controls
+M_min = n_cases
+#M_min = n_controls // 2
+M_max = n_controls // 2
 # Create steps: use approximately 10-15 steps, with larger steps for larger ranges
 num_steps = 12
 if M_max - M_min < num_steps:
@@ -200,6 +205,7 @@ print(f"{'='*80}\n")
 for m_idx, M in enumerate(M_values, 1):
     print(f"\n{'#'*80}")
     print(f"ITERATION {m_idx}/{len(M_values)}: M = {M:,} (fixed pool)")
+    print(f"    Quota config: {QUOTA_CFG}")
     print(f"{'#'*80}\n")
     
     iteration_start_time = time.perf_counter()
@@ -230,13 +236,14 @@ for m_idx, M in enumerate(M_values, 1):
             use_adaptive_pool=False,  # Fixed pool size
             tau=None,  # Not used when adaptive_pool=False
             plateau_eps=0.01,
-            force_nearest_per_case=True,
+            force_nearest_per_case=FORCE_NEAREST_PER_CASE,
             force_topm=1,
             assignment_topk_start=None,  # Exact matching
             seed_method=SEED_METHOD,
             matching_ratio=MATCHING_RATIO,
             X_majority_leaf=None,  # Not needed when using precomputed distances
             case_weighting=CASE_WEIGHTING,
+            quota_cfg=QUOTA_CFG,
         )
         
         matching_end_time = time.perf_counter()
@@ -394,6 +401,7 @@ try:
         matching_ratio=MATCHING_RATIO,
         X_majority_leaf=None,  # Not needed when using precomputed distances
         case_weighting=CASE_WEIGHTING,
+        quota_cfg=QUOTA_CFG,
     )
     
     matching_end_time = time.perf_counter()
