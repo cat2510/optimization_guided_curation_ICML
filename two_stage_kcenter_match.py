@@ -1,4 +1,5 @@
 # two_stage_kcenter_match.py
+# Includes bin-quota constrained matching for representativeness control.
 import numpy as np
 import h5py
 from typing import Dict, Tuple, List, Optional
@@ -343,6 +344,33 @@ def compute_case_weights_density_inverse(
 
 
 # ----------------------------
+# Bin-Quota Helpers (imported from quota_helpers.py)
+# ----------------------------
+try:
+    from public.quota_helpers import (
+        compute_proximity_scores,
+        deterministic_binning,
+        compute_bin_quotas,
+        select_population_subset_indices,
+        compute_cutpoints_from_population,
+        assign_bins_from_cutpoints,
+        cap_quotas_at_pool_counts,
+        collapse_to_active_bins,
+    )
+except ImportError:
+    from quota_helpers import (
+        compute_proximity_scores,
+        deterministic_binning,
+        compute_bin_quotas,
+        select_population_subset_indices,
+        compute_cutpoints_from_population,
+        assign_bins_from_cutpoints,
+        cap_quotas_at_pool_counts,
+        collapse_to_active_bins,
+    )
+
+
+# ----------------------------
 # Stage B: 1-to-1 min-cost assignment
 # ----------------------------
 
@@ -564,6 +592,185 @@ def solve_min_cost_assignment_adaptive_topk(
         K = min(topk_max, K * topk_growth)
 
 # ----------------------------
+# Stage B: Quota-constrained min-cost flow
+# ----------------------------
+
+def solve_min_cost_assignment_with_quotas(
+    cost_matrix: np.ndarray,
+    bin_assignments: np.ndarray,
+    quotas: List[int],
+    K_per_bin: int = 25,
+    K_growth: int = 2,
+    max_K_per_bin: Optional[int] = None,
+    cost_scale: int = 10000,
+    case_weights: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    """
+    1:1 min-cost assignment with bin-quota constraints.
+
+    Network topology:
+        source -> case_i          (cap=1, cost=0)
+        case_i -> ctrl_j          (cap=1, cost=d[i,j])  [per-bin sparsified]
+        ctrl_j -> bin_node[bin(j)] (cap=1, cost=0)
+        bin_node[t] -> sink       (cap=quotas[t], cost=0)
+
+    Parameters
+    ----------
+    cost_matrix : (n_cases, n_pool) float
+    bin_assignments : (n_pool,) int  -- bin index per pool control
+    quotas : list[int]  -- required count per bin, sum = n_cases
+    K_per_bin : int  -- initial top-K edges per case per bin
+    K_growth : int  -- multiplicative factor on retry
+    max_K_per_bin : int or None
+    cost_scale : int  -- float-to-int scale for OR-Tools
+    case_weights : (n_cases,) float or None
+
+    Returns
+    -------
+    match_ctrl : (n_cases,) int64
+    match_cost : (n_cases,) float32  (weighted if case_weights given)
+    diagnostics : dict
+    """
+    try:
+        from ortools.graph.python import min_cost_flow
+    except Exception:
+        from ortools.graph import pywrapgraph as min_cost_flow  # type: ignore
+
+    n_cases, n_pool = cost_matrix.shape
+    T = len(quotas)
+
+    if sum(quotas) != n_cases:
+        raise ValueError(f"sum(quotas)={sum(quotas)} != n_cases={n_cases}")
+
+    # Apply case weights (multiply rows)
+    if case_weights is not None:
+        if len(case_weights) != n_cases:
+            raise ValueError(
+                f"case_weights length {len(case_weights)} != n_cases {n_cases}"
+            )
+        cost_matrix = cost_matrix * case_weights[:, np.newaxis]
+
+    # Per-bin member lists (indices sorted for determinism)
+    bin_members: List[List[int]] = [[] for _ in range(T)]
+    for j in range(n_pool):
+        bin_members[int(bin_assignments[j])].append(j)
+
+    for t in range(T):
+        if quotas[t] > len(bin_members[t]):
+            raise ValueError(
+                f"Quota for bin {t} ({quotas[t]}) > bin size "
+                f"({len(bin_members[t])})"
+            )
+
+    max_bin_sz = max((len(bm) for bm in bin_members), default=n_pool)
+    eff_max_K = max_K_per_bin if max_K_per_bin is not None else max_bin_sz
+    K_bins = [min(K_per_bin, len(bm)) for bm in bin_members]
+
+    retries = 0
+    K_schedule = [list(K_bins)]
+
+    while True:
+        source = 0
+        case_off = 1
+        ctrl_off = 1 + n_cases
+        bin_off = 1 + n_cases + n_pool
+        sink = 1 + n_cases + n_pool + T
+
+        mcf = min_cost_flow.SimpleMinCostFlow()
+        mcf.set_node_supply(source, n_cases)
+        mcf.set_node_supply(sink, -n_cases)
+
+        # source -> cases
+        for i in range(n_cases):
+            mcf.add_arc_with_capacity_and_unit_cost(
+                source, case_off + i, 1, 0
+            )
+
+        # cases -> controls  (per-bin top-K sparsification)
+        for i in range(n_cases):
+            row = cost_matrix[i]
+            for t in range(T):
+                if quotas[t] == 0:
+                    continue
+                members = bin_members[t]
+                if not members:
+                    continue
+                K_t = K_bins[t]
+                member_arr = np.array(members, dtype=np.int64)
+                if K_t < len(members):
+                    member_costs = row[member_arr]
+                    top_idx = np.argpartition(member_costs, K_t - 1)[:K_t]
+                    cands = member_arr[top_idx]
+                else:
+                    cands = member_arr
+                for j_val in cands:
+                    j = int(j_val)
+                    c = int(float(row[j]) * cost_scale)
+                    if c < 0:
+                        c = 0
+                    mcf.add_arc_with_capacity_and_unit_cost(
+                        case_off + i, ctrl_off + j, 1, c
+                    )
+
+        # controls -> bin nodes
+        for j in range(n_pool):
+            mcf.add_arc_with_capacity_and_unit_cost(
+                ctrl_off + j, bin_off + int(bin_assignments[j]), 1, 0
+            )
+
+        # bin nodes -> sink
+        for t in range(T):
+            if quotas[t] > 0:
+                mcf.add_arc_with_capacity_and_unit_cost(
+                    bin_off + t, sink, quotas[t], 0
+                )
+
+        status = mcf.solve()
+        if status == min_cost_flow.SimpleMinCostFlow.OPTIMAL:
+            match_ctrl = np.full(n_cases, -1, dtype=np.int64)
+            match_cost = np.full(n_cases, np.nan, dtype=np.float32)
+
+            for a in range(mcf.num_arcs()):
+                tail = mcf.tail(a)
+                head = mcf.head(a)
+                if (mcf.flow(a) == 1
+                        and case_off <= tail < case_off + n_cases
+                        and ctrl_off <= head < ctrl_off + n_pool):
+                    i = tail - case_off
+                    j = head - ctrl_off
+                    match_ctrl[i] = j
+                    match_cost[i] = float(cost_matrix[i, j])
+
+            if np.any(match_ctrl < 0):
+                raise RuntimeError(
+                    "Optimal flow but incomplete quota matching."
+                )
+
+            return match_ctrl, match_cost, {
+                "K_per_bin_final": list(K_bins),
+                "K_per_bin_schedule": K_schedule,
+                "retries": retries,
+            }
+
+        # Infeasible -- grow K_per_bin
+        retries += 1
+        grew = False
+        for t in range(T):
+            new_K = min(len(bin_members[t]), K_bins[t] * K_growth, eff_max_K)
+            if new_K > K_bins[t]:
+                K_bins[t] = new_K
+                grew = True
+        K_schedule.append(list(K_bins))
+
+        if not grew:
+            raise RuntimeError(
+                f"Quota-constrained flow infeasible at max K. "
+                f"quotas={quotas}, "
+                f"bin_sizes={[len(bm) for bm in bin_members]}"
+            )
+
+
+# ----------------------------
 # Full two-stage runner
 # ----------------------------
 def two_stage_kcenter_then_match(
@@ -588,6 +795,7 @@ def two_stage_kcenter_then_match(
     case_weighting: Optional[str] = None,  # NEW: "boundary", "uncertainty", "density_inverse", or None
     case_weights: Optional[np.ndarray] = None,  # NEW: Pre-computed weights (overrides case_weighting)
     predicted_probs: Optional[np.ndarray] = None,  # Required if case_weighting="uncertainty"
+    quota_cfg: Optional[Dict] = None,  # Bin-quota constraints config (see below)
 ) -> Dict[str, object]:
     """
     Two-stage k-center matching: select diverse candidate controls, then optimally assign.
@@ -651,6 +859,20 @@ def two_stage_kcenter_then_match(
         Pre-computed case weights. If provided, overrides case_weighting parameter.
     predicted_probs : np.ndarray, optional, shape (n_cases, n_classes)
         Predicted class probabilities. Required if case_weighting="uncertainty".
+    quota_cfg : dict or None, default=None
+        Bin-quota constraints config.  If None or ``{"enabled": False}``, the
+        original unconstrained matching runs unchanged.  Keys when enabled::
+
+            quota_cfg = {
+                "enabled": True,
+                "T": 5,                          # target number of bins
+                "quantiles": [0,.2,.4,.6,.8,1.], # optional, length T+1
+                "mode": "pool_mass",              # or "tilted"
+                "lambda": 0.0,                    # tilt param (>= 0)
+                "K_per_bin": 25,                  # edges per case per bin
+                "K_growth": 2,                    # multiplicative retry
+                "max_K_per_bin": None,            # None = up to all in bin
+            }
     
     Returns
     -------
@@ -669,6 +891,9 @@ def two_stage_kcenter_then_match(
         - seed_method: str, the seed method used
         - seed_idx: int, the seed index selected
         - seed_enrolid: int, the seed ENROLID selected
+        - quota_diagnostics: dict (only present when quotas enabled)
+            Contains target_quotas, achieved_counts, per_bin_b_stats,
+            matched_cost_quantiles, K_retries, etc.
     """
 
     # ---- Load leaf d^nn ----
@@ -828,34 +1053,290 @@ def two_stage_kcenter_then_match(
                 raise ValueError(f"Unknown case_weighting method: '{case_weighting}'. "
                                f"Must be 'boundary','density_inverse', or None.")
 
-        # Stage B exact matching (topk_start=None => full graph exact)
-        cost = d_pn_leaf[cand_idx_final, :].T  # (n_cases, n_candidates)
-        match_ctrl_local, match_costs = solve_min_cost_assignment_adaptive_topk(
-            cost_matrix=cost,
-            topk_start=assignment_topk_start,  # None => exact
-            matching_ratio=matching_ratio,
-            case_weights=weights_to_use,  # NEW: Apply weights
-        )
+        # ================================================================
+        # Stage B: Min-cost flow matching
+        # ================================================================
+        quota_diagnostics = None
 
-        # Handle return values based on matching_ratio
-        if matching_ratio == 1:
-            # 1:1 matching: match_ctrl_local and match_costs are arrays
-            selected_control_enrolids = candidate_majority_enrolids[match_ctrl_local]
-            case_to_control = {int(ci): int(cj) for ci, cj in zip(leaf_cases_enrolids, selected_control_enrolids)}
+        if quota_cfg is not None and quota_cfg.get("enabled", False):
+            # -- Bin-quota constrained matching (1:1 only) --
+            if matching_ratio != 1:
+                raise ValueError(
+                    "Bin-quota constraints only supported for "
+                    f"matching_ratio=1 (got {matching_ratio})"
+                )
+
+            # ---- Config ----
+            q_quantiles = quota_cfg.get(
+                "quantiles", [0, .2, .4, .6, .8, 1.0]
+            )
+            T = len(q_quantiles) - 1
+            n_target = len(leaf_cases_enrolids)
+            q_mode = quota_cfg.get("mode", "pool_mass")
+            q_lambda = quota_cfg.get("lambda", 0.0)
+            binning = quota_cfg.get("binning", "population")
+
+            # ---- B1: proximity scores on POOL ----
+            d_pn_pool = d_pn_leaf[cand_idx_final, :]   # (M, n_cases)
+            b_J = compute_proximity_scores(d_pn_pool)
+
+            if binning == "population":
+                # ============================================================
+                # POPULATION-BASED binning & quotas
+                # Cutpoints come from a large deterministic population subset;
+                # quotas are proportional to population bin counts (not pool).
+                # ============================================================
+                pop_S = quota_cfg.get("pop_S", 50000)
+                pop_subset_mode = quota_cfg.get(
+                    "pop_subset", "sorted_prefix"
+                )
+
+                # (1) Deterministic population subset
+                pop_idx = select_population_subset_indices(
+                    leaf_controls_enrolids,
+                    S=pop_S,
+                    mode=pop_subset_mode,
+                )
+
+                # (2) Cutpoints from population proximity distribution
+                cutpoints, b_pop = compute_cutpoints_from_population(
+                    d_pn_leaf, pop_idx, q_quantiles,
+                )
+
+                # (3) Bin population and pool using SAME cutpoints
+                pop_bins_raw = assign_bins_from_cutpoints(
+                    b_pop, cutpoints
+                )
+                pop_bin_counts_raw = [
+                    int(np.sum(pop_bins_raw == t)) for t in range(T)
+                ]
+                pool_bins_raw = assign_bins_from_cutpoints(
+                    b_J, cutpoints
+                )
+                pool_bin_counts_raw = [
+                    int(np.sum(pool_bins_raw == t)) for t in range(T)
+                ]
+
+                # (4) Quotas from POPULATION counts (proportional)
+                #     compute_bin_quotas caps at the reference counts,
+                #     but we also need to cap at pool counts afterwards.
+                if q_mode == "tilted":
+                    bin_midpoints = []
+                    for t_raw in range(T):
+                        mask = pop_bins_raw == t_raw
+                        if mask.any():
+                            v = b_pop[mask]
+                            bin_midpoints.append(
+                                float((v.min() + v.max()) / 2.0)
+                            )
+                        else:
+                            bin_midpoints.append(0.0)
+                    quotas_raw = compute_bin_quotas(
+                        pop_bin_counts_raw, n_target,
+                        mode=q_mode, lamda=q_lambda,
+                        bin_midpoints=bin_midpoints,
+                    )
+                else:
+                    quotas_raw = compute_bin_quotas(
+                        pop_bin_counts_raw, n_target,
+                        mode=q_mode,
+                    )
+
+                # Cap quotas at pool capacity per bin
+                quotas_capped = cap_quotas_at_pool_counts(
+                    quotas_raw, pool_bin_counts_raw
+                )
+
+                # (5) Collapse bins with zero pool members
+                (pool_bins, pool_bin_counts, pop_bin_counts,
+                 quotas, active_bins) = collapse_to_active_bins(
+                    pool_bins_raw, pool_bin_counts_raw,
+                    pop_bin_counts_raw, quotas_capped, T,
+                )
+                T_active = len(active_bins)
+                bin_assignments = pool_bins
+
+                print(
+                    f"  Bin-quota matching (population-based): "
+                    f"T_active={T_active}, quotas={quotas}, "
+                    f"pop_per_bin={pop_bin_counts}, "
+                    f"pool_per_bin={pool_bin_counts}"
+                )
+
+            elif binning == "pool":
+                # ============================================================
+                # POOL-BASED binning & quotas  (legacy behavior)
+                # Cutpoints from pool b_J quantiles, quotas from pool counts.
+                # ============================================================
+                q_T = quota_cfg.get("T", 5)
+                bin_assignments, cutpoints, pool_bin_counts, active_bins = \
+                    deterministic_binning(
+                        b_J, T=q_T, quantiles=q_quantiles
+                    )
+                T_active = len(active_bins)
+                pop_bin_counts = pool_bin_counts   # same for pool mode
+
+                if q_mode == "tilted":
+                    bin_midpoints = []
+                    for t in range(T_active):
+                        v = b_J[bin_assignments == t]
+                        bin_midpoints.append(
+                            float((v.min() + v.max()) / 2.0)
+                        )
+                    quotas = compute_bin_quotas(
+                        pool_bin_counts, n_target,
+                        mode=q_mode, lamda=q_lambda,
+                        bin_midpoints=bin_midpoints,
+                    )
+                else:
+                    quotas = compute_bin_quotas(
+                        pool_bin_counts, n_target,
+                        mode=q_mode,
+                    )
+
+                pop_S = None
+                pop_subset_mode = None
+
+                print(
+                    f"  Bin-quota matching (pool-based): "
+                    f"T_active={T_active}, quotas={quotas}, "
+                    f"pool_per_bin={pool_bin_counts}"
+                )
+
+            else:
+                raise ValueError(
+                    f"Unknown binning mode '{binning}'. "
+                    f"Use 'population' or 'pool'."
+                )
+
+            # ---- Solve with per-bin sparsification ----
+            cost = d_pn_leaf[cand_idx_final, :].T  # (n_cases, M)
+            match_ctrl_local, match_costs, solve_diag = \
+                solve_min_cost_assignment_with_quotas(
+                    cost_matrix=cost,
+                    bin_assignments=bin_assignments,
+                    quotas=quotas,
+                    K_per_bin=quota_cfg.get("K_per_bin", 25),
+                    K_growth=quota_cfg.get("K_growth", 2),
+                    max_K_per_bin=quota_cfg.get(
+                        "max_K_per_bin", None
+                    ),
+                    case_weights=weights_to_use,
+                )
+
+            # ---- Diagnostics ----
+            matched_bins = bin_assignments[match_ctrl_local]
+            achieved = [
+                int(np.sum(matched_bins == t))
+                for t in range(T_active)
+            ]
+            matched_b = b_J[match_ctrl_local]
+            per_bin_stats = {}
+            for t in range(T_active):
+                mask_t = matched_bins == t
+                if mask_t.any():
+                    v = matched_b[mask_t]
+                    per_bin_stats[t] = {
+                        "min": float(v.min()),
+                        "median": float(np.median(v)),
+                        "max": float(v.max()),
+                    }
+                else:
+                    per_bin_stats[t] = {
+                        "min": None, "median": None,
+                        "max": None,
+                    }
+            dq = np.quantile(
+                match_costs, [0, 0.25, 0.5, 0.75, 1.0]
+            )
+            quota_diagnostics = {
+                "binning_source": binning,
+                "T_active": T_active,
+                "target_quotas": quotas,
+                "achieved_counts": achieved,
+                "pop_bin_counts": pop_bin_counts,
+                "pool_bin_counts": pool_bin_counts,
+                "cutpoints": (
+                    cutpoints.tolist()
+                    if hasattr(cutpoints, "tolist")
+                    else list(cutpoints)
+                ),
+                "active_bins": active_bins,
+                "K_per_bin_final": solve_diag["K_per_bin_final"],
+                "K_retries": solve_diag["retries"],
+                "per_bin_b_stats": per_bin_stats,
+                "matched_cost_quantiles": {
+                    "min": float(dq[0]),
+                    "q25": float(dq[1]),
+                    "median": float(dq[2]),
+                    "q75": float(dq[3]),
+                    "max": float(dq[4]),
+                },
+                "mode": q_mode,
+            }
+            if binning == "population":
+                quota_diagnostics["pop_S"] = len(pop_idx)
+                quota_diagnostics["pop_subset_mode"] = (
+                    pop_subset_mode
+                )
+
+            print(
+                f"  Quota solve done "
+                f"(retries={solve_diag['retries']})"
+            )
+            for t in range(T_active):
+                print(
+                    f"    Bin {t}: target={quotas[t]}, "
+                    f"achieved={achieved[t]}, "
+                    f"pool={pool_bin_counts[t]}"
+                )
+
+            selected_control_enrolids = \
+                candidate_majority_enrolids[match_ctrl_local]
+            case_to_control = {
+                int(ci): int(cj)
+                for ci, cj in zip(
+                    leaf_cases_enrolids, selected_control_enrolids
+                )
+            }
+
         else:
-            # 1:k matching: match_ctrl_local and match_costs are lists of arrays
-            # Flatten to get all selected controls
-            selected_control_indices_local = np.concatenate(match_ctrl_local)
-            selected_control_enrolids = candidate_majority_enrolids[selected_control_indices_local]
-            match_costs = np.concatenate(match_costs)
-            
-            # Build case-to-control map (each case maps to k controls)
-            case_to_control = {}
-            for i, case_enrolid in enumerate(leaf_cases_enrolids):
-                matched_controls = candidate_majority_enrolids[match_ctrl_local[i]]
-                case_to_control[int(case_enrolid)] = matched_controls.tolist()
+            # -- Original (unconstrained) matching path --
+            cost = d_pn_leaf[cand_idx_final, :].T  # (n_cases, M)
+            match_ctrl_local, match_costs = \
+                solve_min_cost_assignment_adaptive_topk(
+                    cost_matrix=cost,
+                    topk_start=assignment_topk_start,
+                    matching_ratio=matching_ratio,
+                    case_weights=weights_to_use,
+                )
 
-        return {
+            if matching_ratio == 1:
+                selected_control_enrolids = \
+                    candidate_majority_enrolids[match_ctrl_local]
+                case_to_control = {
+                    int(ci): int(cj)
+                    for ci, cj in zip(
+                        leaf_cases_enrolids, selected_control_enrolids
+                    )
+                }
+            else:
+                selected_control_indices_local = np.concatenate(
+                    match_ctrl_local
+                )
+                selected_control_enrolids = \
+                    candidate_majority_enrolids[
+                        selected_control_indices_local
+                    ]
+                match_costs = np.concatenate(match_costs)
+                case_to_control = {}
+                for i, case_enrolid in enumerate(leaf_cases_enrolids):
+                    matched_ctrls = \
+                        candidate_majority_enrolids[match_ctrl_local[i]]
+                    case_to_control[int(case_enrolid)] = \
+                        matched_ctrls.tolist()
+
+        result = {
             "candidate_majority_enrolids": candidate_majority_enrolids,
             "selected_control_enrolids": selected_control_enrolids,
             "case_to_control_map": case_to_control,
@@ -864,9 +1345,15 @@ def two_stage_kcenter_then_match(
             "seed_method": seed_method,
             "seed_idx": seed_idx,
             "seed_enrolid": int(leaf_controls_enrolids[seed_idx]),
-            "case_weights": weights_to_use,  # NEW: Include weights used
-            "case_weighting_method": case_weighting if case_weights is None else "custom",
+            "case_weights": weights_to_use,
+            "case_weighting_method": (
+                case_weighting if case_weights is None else "custom"
+            ),
         }
+        if quota_diagnostics is not None:
+            result["quota_diagnostics"] = quota_diagnostics
+        return result
 
     finally:
         f_pn.close()
+
