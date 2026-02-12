@@ -793,8 +793,6 @@ def two_stage_kcenter_then_match(
     density_percentile: float = 10.0,  # For auto-selecting epsilon in "density"
     matching_ratio: int = 1,  # 1:k matching support
     case_weighting: Optional[str] = None,  # NEW: "boundary", "uncertainty", "density_inverse", or None
-    case_weights: Optional[np.ndarray] = None,  # NEW: Pre-computed weights (overrides case_weighting)
-    predicted_probs: Optional[np.ndarray] = None,  # Required if case_weighting="uncertainty"
     quota_cfg: Optional[Dict] = None,  # Bin-quota constraints config (see below)
 ) -> Dict[str, object]:
     """
@@ -855,25 +853,10 @@ def two_stage_kcenter_then_match(
         - "boundary": Inverse distance to nearest control (closer = higher weight)
         - "uncertainty": Shannon entropy of predicted probabilities (requires predicted_probs)
         - "density_inverse": Inverse local density (fewer neighbors = higher weight)
-    case_weights : np.ndarray, optional, shape (n_cases,)
-        Pre-computed case weights. If provided, overrides case_weighting parameter.
-    predicted_probs : np.ndarray, optional, shape (n_cases, n_classes)
-        Predicted class probabilities. Required if case_weighting="uncertainty".
     quota_cfg : dict or None, default=None
         Bin-quota constraints config.  If None or ``{"enabled": False}``, the
         original unconstrained matching runs unchanged.  Keys when enabled::
 
-            quota_cfg = {
-                "enabled": True,
-                "T": 5,                          # target number of bins
-                "quantiles": [0,.2,.4,.6,.8,1.], # optional, length T+1
-                "mode": "pool_mass",              # or "tilted"
-                "lambda": 0.0,                    # tilt param (>= 0)
-                "K_per_bin": 25,                  # edges per case per bin
-                "K_growth": 2,                    # multiplicative retry
-                "max_K_per_bin": None,            # None = up to all in bin
-            }
-    
     Returns
     -------
     dict with keys:
@@ -1029,30 +1012,21 @@ def two_stage_kcenter_then_match(
         # Compute case weights (if requested)
         # ============================================================================
         weights_to_use = None
-        if case_weights is not None:
-            # Use pre-computed weights
-            weights_to_use = case_weights
-            print(f"  Using pre-computed case weights (mean={weights_to_use.mean():.3f}, std={weights_to_use.std():.3f})")
-        elif case_weighting is not None:
-            print(f"  Computing case weights: method='{case_weighting}'")
+        
+        if case_weighting == "boundary":
+            weights_to_use = compute_case_weights_boundary(d_pn_leaf, normalize=True)
+            print(f"    Boundary weights: min={weights_to_use.min():.3f}, max={weights_to_use.max():.3f}, mean={weights_to_use.mean():.3f}")
             
-            if case_weighting == "boundary":
-                weights_to_use = compute_case_weights_boundary(d_pn_leaf, normalize=True)
-                print(f"    Boundary weights: min={weights_to_use.min():.3f}, max={weights_to_use.max():.3f}, mean={weights_to_use.mean():.3f}")
-                
-            elif case_weighting == "density_inverse":
-                weights_to_use = compute_case_weights_density_inverse(
-                    d_pn_leaf, 
-                    epsilon=density_epsilon,
-                    percentile=density_percentile,
-                    normalize=True
-                )
-                print(f"    Density-inverse weights: min={weights_to_use.min():.3f}, max={weights_to_use.max():.3f}, mean={weights_to_use.mean():.3f}")
-                
-            else:
-                raise ValueError(f"Unknown case_weighting method: '{case_weighting}'. "
-                               f"Must be 'boundary','density_inverse', or None.")
-
+        elif case_weighting == "density_inverse":
+            weights_to_use = compute_case_weights_density_inverse(
+                d_pn_leaf, 
+                epsilon=density_epsilon,
+                percentile=density_percentile,
+                normalize=True
+            )
+            print(f"    Density-inverse weights: min={weights_to_use.min():.3f}, max={weights_to_use.max():.3f}, mean={weights_to_use.mean():.3f}")
+            
+        
         # ================================================================
         # Stage B: Min-cost flow matching
         # ================================================================
@@ -1346,9 +1320,7 @@ def two_stage_kcenter_then_match(
             "seed_idx": seed_idx,
             "seed_enrolid": int(leaf_controls_enrolids[seed_idx]),
             "case_weights": weights_to_use,
-            "case_weighting_method": (
-                case_weighting if case_weights is None else "custom"
-            ),
+            "case_weighting_method": case_weighting,
         }
         if quota_diagnostics is not None:
             result["quota_diagnostics"] = quota_diagnostics
