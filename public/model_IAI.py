@@ -21,6 +21,10 @@ from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, FunctionTransformer
+try:
+    from scipy import sparse
+except Exception:
+    sparse = None
 def train_test_split_enrol(df, target_col, test_size=0.3, random_state=42,verbose=True):
     """
     Splits df by ENROLID into train/test, stratifying on target_col.
@@ -191,98 +195,101 @@ def get_preprocessor_with_impute(X_train, categorical_cols, numeric_cols, binary
 
     return ColumnTransformer(transformers=transformers, remainder="drop")
 
-def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
-                 binary_cols=None,
-                 depths=[5, 7, 9],
-                 minbuckets=[50, 100, 150],
-                 cps=[1e-6, 1e-5, 1e-4, 1e-3],
-                 verbose=True,
-                 random_seed=123):
+
+
+
+def finetune_oct(
+    X_train, y_train, X_val, y_val,
+    categorical_cols, numeric_cols,
+    binary_cols=None,
+    depths=(5, 7, 9),
+    minbuckets=(50, 100, 150),
+    cps=(1e-6, 1e-5, 1e-4, 1e-3),
+    # NEW:
+    tree_kind="oct",  # {"oct", "oct_h", "both"}
+    hyperplane_configs=None,  # list[dict] for OCT-H, e.g. [{"sparsity":"all"}]
+    ls_num_hyper_restarts=5,  # hyperplane search restarts (optional speed/quality knob)
+    missingdatamode_oct="always_left",
+    verbose=True,
+    random_seed=123,
+):
     """
     Hyperparameter tuning for IAI OptimalTreeClassifier with conditional imputation.
-    
-    Selects best hyperparameters based on PR-AUC on validation set.
-    Uses conditional imputation (only when missing values are present).
-    
-    Parameters
-    ----------
-    X_train : pd.DataFrame
-        Training features
-    y_train : array-like
-        Training labels
-    X_val : pd.DataFrame
-        Validation features
-    y_val : array-like
-        Validation labels
-    categorical_cols : list
-        List of categorical column names
-    numeric_cols : list
-        List of numeric column names (will be scaled)
-    binary_cols : list, optional
-        List of binary flag column names (0/1). These will be passed through
-        without scaling. If None, binary columns are dropped.
-    depths : list, default=[5, 7, 9]
-        Tree depths to try
-    minbuckets : list, default=[50, 100, 150]
-        Minimum bucket sizes to try
-    cps : list, default=[1e-6, 1e-5, 1e-4, 1e-3]
-        Complexity parameters to try
-    verbose : bool, default=True
-        Whether to print preprocessing details
-    random_seed : int, default=123
-        Random seed for OCT training
-    
-    Returns
-    -------
-    best_model : IAI OptimalTreeClassifier
-        Best model from hyperparameter search
-    best_params : tuple
-        (depth, minbucket, cp) of best model
-    results_df : pd.DataFrame
-        Results for all hyperparameter combinations, sorted by PR-AUC
-    preprocessor : sklearn ColumnTransformer
-        Fitted preprocessor
-    feature_names : list
-        Feature names after preprocessing
+
+    NEW:
+      - tree_kind: "oct" (axis-aligned), "oct_h" (hyperplanes), or "both" (compete in same search)
+      - hyperplane_configs: list of dict configs for IAI hyperplane_config
+          default when OCT-H is used: [{"sparsity": "all"}]
+      - ls_num_hyper_restarts: number of random restarts for hyperplane optimization
+      - missingdatamode_oct: missing-data mode for vanilla OCT (OCT-H should not rely on missingdatamode)
     """
-    print(f"Finetuning OCT with depths: {depths}, minbuckets: {minbuckets}, cps: {cps}, for best PR-AUC")
+    tree_kind = tree_kind.lower().strip()
+    if tree_kind not in {"oct", "oct_h", "both"}:
+        raise ValueError("tree_kind must be one of {'oct','oct_h','both'}")
+
+    if tree_kind in {"oct_h", "both"}:
+        if hyperplane_configs is None:
+            hyperplane_configs = [{"sparsity": "all"}]  # IAI default “turn on hyperplanes”
+    else:
+        hyperplane_configs = []
+
+    # Build model-variant grid:
+    # None => vanilla OCT
+    # dict => OCT-H enabled with that hyperplane_config
+    variant_grid = []
+    if tree_kind in {"oct", "both"}:
+        variant_grid.append(None)
+    if tree_kind in {"oct_h", "both"}:
+        variant_grid.extend(list(hyperplane_configs))
+
+    if verbose:
+        print(
+            f"Finetuning IAI OCT with variants={['oct' if v is None else 'oct_h' for v in variant_grid]}, "
+            f"depths={list(depths)}, minbuckets={list(minbuckets)}, cps={list(cps)} (best PR-AUC)"
+        )
+
     best_score = -np.inf
     best_params = None
     best_model = None
     results = []
-    
-    # Build and fit preprocessor on TRAIN only (important)
-    # Uses conditional imputation (only when missing values are present)
-    preprocessor = get_preprocessor_with_impute(X_train, categorical_cols, numeric_cols, binary_cols=binary_cols, verbose=verbose)
+
+    # ── Preprocess (fit on TRAIN only) ──
+    preprocessor = get_preprocessor_with_impute(
+        X_train, categorical_cols, numeric_cols, binary_cols=binary_cols, verbose=verbose
+    )
     X_train_transformed = preprocessor.fit_transform(X_train)
     X_val_transformed = preprocessor.transform(X_val)
-    
-    # Check for remaining missing values after preprocessing
-    if pd.DataFrame(X_train_transformed).isna().any().any():
-        print("⚠️  Warning: Missing values still present after preprocessing. Using missingdatamode='always_left' in OCT.")
 
-    # Get feature names - robust extraction that handles all transformer types
+    # If the transformer yields sparse output, densify (IAI typically expects dense tabular input)
+    if sparse is not None and sparse.issparse(X_train_transformed):
+        X_train_transformed = X_train_transformed.toarray()
+        X_val_transformed = X_val_transformed.toarray()
+
+    # Robust missing check without forcing huge DataFrames
+    train_has_nan = np.isnan(X_train_transformed).any()
+    val_has_nan = np.isnan(X_val_transformed).any()
+    if train_has_nan or val_has_nan:
+        msg = "⚠️ Warning: Missing values still present after preprocessing."
+        if verbose:
+            print(msg)
+
+    # ── Feature name extraction (your original logic) ──
     feature_names = []
     for name, transformer, columns in preprocessor.transformers_:
         if name == 'cat':
-            # Handle categorical pipeline (may have impute + ohe)
             try:
-                # Try to get OHE from pipeline
                 if hasattr(transformer, 'named_steps') and 'ohe' in transformer.named_steps:
                     ohe = transformer.named_steps['ohe']
                     ohe_features = ohe.get_feature_names_out(columns)
                     feature_names.extend(ohe_features)
                 elif hasattr(transformer, 'get_feature_names_out'):
-                    # Direct OHE transformer
                     ohe_features = transformer.get_feature_names_out(columns)
                     feature_names.extend(ohe_features)
             except (NotFittedError, AttributeError, ValueError) as e:
                 if verbose:
-                    print(f"  ⚠️  Could not extract categorical feature names: {e}")
-                pass
+                    print(f"  ⚠️ Could not extract categorical feature names: {e}")
         elif name == 'ohe':
-            # Direct OHE transformer (legacy format)
-            if columns:  # Only process if there are actual columns to encode
+            if columns:
                 try:
                     ohe_features = transformer.get_feature_names_out(columns)
                     feature_names.extend(ohe_features)
@@ -291,7 +298,6 @@ def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
         elif name == 'num':
             feature_names.extend(columns)
         elif name == 'binary':
-            # Binary columns pass through with original names
             feature_names.extend(columns)
         elif name == 'remainder' and preprocessor.remainder == 'passthrough':
             all_cols = X_train.columns.tolist()
@@ -304,45 +310,72 @@ def finetune_oct(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
     X_train_df = pd.DataFrame(X_train_transformed, columns=feature_names)
     X_val_df = pd.DataFrame(X_val_transformed, columns=feature_names)
 
-    # Grid search over hyperparameters
-    for depth, minbucket, cp in itertools.product(depths, minbuckets, cps):
-        model = iai.OptimalTreeClassifier(
+    # OCT-H should not see missing values at all (IAI notes missing not directly supported w/ hyperplanes)
+    # If any NaNs remain, we allow vanilla OCT to proceed with missingdatamode, but fail for OCT-H variants.
+    # :contentReference[oaicite:2]{index=2}
+    # (If you want a softer behavior, you can skip OCT-H variants instead of raising.)
+    for depth, minbucket, cp, variant in itertools.product(depths, minbuckets, cps, variant_grid):
+        is_hyperplane = variant is not None
+
+        if is_hyperplane and (train_has_nan or val_has_nan):
+            raise ValueError(
+                "OCT-H (hyperplane splits) selected but NaNs remain after preprocessing. "
+                "Ensure get_preprocessor_with_impute fully imputes all missing values."
+            )
+
+        model_kwargs = dict(
             max_depth=depth,
             minbucket=minbucket,
             cp=cp,
             random_seed=random_seed,
-            missingdatamode='always_left'  # Handle missing data: always_left, always_right, or separate_class
         )
+
+        if is_hyperplane:
+            # Enable OCT-H via hyperplane_config (Python example in IAI docs)
+            # :contentReference[oaicite:3]{index=3}
+            model_kwargs["hyperplane_config"] = variant
+            model_kwargs["ls_num_hyper_restarts"] = ls_num_hyper_restarts
+            # missingdatamode is irrelevant if there are no NaNs; keep it conservative
+            model_kwargs["missingdatamode"] = "none"
+        else:
+            # Vanilla OCT can optionally route NaNs if they exist
+            model_kwargs["missingdatamode"] = missingdatamode_oct
+
+        model = iai.OptimalTreeClassifier(**model_kwargs)
         model.fit(X_train_df, y_train)
 
-        # Get predictions and probabilities
         y_pred = model.predict(X_val_df)
         y_val_proba = model.predict_proba(X_val_df).iloc[:, 1]
 
-        # Compute metrics
         f1 = f1_score(y_val, y_pred, zero_division=0)
-        pr_auc = average_precision_score(y_val, y_val_proba)  # Use probabilities for PR-AUC
+        pr_auc = average_precision_score(y_val, y_val_proba)
 
         results.append({
+            "variant": "oct_h" if is_hyperplane else "oct",
+            "hyperplane_config": repr(variant) if is_hyperplane else None,
             "depth": depth,
             "minbucket": minbucket,
             "cp": cp,
             "f1": f1,
-            "pr_auc": pr_auc
+            "pr_auc": pr_auc,
         })
 
-        # Select best model based on PR-AUC
         if pr_auc > best_score:
             best_score = pr_auc
-            best_params = (depth, minbucket, cp)
+            best_params = {
+                "variant": "oct_h" if is_hyperplane else "oct",
+                "hyperplane_config": variant,
+                "depth": depth,
+                "minbucket": minbucket,
+                "cp": cp,
+            }
             best_model = model
 
-    # Sort results by PR-AUC (descending)
-    results_df = pd.DataFrame(results).sort_values("pr_auc", ascending=False)
-    print(f"Best params: {best_params} @ PR-AUC: {best_score:.4f}")
+    results_df = pd.DataFrame(results).sort_values("pr_auc", ascending=False).reset_index(drop=True)
+    if verbose:
+        print(f"Best params: {best_params} @ PR-AUC: {best_score:.4f}")
+
     return best_model, best_params, results_df, preprocessor, feature_names
-
-
 # Alias for backward compatibility
 def finetune_oct_impute(X_train, y_train, X_val, y_val, categorical_cols, numeric_cols,
                         binary_cols=None,

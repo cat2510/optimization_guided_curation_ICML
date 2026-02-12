@@ -39,7 +39,7 @@ df_msk_spark = spark.read.format("parquet").load("msk_2017_18_full.parquet")
 df_og = df_msk_spark.toPandas()
 
 TRAIN_TEST_SEED = 123
-BASE_DIR = "./sensitivity_quota_cfg_pool_size_all_cost_features_150_minbucket"
+BASE_DIR = "./sensitivity_quota_cfg_population_binning_150_minbucket"
 RESULTS_DIR = os.path.join(BASE_DIR, "results") #undersampled dataset directory
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -52,7 +52,15 @@ SEED_METHOD = "smart"  # Options: "smart", "centroid", "density", "random"
 # Bin-quota constraints for representativeness (optional)
 # Set to None to disable, or a dict to enable:
 #   e.g. dict(enabled=True, T=5, mode="pool_mass", K_per_bin=25)
-QUOTA_CFG = {"enabled": True, "T": 5, "mode": "pool_mass", "K_per_bin": 25}
+QUOTA_CFG = {
+    "enabled": True,
+    "T": 5,
+    "mode": "pool_mass",           # quota computation mode (proportional to bin counts)
+    "binning": "population",       # NEW: use population-based cutpoints & quotas
+    "pop_S": 50000,                # population subset size (default 50k)
+    "pop_subset": "sorted_prefix", # deterministic subset selection
+    "K_per_bin": 25,
+}
 FORCE_NEAREST_PER_CASE = False #last step in two_stage_kcenter_match.py
 # MSK-specific feature column definitions
 # Binary flag columns: comorbidity flags, MSK category flags, medication flags
@@ -140,12 +148,12 @@ print(f"Train: {train_pd.shape}, Val: {val_pd.shape}, Test: {test_pd.shape}")
 # ============================================================================
 # CONFIGURATION: Pool size sensitivity analysis
 # ============================================================================
+#TODO try different distance metrics for precompute_distances: 'euclidean' (L2), 'manhattan' (L1), 'chebyshev' (L_infinity)
+DISTANCE_METRIC = "euclidean"  # or "chebyshev" for L_infinity; pass to compute_distances_batched / precompute_leaf_dnn_memmap
 
 # Use a single precomputed distance directory
 DISTANCES_DIR = "./precomputed_distances_msk_with_cost_features"  # Change this to your preferred directory
 PN_H5_PATH = os.path.join(DISTANCES_DIR, "distances_majority_minority.h5")
-#TODO try different distance metrics for precompute_distances: 'euclidean' (L2), 'manhattan' (L1), 'chebyshev' (L_infinity)
-DISTANCE_METRIC = "manhattan"  # or "chebyshev" for L_infinity; pass to compute_distances_batched / precompute_leaf_dnn_memmap
 DNN_OUT_DIR = os.path.join(DISTANCES_DIR, f"global_dnn_seed_{TRAIN_TEST_SEED}")
 dnn_matrix_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_matrix.npy")
 dnn_enrolids_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_enrolids.npy")
@@ -170,11 +178,10 @@ print(f"  Ratio: {n_controls/n_cases:.2f}:1\n")
 
 # Generate pool sizes M to test
 # Range from n_cases to n_controls//2 in reasonably separated steps
-M_min = n_cases
-#M_min = n_controls // 2
-M_max = n_controls // 2
+M_min = n_controls // 2
+M_max = 150000
 # Create steps: use approximately 10-15 steps, with larger steps for larger ranges
-num_steps = 12
+num_steps = 4
 if M_max - M_min < num_steps:
     # If range is small, test every value
     M_values = list(range(M_min, M_max + 1))
@@ -211,6 +218,7 @@ for m_idx, M in enumerate(M_values, 1):
     iteration_start_time = time.perf_counter()
     
     try:
+        """
         # ====================================================================
         # STEP 1: K-CENTER UNDERSAMPLING
         # ====================================================================
@@ -238,7 +246,7 @@ for m_idx, M in enumerate(M_values, 1):
             plateau_eps=0.01,
             force_nearest_per_case=FORCE_NEAREST_PER_CASE,
             force_topm=1,
-            assignment_topk_start=None,  # Exact matching
+            assignment_topk_start=None,  # Exoh matching
             seed_method=SEED_METHOD,
             matching_ratio=MATCHING_RATIO,
             X_majority_leaf=None,  # Not needed when using precomputed distances
@@ -271,12 +279,13 @@ for m_idx, M in enumerate(M_values, 1):
         print(f"     Total samples: {len(undersampled_training_data):,}")
         print(f"     Class distribution:")
         print(undersampled_training_data[target_col].value_counts().sort_index())
-        
+        """
         # Save undersampled dataset
         config_name = f"cw_{CASE_WEIGHTING}_pool_False_seed_{SEED_METHOD}"
         undersample_path = os.path.join(RESULTS_DIR, f"M{M}_{config_name}.csv")
-        undersampled_training_data.to_csv(undersample_path, index=False)
-        print(f"     ✓ Saved undersampled dataset: {undersample_path}")
+        #undersampled_training_data.to_csv(undersample_path, index=False)
+        undersampled_training_data = pd.read_csv(undersample_path)
+        print(f"     ✓ Loaded undersampled dataset: {undersample_path}")
         
         # ====================================================================
         # STEP 2: TRAIN AND EVALUATE OCT
@@ -311,13 +320,13 @@ for m_idx, M in enumerate(M_values, 1):
         # Create results directory
         results_dir = f"{BASE_DIR}/pool_size_M{M}"
         os.makedirs(results_dir, exist_ok=True)
-        
+        if isinstance(balanced_params, dict):
+            save_suffix = f"M{M}_{balanced_params['depth']}_{balanced_params['minbucket']}_{balanced_params['cp']}"
+        else:
+            save_suffix = f"M{M}_{balanced_params[0]}_{balanced_params[1]}_{balanced_params[2]}"
         metrics = evaluate_binary_oct(
             balanced_model, X_test, y_test, preprocessor, feature_names, 
-            X_val_df=X_val, y_val=y_val,
-            results_dir=results_dir, 
-            save_suffix=f"M{M}_{balanced_params[0]}_{balanced_params[1]}_{balanced_params[2]}"
-        )
+            X_val_df=X_val, y_val=y_val, results_dir=results_dir, save_suffix=save_suffix)
         
         evaluation_end_time = time.perf_counter()
         evaluation_time = evaluation_end_time - evaluation_start_time
@@ -343,7 +352,7 @@ for m_idx, M in enumerate(M_values, 1):
             'best_depth': balanced_params[0],
             'best_minbucket': balanced_params[1],
             'best_cp': balanced_params[2],
-            'matching_time_seconds': matching_time,
+            'matching_time_seconds': 0,
             'training_time_seconds': training_time,
             'evaluation_time_seconds': evaluation_time,
             'total_time_seconds': total_time,

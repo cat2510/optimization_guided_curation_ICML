@@ -26,6 +26,7 @@ except ImportError:
     print("Warning: interpretableai not available. OCT model loading will be limited.")
 
 import xgboost as xgb
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, precision_recall_curve,
     confusion_matrix, recall_score, precision_score, f1_score,
@@ -704,7 +705,7 @@ def train_student_distilled(
     
     if use_rule_features:
         if verbose:
-            print("Extracting OCT rule-based features...")
+            print("Extracting OCT rule-based features for XGBoost...")
         rule_features_train, rule_metadata = extract_oct_rule_features(
             teacher, X_train, include_leaf_assignment=True,
             include_rule_indicators=True, include_rule_confidence=include_rule_confidence_feature
@@ -807,6 +808,103 @@ def train_student_distilled(
     metrics['used_sample_weights'] = use_sample_weights
     
     return model_sklearn, metrics
+
+
+def train_student_distilled_rf(
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    X_val: pd.DataFrame,
+    y_val: np.ndarray,
+    teacher: OCTTeacher,
+    preprocessor=None,
+    use_rule_features: bool = True,
+    use_sample_weights: bool = True,
+    weight_strategy: str = 'confidence',
+    weight_min: float = 1.0,
+    weight_max: float = 2.0,
+    confidence_exponent: float = 1.0,
+    rule_feature_scale: float = 1.0,
+    include_rule_confidence_feature: bool = True,
+    n_estimators: int = 500,
+    max_depth: int = 6,
+    random_state: int = 42,
+    verbose: bool = True
+) -> Tuple[RandomForestClassifier, Dict]:
+    """
+    Train Random Forest student with rule-based distillation from OCT teacher.
+    Same rule features and sample weighting as XGBoost path; no early stopping.
+    """
+    if preprocessor is None:
+        raise ValueError("Preprocessor required")
+
+    X_train_processed = preprocessor.transform(X_train)
+    X_val_processed = preprocessor.transform(X_val)
+
+    feature_names = []
+    if hasattr(preprocessor, 'transformers_'):
+        for name, transformer, columns in preprocessor.transformers_:
+            if name == 'cat' and hasattr(transformer, 'named_steps'):
+                ohe = transformer.named_steps.get('ohe') or transformer.named_steps.get('onehotencoder')
+                if ohe:
+                    feature_names.extend(ohe.get_feature_names_out(columns))
+            elif name == 'num' or name == 'binary':
+                feature_names.extend(columns)
+    else:
+        feature_names = [f'f{i}' for i in range(X_train_processed.shape[1])]
+
+    rule_metadata = {}
+    rule_feature_names = []
+    if use_rule_features:
+        if verbose:
+            print("Extracting OCT rule-based features for Random Forest...")
+        rule_features_train, rule_metadata = extract_oct_rule_features(
+            teacher, X_train, include_leaf_assignment=True,
+            include_rule_indicators=True, include_rule_confidence=include_rule_confidence_feature
+        )
+        rule_features_val, _ = extract_oct_rule_features(
+            teacher, X_val, include_leaf_assignment=True,
+            include_rule_indicators=True, include_rule_confidence=include_rule_confidence_feature
+        )
+        rtrain = rule_features_train.values.astype(np.float64) * rule_feature_scale
+        rval = rule_features_val.values.astype(np.float64) * rule_feature_scale
+        X_train_processed = np.hstack([X_train_processed, rtrain])
+        X_val_processed = np.hstack([X_val_processed, rval])
+        rule_feature_names = list(rule_features_train.columns)
+        feature_names = feature_names + rule_feature_names
+        if verbose:
+            print(f"  Added {len(rule_feature_names)} rule features")
+            print(f"  Total features: {len(feature_names)}")
+
+    sample_weights = None
+    if use_sample_weights:
+        if verbose:
+            print(f"Computing rule-based sample weights (strategy: {weight_strategy})...")
+        sample_weights = compute_rule_based_sample_weights(
+            teacher, X_train, y_train, weight_strategy=weight_strategy,
+            min_weight=weight_min, max_weight=weight_max,
+            confidence_exponent=confidence_exponent
+        )
+        if verbose:
+            print(f"  Weight range: [{sample_weights.min():.3f}, {sample_weights.max():.3f}]")
+
+    model = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        random_state=random_state,
+        #class_weight='balanced',
+        n_jobs=-1,
+    )
+    if sample_weights is not None:
+        model.fit(X_train_processed, y_train, sample_weight=sample_weights)
+    else:
+        model.fit(X_train_processed, y_train)
+
+    y_val_pred_proba = model.predict_proba(X_val_processed)[:, 1]
+    metrics = compute_minority_metrics(y_val, y_val_pred_proba, verbose=verbose)
+    metrics['rule_metadata'] = rule_metadata if use_rule_features else {}
+    metrics['n_rule_features'] = len(rule_feature_names) if use_rule_features else 0
+    metrics['used_sample_weights'] = use_sample_weights
+    return model, metrics
 
 
 # ============================================================================
