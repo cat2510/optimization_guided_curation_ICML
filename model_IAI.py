@@ -25,6 +25,37 @@ try:
     from scipy import sparse
 except Exception:
     sparse = None
+
+
+def recall_at_specificity(y_true, y_score, target_specificity: float = 0.60):
+    """
+    Return (recall, specificity, threshold) where specificity >= target_specificity and
+    recall is maximized among those thresholds.
+
+    Uses ROC curve (thresholds on y_score). If no threshold reaches target specificity,
+    returns the closest (max specificity) operating point.
+
+    Note: In imbalanced settings, there may be many thresholds; this is O(n log n) dominated by sort.
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_score = np.asarray(y_score).astype(float)
+
+    fpr, tpr, thresholds = roc_curve(y_true, y_score)
+    specificity = 1.0 - fpr
+
+    # Candidate indices satisfying specificity constraint
+    idx = np.where(specificity >= target_specificity)[0]
+    if idx.size > 0:
+        # pick the one with max recall (tpr) among feasible points
+        best_i = idx[np.argmax(tpr[idx])]
+        return float(tpr[best_i]), float(specificity[best_i]), float(thresholds[best_i])
+
+    # If constraint not achievable, pick point with maximal specificity (i.e., minimal FPR)
+    best_i = int(np.argmax(specificity))
+    return float(tpr[best_i]), float(specificity[best_i]), float(thresholds[best_i])
+
+
+
 def train_test_split_enrol(df, target_col, test_size=0.3, random_state=42,verbose=True):
     """
     Splits df by ENROLID into train/test, stratifying on target_col.
@@ -66,6 +97,7 @@ def get_true_num_columns(df, CAT_COLUMNS,BIN_FLAG_COLUMNS):
             and col not in CAT_COLUMNS+BIN_FLAG_COLUMNS
         )
     ]
+
 
 def train_oct_with_feature_names(X_train, y_train, 
                                  categorical_cols, numeric_cols,
@@ -584,6 +616,9 @@ def evaluate_binary_oct(
     Returns
     -------
     dict : Evaluation metrics
+    NEW METRIC:
+      - recall_at_specificity_0.6: maximum recall achievable at specificity >= 0.6
+        (and reports the selected threshold + achieved specificity).
     """
     print(f"Test dataset for OCT application: {len(X_test_df):,} samples")
 
@@ -693,7 +728,15 @@ def evaluate_binary_oct(
         precision_gmean = tp_gmean / (tp_gmean + fp_gmean) if (tp_gmean + fp_gmean) else 0.0
         balanced_recall_gmean_test = tp_gmean / (tp_gmean + fn_gmean) if (tp_gmean + fn_gmean) else 0.0
         balanced_specificity_gmean_test = tn_gmean / (tn_gmean + fp_gmean) if (tn_gmean + fp_gmean) else 0.0
-    
+    # ------------------------------------------------------------
+    # NEW: recall at specificity >= 0.6 (on test set)
+    # ------------------------------------------------------------
+    recall_at_spec_06, achieved_spec_06, threshold_spec_06 = recall_at_specificity(
+        y_test_series.values,
+        y_proba.values if hasattr(y_proba, "values") else y_proba,
+        target_specificity=0.60
+    )
+
     # ------------------------------------------------------------
     # WRITE OUT PREDICTIONS TO DISK
     # ------------------------------------------------------------
@@ -727,6 +770,7 @@ def evaluate_binary_oct(
     else:
         print(f"Balanced (G-mean) recall: {balanced['gmean_opt']['recall']:.3f}")
         print(f"Balanced (G-mean) specificity: {balanced['gmean_opt']['specificity']:.3f}")
+    print(f"Recall @ specificity>=0.60: {recall_at_spec_06:.3f} (achieved spec={achieved_spec_06:.3f}, thr={threshold_spec_06:.6f})")
     print("Number of leaves:", len(pd.unique(leaf_assignments)))
 
     # ------------------------------------------------------------
@@ -744,13 +788,14 @@ def evaluate_binary_oct(
         "auc": auc,
         "pr_auc": pr_auc,
         "best_mcc": best_mcc_value,
-        "best_mcc_threshold": best_mcc_threshold_value,
         "recall_mcc": float(recall_mcc),
-        "precision_mcc": float(precision_mcc),
+        "specificity_mcc": float(specificity_mcc),
         "optimal_f1": float(optimal_f1),
         "balanced_recall_gmean": float(balanced_recall_gmean),
         "balanced_specificity_gmean": float(balanced_specificity_gmean),
-        "precision_gmean": float(precision_gmean) if precision_gmean is not None else None,
+        "recall_at_specificity_0.6": float(recall_at_spec_06),
+        "achieved_specificity_0.6": float(achieved_spec_06),
+        "threshold_specificity_0.6": float(threshold_spec_06),
     }
 
 def best_balanced_threshold(y_true, y_prob):
