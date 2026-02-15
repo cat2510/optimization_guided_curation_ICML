@@ -794,6 +794,7 @@ def two_stage_kcenter_then_match(
     matching_ratio: int = 1,  # 1:k matching support
     case_weighting: Optional[str] = None,  # NEW: "boundary", "uncertainty", "density_inverse", or None
     quota_cfg: Optional[Dict] = None,  # Bin-quota constraints config (see below)
+    debug_alignment: bool = False,  # Print reorder/pn alignment diagnostics
 ) -> Dict[str, object]:
     """
     Two-stage k-center matching: select diverse candidate controls, then optimally assign.
@@ -890,17 +891,39 @@ def two_stage_kcenter_then_match(
 
     # Reorder leaf_controls to match d_nn ordering if necessary
     # We want: row i of d_nn corresponds to leaf_controls_enrolids[i]
+    _debug_alignment = debug_alignment
     if not np.array_equal(leaf_controls_enrolids, dnn_ids):
         id2pos = {int(e): i for i, e in enumerate(leaf_controls_enrolids)}
         perm = np.array([id2pos[int(e)] for e in dnn_ids], dtype=np.int64)
         leaf_controls_enrolids = leaf_controls_enrolids[perm]
         # IMPORTANT: your d_pn extraction later uses leaf_controls_enrolids,
         # so this keeps everything aligned.
+        if _debug_alignment:
+            is_identity = np.array_equal(perm, np.arange(len(perm)))
+            print(f"  [debug_alignment] Reorder applied: permutation is identity = {is_identity}")
+            if not is_identity:
+                n_moved = int(np.sum(perm != np.arange(len(perm))))
+                print(f"  [debug_alignment]   {n_moved}/{len(perm)} positions differ from identity")
+            # Verify post-reorder alignment
+            assert np.array_equal(leaf_controls_enrolids, dnn_ids), (
+                "BUG: leaf_controls_enrolids != dnn_ids after reorder"
+            )
+            print(f"  [debug_alignment]   Post-reorder leaf_controls == dnn_ids: OK")
+    else:
+        if _debug_alignment:
+            print(f"  [debug_alignment] leaf_controls already matches dnn_ids (no reorder needed)")
 
     # ---- Load d^pn ----
     f_pn, d_pn, pn_maj_ids, pn_min_ids = load_pn_hdf5(pn_h5_path)
     pn_maj_id2idx = build_id_to_index(pn_maj_ids)
     pn_min_id2idx = build_id_to_index(pn_min_ids)
+
+    if _debug_alignment:
+        # Verify pn_rows uses the *reordered* control list
+        ctrl_in_pn = sum(1 for e in leaf_controls_enrolids if int(e) in pn_maj_id2idx)
+        case_in_pn = sum(1 for e in leaf_cases_enrolids if int(e) in pn_min_id2idx)
+        print(f"  [debug_alignment] pn lookup: {ctrl_in_pn}/{len(leaf_controls_enrolids)} controls found in pn_maj, "
+              f"{case_in_pn}/{len(leaf_cases_enrolids)} cases found in pn_min")
 
     try:
         pn_rows = np.array([pn_maj_id2idx[int(e)] for e in leaf_controls_enrolids], dtype=np.int64)

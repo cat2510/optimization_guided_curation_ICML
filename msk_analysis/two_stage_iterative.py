@@ -39,7 +39,7 @@ df_msk_spark = spark.read.format("parquet").load("msk_2017_18_full.parquet")
 df_og = df_msk_spark.toPandas()
 
 TRAIN_TEST_SEED = 123
-BASE_DIR = "./sensitivity_quota_cfg_population_binning_150_minbucket"
+BASE_DIR = "./sensitivity_medical_only_features_150_minbucket"
 RESULTS_DIR = os.path.join(BASE_DIR, "results") #undersampled dataset directory
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -53,9 +53,9 @@ SEED_METHOD = "smart"  # Options: "smart", "centroid", "density", "random"
 # Set to None to disable, or a dict to enable:
 #   e.g. dict(enabled=True, T=5, mode="pool_mass", K_per_bin=25)
 QUOTA_CFG = {
-    "enabled": True,
+    "enabled": False,
     "T": 5,
-    "mode": "pool_mass",           # quota computation mode (proportional to bin counts)
+    "mode": "tilted",           # quota computation mode (proportional to bin counts)
     "binning": "population",       # NEW: use population-based cutpoints & quotas
     "pop_S": 50000,                # population subset size (default 50k)
     "pop_subset": "sorted_prefix", # deterministic subset selection
@@ -112,13 +112,28 @@ elif "annual_cost_2018_deflated" in df_og.columns:
     print(f"Created {target_col} using threshold ${threshold:,.2f}")
 else:
     raise ValueError("No 2018 target column found. Need either 'top_2_pct_cost_2018' or 'annual_cost_2018_deflated'")
-
+balanced_pa
 # Exclude all columns containing "2018" from features (to prevent leakage)
 # Also exclude ENROLID and target column
 exclude_cols = ["ENROLID", target_col] + [col for col in df_og.columns 
-if "2018" in col]
+if "2018" in col] + COST_COLUMNS
 feature_cols = [c for c in df_og.columns if c not in exclude_cols]
 
+#TODO try different distance metrics for precompute_distances: 'euclidean' (L2), 'manhattan' (L1), 'chebyshev' (L_infinity)
+DISTANCE_METRIC = "euclidean"  # or "chebyshev" for L_infinity; pass to compute_distances_batched / precompute_leaf_dnn_memmap
+
+# Use a single precomputed distance directory
+DISTANCES_DIR = "./precomputed_distances_msk_medical_only"  # Change this to your preferred directory
+PN_H5_PATH = os.path.join(DISTANCES_DIR, "distances_majority_minority.h5")
+DNN_OUT_DIR = os.path.join(DISTANCES_DIR, f"global_dnn_seed_{TRAIN_TEST_SEED}")
+dnn_matrix_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_matrix.npy")
+dnn_enrolids_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_enrolids.npy")
+
+# Check if required files exist
+if not os.path.exists(PN_H5_PATH):
+    raise FileNotFoundError(f"Distance file not found: {PN_H5_PATH}")
+if not os.path.exists(dnn_matrix_npy) or not os.path.exists(dnn_enrolids_npy):
+    raise FileNotFoundError(f"DNN files not found in {DNN_OUT_DIR}")
 
 # Split data into train/test/val (same as multiobjective_bilevel.ipynb)
 # Use the target_col defined in cell 0
@@ -148,21 +163,6 @@ print(f"Train: {train_pd.shape}, Val: {val_pd.shape}, Test: {test_pd.shape}")
 # ============================================================================
 # CONFIGURATION: Pool size sensitivity analysis
 # ============================================================================
-#TODO try different distance metrics for precompute_distances: 'euclidean' (L2), 'manhattan' (L1), 'chebyshev' (L_infinity)
-DISTANCE_METRIC = "euclidean"  # or "chebyshev" for L_infinity; pass to compute_distances_batched / precompute_leaf_dnn_memmap
-
-# Use a single precomputed distance directory
-DISTANCES_DIR = "./precomputed_distances_msk_with_cost_features"  # Change this to your preferred directory
-PN_H5_PATH = os.path.join(DISTANCES_DIR, "distances_majority_minority.h5")
-DNN_OUT_DIR = os.path.join(DISTANCES_DIR, f"global_dnn_seed_{TRAIN_TEST_SEED}")
-dnn_matrix_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_matrix.npy")
-dnn_enrolids_npy = os.path.join(DNN_OUT_DIR, "leaf_global_dnn_enrolids.npy")
-
-# Check if required files exist
-if not os.path.exists(PN_H5_PATH):
-    raise FileNotFoundError(f"Distance file not found: {PN_H5_PATH}")
-if not os.path.exists(dnn_matrix_npy) or not os.path.exists(dnn_enrolids_npy):
-    raise FileNotFoundError(f"DNN files not found in {DNN_OUT_DIR}")
 
 # Separate minority (cases) and majority (controls)
 cases = train_pd[train_pd[target_col] == 1].copy()
@@ -178,8 +178,8 @@ print(f"  Ratio: {n_controls/n_cases:.2f}:1\n")
 
 # Generate pool sizes M to test
 # Range from n_cases to n_controls//2 in reasonably separated steps
-M_min = n_controls // 2
-M_max = 150000
+M_min = n_controls // 4
+M_max = n_controls // 2
 # Create steps: use approximately 10-15 steps, with larger steps for larger ranges
 num_steps = 4
 if M_max - M_min < num_steps:
@@ -218,7 +218,7 @@ for m_idx, M in enumerate(M_values, 1):
     iteration_start_time = time.perf_counter()
     
     try:
-        """
+        
         # ====================================================================
         # STEP 1: K-CENTER UNDERSAMPLING
         # ====================================================================
@@ -279,12 +279,12 @@ for m_idx, M in enumerate(M_values, 1):
         print(f"     Total samples: {len(undersampled_training_data):,}")
         print(f"     Class distribution:")
         print(undersampled_training_data[target_col].value_counts().sort_index())
-        """
+        
         # Save undersampled dataset
         config_name = f"cw_{CASE_WEIGHTING}_pool_False_seed_{SEED_METHOD}"
         undersample_path = os.path.join(RESULTS_DIR, f"M{M}_{config_name}.csv")
-        #undersampled_training_data.to_csv(undersample_path, index=False)
-        undersampled_training_data = pd.read_csv(undersample_path)
+        undersampled_training_data.to_csv(undersample_path, index=False)
+        #undersampled_training_data = pd.read_csv(undersample_path)
         print(f"     ✓ Loaded undersampled dataset: {undersample_path}")
         
         # ====================================================================
@@ -333,7 +333,6 @@ for m_idx, M in enumerate(M_values, 1):
         total_time = time.perf_counter() - iteration_start_time
         
         print(f"\n  ✓ Model training and evaluation complete:")
-        print(f"     Best params: depth={balanced_params[0]}, minbucket={balanced_params[1]}, cp={balanced_params[2]}")
         print(f"     Total iteration time: {total_time:.2f}s")
         
         if isinstance(metrics, dict):
@@ -349,9 +348,9 @@ for m_idx, M in enumerate(M_values, 1):
             'n_train_samples': len(undersampled_training_data),
             'n_train_minority': (undersampled_training_data[target_col] == 1).sum(),
             'n_train_majority': (undersampled_training_data[target_col] == 0).sum(),
-            'best_depth': balanced_params[0],
-            'best_minbucket': balanced_params[1],
-            'best_cp': balanced_params[2],
+            'best_depth': balanced_params['depth'],
+            'best_minbucket': balanced_params['minbucket'],
+            'best_cp': balanced_params['cp'],
             'matching_time_seconds': 0,
             'training_time_seconds': training_time,
             'evaluation_time_seconds': evaluation_time,
@@ -382,7 +381,7 @@ for m_idx, M in enumerate(M_values, 1):
 # ============================================================================
 # PHASE 2: Test with adaptive pool to find stopping size
 # ============================================================================
-
+"""
 print(f"\n{'='*80}")
 print("PHASE 2: Testing adaptive pool (adaptive_pool=True)")
 print(f"{'='*80}\n")
@@ -532,7 +531,7 @@ except Exception as e:
         'adaptive_pool': True,
         'error': str(e),
     })
-
+"""
 # ============================================================================
 # FINAL COMPARISON
 # ============================================================================

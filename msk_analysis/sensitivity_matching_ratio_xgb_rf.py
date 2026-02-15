@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "distillation_with_OCT"))
 from oct_distillation import compute_minority_metrics
 
 # Matching ratios to sweep: 1, 5, 10, 15, 20
-MATCHING_RATIOS = [1, 5, 10, 15, 20]
+MATCHING_RATIOS =  [1, 5, 10, 15, 20,25,30]
 TRAIN_TEST_SEED = 123
 
 
@@ -82,7 +82,7 @@ def prepare_features_msk(df: pd.DataFrame, target_col: str, drop_high_corr: bool
     return feature_cols, CAT, NUM, BIN
 
 
-def run_one_ratio(
+def kcenter_then_train_xgb_default_no_weight(
     ratio: int,
     train_pd: pd.DataFrame,
     cases: pd.DataFrame,
@@ -153,67 +153,7 @@ def run_one_ratio(
     if verbose:
         print(f"    Saved undersampled: {out_path} (n={len(undersampled)})")
 
-    X_under = undersampled[feature_cols]
-    y_under = undersampled[target_col].values
-
-    preprocessor = get_preprocessor_with_impute(
-        X_under, CAT_COLUMNS, TRUE_NUM_COLUMNS, binary_cols=BIN_FLAG_COLUMNS, verbose=False
-    )
-    preprocessor.fit(X_under)
-
-    X_under_p = preprocessor.transform(X_under)
-    X_val_p = preprocessor.transform(X_val)
-    X_test_p = preprocessor.transform(X_test)
-
-    if model_type == "xgb":
-        import xgboost as xgb
-        n_pos = int(np.sum(y_under == 1))
-        n_neg = int(np.sum(y_under == 0))
-        scale_pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
-        model = xgb.XGBClassifier(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            learning_rate=learning_rate,
-            scale_pos_weight=scale_pos_weight,
-            random_state=random_state,
-            eval_metric="logloss",
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_weight=1,
-            gamma=0.1,
-            reg_alpha=0.1,
-            reg_lambda=0.1,
-            tree_method="hist",
-            early_stopping_rounds=early_stop_rounds,
-        )
-        model.fit(X_under_p, y_under, eval_set=[(X_val_p, y_val)], verbose=False)
-    else:
-        from sklearn.ensemble import RandomForestClassifier
-        model = RandomForestClassifier(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            random_state=random_state,
-            class_weight="balanced",
-            n_jobs=-1,
-        )
-        model.fit(X_under_p, y_under)
-
-    y_test_proba = model.predict_proba(X_test_p)[:, 1]
-    metrics = compute_minority_metrics(y_test, y_test_proba, verbose=False)
-
-    return {
-        "matching_ratio": ratio,
-        "n_train": len(undersampled),
-        "n_train_minority": int((undersampled[target_col] == 1).sum()),
-        "n_train_majority": int((undersampled[target_col] == 0).sum()),
-        "pr_auc": float(metrics["pr_auc"]),
-        "auc": float(metrics["auc"]),
-        "mcc": float(metrics["mcc_optimal"]["mcc"]),
-        "recall_at_gmean": float(metrics["gmean_optimal"]["recall"]),
-        "specificity_at_gmean": float(metrics["gmean_optimal"]["specificity"]),
-        "gmean": float(metrics["gmean_optimal"]["gmean"]),
-    }
-
+    return undersampled
 
 def train_xgb_default_no_weight(
     undersampled_df: pd.DataFrame,
@@ -263,7 +203,15 @@ def train_xgb_default_no_weight(
         "n_train_majority": n_maj,
         "pr_auc": float(metrics["pr_auc"]),
         "auc": float(metrics["auc"]),
+        "recall_at_mcc": float(metrics["mcc_optimal"]["recall"]),
+        "specificity_at_mcc": float(metrics["mcc_optimal"]["specificity"]),
         "mcc": float(metrics["mcc_optimal"]["mcc"]),
+        "recall_at_gmean": float(metrics["gmean_optimal"]["recall"]),
+        "specificity_at_gmean": float(metrics["gmean_optimal"]["specificity"]),
+        "gmean": float(metrics["gmean_optimal"]["gmean"]),
+        "recall_at_f1": float(metrics["f1_optimal"]["recall"]),
+        "specificity_at_f1": float(metrics["f1_optimal"]["specificity"]),
+        "f1": float(metrics["f1_optimal"]["f1"]),
     }
 
 
@@ -318,15 +266,12 @@ def run_comparison_random_vs_kcenter(
     For each ratio, create n_random_seeds random undersamples of the same size, train XGB default no weight.
     Returns (kcenter_rows, random_rows) where each row has matching_ratio, source, pr_auc, auc, mcc, [seed for random].
     """
-    import glob
     kcenter_rows = []
     random_rows = []
     for ratio in ratios:
         path = os.path.join(undersampled_dir, f"ratio_{ratio}.csv")
         if not os.path.exists(path):
-            if verbose:
-                print(f"  Skip ratio {ratio}: {path} not found")
-            continue
+            raise FileNotFoundError(f"Undersampled file not found: {path}")
         under = pd.read_csv(path)
         n_min = int((under[target_col] == 1).sum())
         n_maj = int((under[target_col] == 0).sum())
@@ -374,13 +319,13 @@ def main():
     )
     parser.add_argument("--data", type=str, default="msk_2017_18_full.parquet",
                         help="Path to parquet (relative to cwd or repo)")
-    parser.add_argument("--distances_dir", type=str, default="precomputed_distances_msk_with_cost_features",
+    parser.add_argument("--distances_dir", type=str, default="precomputed_distances_msk_medical_only",
                         help="Directory with distances_majority_minority.h5 and global_dnn_*")
     parser.add_argument("--output_dir", type=str, default="xgb_matching_ratio_results",
                         help="Output dir for undersampled datasets, CSV, and plot")
     parser.add_argument("--model", type=str, default="xgb", choices=["xgb", "rf"])
     parser.add_argument("--ratios", type=int, nargs="+", default=MATCHING_RATIOS,
-                        help="Matching ratios to test (default: 1 5 10 15 20)")
+                        help="Matching ratios to test")
     parser.add_argument("--M", type=int, default=None,
                         help="Pool size M for k-center (default: min(150000, n_controls))")
     parser.add_argument("--seed_method", type=str, default="smart")
@@ -394,7 +339,7 @@ def main():
     parser.add_argument("--no_drop_high_corr", action="store_true", help="Do not drop high-corr features")
     parser.add_argument("--compare_random", action="store_true",
                         help="After k-center run (or using existing undersampled_datasets), train XGB default no weight on k-center data and on 10 random same-size undersamples; save comparison CSV and plot (AUC, PR-AUC, MCC)")
-    parser.add_argument("--n_random_seeds", type=int, default=10,
+    parser.add_argument("--n_random_seeds", type=int, default=5,
                         help="Number of random seeds per ratio for --compare_random (default 10)")
     parser.add_argument("--verbose", action="store_true", default=True)
     args = parser.parse_args()
@@ -467,11 +412,10 @@ def main():
     print(f"Val: {len(X_val):,}, Test: {len(X_test):,}")
     print(f"Model: {args.model}, Ratios: {args.ratios}, M: {M:,}\n")
 
-    all_results = []
     for ratio in args.ratios:
-        print(f"--- Matching ratio 1:{ratio} ---")
-        try:
-            row = run_one_ratio(
+        path = os.path.join(undersampled_dir, f"ratio_{ratio}.csv")
+        if not os.path.exists(path):
+            _ = kcenter_then_train_xgb_default_no_weight(
                 ratio=ratio,
                 train_pd=train_pd,
                 cases=cases,
@@ -499,60 +443,7 @@ def main():
                 seed_method=args.seed_method,
                 undersampled_dir=undersampled_dir,
                 verbose=args.verbose,
-            )
-            if "error" in row:
-                print(f"  Skip: {row['error']}")
-            else:
-                print(f"  Test PR-AUC: {row['pr_auc']:.4f}, AUC: {row['auc']:.4f}, Recall(gmean): {row['recall_at_gmean']:.4f}")
-            all_results.append(row)
-        except Exception as e:
-            print(f"  Error: {e}")
-            import traceback
-            traceback.print_exc()
-            all_results.append({"matching_ratio": ratio, "error": str(e)})
-
-    # Save CSV
-    results_df = pd.DataFrame(all_results)
-    csv_path = os.path.join(args.output_dir, "sensitivity_matching_ratio.csv")
-    results_df.to_csv(csv_path, index=False)
-    print(f"\nSaved results to {csv_path}")
-
-    # Plot: PR-AUC, AUC, recall_at_gmean vs matching_ratio
-    if "error" in results_df.columns:
-        plot_df = results_df[results_df["error"].isna()].copy()
-    else:
-        plot_df = results_df.copy()
-    if len(plot_df) == 0 or "matching_ratio" not in plot_df.columns:
-        plot_df = results_df.copy()
-    plot_df = plot_df.sort_values("matching_ratio")
-
-    if len(plot_df) > 0 and "pr_auc" in plot_df.columns:
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-            fig, ax = plt.subplots(1, 1, figsize=(7, 5))
-            x = plot_df["matching_ratio"].values
-            ax.plot(x, plot_df["pr_auc"], "o-", label="PR-AUC", color="C0")
-            ax.plot(x, plot_df["auc"], "s-", label="AUC", color="C1")
-            if "mcc" in plot_df.columns:
-                ax.plot(x, plot_df["mcc"], "d-", label="MCC", color="C2")
-            ax.plot(x, plot_df["recall_at_gmean"], "^-", label="Recall (at G-mean threshold)", color="C3")
-            ax.set_xlabel("Matching ratio (1:k)")
-            ax.set_ylabel("Score")
-            ax.set_xticks(x)
-            ax.legend()
-            ax.set_title(f"Sensitivity to matching ratio ({args.model}, class-weighted)")
-            ax.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plot_path = os.path.join(args.output_dir, "sensitivity_matching_ratio.png")
-            plt.savefig(plot_path, dpi=150)
-            plt.close()
-            print(f"Saved plot to {plot_path}")
-        except Exception as e:
-            print(f"Plot failed: {e}")
-    else:
-        print("No valid rows to plot.")
+                )
 
     # ----- Compare k-center (no weight) vs random same-size (no weight) -----
     if args.compare_random:
@@ -587,39 +478,67 @@ def main():
             # Save comparison CSV
             comp_df = pd.DataFrame(kcenter_rows + random_rows)
             comp_path = os.path.join(args.output_dir, "comparison_random_vs_kcenter.csv")
-            comp_df.to_csv(comp_path, index=False)
+            if os.path.exists(comp_path):
+                comp_df.to_csv(comp_path, mode='a', header=False, index=False)
+            else:
+                comp_df.to_csv(comp_path, index=False)
             print(f"\nSaved comparison to {comp_path}")
 
-            # Plot: AUC, PR-AUC, MCC - k-center line vs random mean ± std
+            # Plot: AUC, PR-AUC - k-center line vs random mean ± std
             if len(kcenter_rows) > 0 and len(random_rows) > 0:
-                try:
-                    import matplotlib
-                    matplotlib.use("Agg")
-                    import matplotlib.pyplot as plt
-                    kc_df = pd.DataFrame(kcenter_rows).sort_values("matching_ratio")
-                    rnd_df = pd.DataFrame(random_rows)
-                    ratios_plot = sorted(kc_df["matching_ratio"].unique())
-                    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-                    for ax, metric in zip(axes, ["pr_auc", "auc", "mcc"]):
-                        ax.plot(kc_df["matching_ratio"], kc_df[metric], "o-", label="k-center (no weight)", color="C0", linewidth=2)
-                        rnd_agg = rnd_df.groupby("matching_ratio")[metric].agg(["mean", "std"])
-                        rnd_agg = rnd_agg.reindex(ratios_plot)
-                        means = rnd_agg["mean"].values
-                        stds = rnd_agg["std"].values
-                        ax.errorbar(ratios_plot, means, yerr=stds, fmt="s--", capsize=4, label=f"random (no weight, n={args.n_random_seeds} seeds)", color="C1")
-                        ax.set_xlabel("Matching ratio (1:k)")
-                        ax.set_ylabel(metric.upper().replace("_", "-"))
-                        ax.set_xticks(ratios_plot)
-                        ax.legend(fontsize=8)
-                        ax.grid(True, alpha=0.3)
-                    plt.suptitle("XGB default (no class weight): k-center vs random same-size undersample")
-                    plt.tight_layout()
-                    comp_plot_path = os.path.join(args.output_dir, "comparison_random_vs_kcenter.png")
-                    plt.savefig(comp_plot_path, dpi=150)
-                    plt.close()
-                    print(f"Saved comparison plot to {comp_plot_path}")
-                except Exception as e:
-                    print(f"Comparison plot failed: {e}")
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                kc_df = pd.DataFrame(kcenter_rows).sort_values("matching_ratio")
+                rnd_df = pd.DataFrame(random_rows)
+                ratios_plot = sorted(kc_df["matching_ratio"].unique())
+                fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+                for ax, metric in zip(axes, ["pr_auc", "auc"]):
+                    ax.plot(kc_df["matching_ratio"], kc_df[metric], "o-", label="k-center (no weight)", color="C0", linewidth=2)
+                    rnd_agg = rnd_df.groupby("matching_ratio")[metric].agg(["mean", "std"])
+                    rnd_agg = rnd_agg.reindex(ratios_plot)
+                    means = rnd_agg["mean"].values
+                    stds = rnd_agg["std"].values
+                    ax.errorbar(ratios_plot, means, yerr=stds, fmt="s--", capsize=4, label=f"random (no weight, n={args.n_random_seeds} seeds)", color="C1")
+                    ax.set_xlabel("Matching ratio (1:k)")
+                    ax.set_ylabel(metric.upper().replace("_", "-"))
+                    ax.set_xticks(ratios_plot)
+                    ax.legend(fontsize=8)
+                    ax.grid(True, alpha=0.3)
+                plt.suptitle("XGB default (no class weight): k-center vs random same-size undersample")
+                plt.tight_layout()
+                comp_plot_path = os.path.join(args.output_dir, "random_vs_kcenter_auc_pr_auc_xgb.png")
+                plt.savefig(comp_plot_path, dpi=150)
+                plt.close()
+                print(f"Saved comparison plot to {comp_plot_path}")
+                # Plot: Recall(G-mean), specificity(G-mean), recall(MCC), specificity(MCC), recall(F1), specificity(F1) - k-center line vs random mean ± std
+                kc_df = pd.DataFrame(kcenter_rows).sort_values("matching_ratio")
+                rnd_df = pd.DataFrame(random_rows)
+                ratios_plot = sorted(kc_df["matching_ratio"].unique())
+                fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+                for ax, metric in zip(axes, [("recall_at_gmean", "specificity_at_gmean"), ("recall_at_mcc", "specificity_at_mcc"), ("recall_at_f1", "specificity_at_f1")]):
+                    ax.plot(kc_df["matching_ratio"], kc_df[metric[0]], "o-", label="recall (k-center)", color="C0", linewidth=2)
+                    ax.plot(kc_df["matching_ratio"], kc_df[metric[1]], "s-", label="specificity (k-center)", color="C0", linewidth=2)
+                    rnd_agg = rnd_df.groupby("matching_ratio")[metric[0]].agg(["mean", "std"])
+                    rnd_agg2 = rnd_df.groupby("matching_ratio")[metric[1]].agg(["mean", "std"])
+                    rnd_agg = rnd_agg.reindex(ratios_plot)
+                    rnd_agg2 = rnd_agg2.reindex(ratios_plot)
+                    means, means2 = rnd_agg["mean"].values, rnd_agg2["mean"].values
+                    stds, stds2 = rnd_agg["std"].values, rnd_agg2["std"].values
+                    ax.errorbar(ratios_plot, means, yerr=stds, fmt="o--", capsize=4, label=f"recall (random)", color="C1")
+                    ax.errorbar(ratios_plot, means2, yerr=stds2, fmt="s--", capsize=4, label=f"specificity (random)", color="C1")
+                    ax.set_xlabel("Matching ratio (1:k)")
+                    ax.set_ylabel(metric[0].upper().replace("_", "-"))
+                    ax.set_xticks(ratios_plot)
+                    ax.legend(fontsize=8)
+                    ax.grid(True, alpha=0.3)
+          
+                plt.suptitle("XGB default (no class weight): k-center vs random same-size undersample")
+                plt.tight_layout()
+                comp_plot_path = os.path.join(args.output_dir, "random_vs_kcenter_recall_xgb.png")
+                plt.savefig(comp_plot_path, dpi=150)
+                plt.close()
+                print(f"Saved comparison plot to {comp_plot_path}")
 
     print("Done.")
 
