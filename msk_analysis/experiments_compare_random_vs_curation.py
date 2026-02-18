@@ -479,17 +479,17 @@ def parse_args():
     p = argparse.ArgumentParser(description="Compare random vs curation experiments")
     p.add_argument("--seeds", type=str, default="0",
                    help="Comma-separated seeds (default: 0)")
-    p.add_argument("--outdir", type=str, default="./exp_random_vs_curation_medical_only_features",
+    p.add_argument("--outdir", type=str, default="./exp_random_vs_curation_all_features_smart_seed",
                    help="Output directory")
     p.add_argument("--stageA_seed_method", choices=["centroid", "density", "random", "smart"],
-                   default="random", help="Stage A seed selection")
+                   default="smart", help="Stage A seed selection")
     p.add_argument("--M_pool", type=int, default=None,
                    help="Candidate pool size (default: n_controls//2))")
     p.add_argument("--quota_enabled", action="store_true", help="Enable quota constraints") #- Sets to True when present (default: False)
     p.add_argument("--parquet_path", type=str, default="msk_2017_18_full.parquet")
     p.add_argument("--distances_dir", type=str,
                    default="./precomputed_distances_msk_medical_only") 
-    p.add_argument("--feature_set", type=str, default="medical_only", choices=["medical_only", "all_cost", "less_cost"])
+    p.add_argument("--feature_set", type=str, default="all_cost", choices=["medical_only", "all_cost", "less_cost"])
     p.add_argument("--resume", action="store_true", #- Sets to True when present (default: False)
                    help="Skip runs already in experiment_summary.csv; load training CSV when it exists")
     p.add_argument("--debug_alignment", action="store_true",

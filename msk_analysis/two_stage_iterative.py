@@ -112,7 +112,6 @@ elif "annual_cost_2018_deflated" in df_og.columns:
     print(f"Created {target_col} using threshold ${threshold:,.2f}")
 else:
     raise ValueError("No 2018 target column found. Need either 'top_2_pct_cost_2018' or 'annual_cost_2018_deflated'")
-balanced_pa
 # Exclude all columns containing "2018" from features (to prevent leakage)
 # Also exclude ENROLID and target column
 exclude_cols = ["ENROLID", target_col] + [col for col in df_og.columns 
