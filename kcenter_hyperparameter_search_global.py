@@ -32,12 +32,11 @@ except ImportError:
     print("Warning: psutil not available. Resource tracking will be limited.")
 
 # Import custom modules
-import model_pipeline
-import model_IAI
-import two_stage_kcenter_match
-from two_stage_kcenter_match import two_stage_kcenter_then_match
-from precompute_distances import precompute_leaf_dnn_memmap
-from model_pipeline import get_preprocessor, get_bin_flag_columns
+import public.model_IAI
+import public.two_stage_kcenter_match
+from public.two_stage_kcenter_match import two_stage_kcenter_then_match
+from public.precompute_distances import precompute_leaf_dnn_memmap
+from public.model_IAI import get_preprocessor_with_impute,train_test_split_enrol, get_bin_flag_columns, get_cat_columns, get_true_num_columns
 from sklearn.impute import SimpleImputer
 
 # ============================================================================
@@ -196,10 +195,11 @@ def run_global_kcenter_matching(
     bin_feats = get_bin_flag_columns(controls_preprocessed)
     num_feats = [c for c in numeric_cols if c not in bin_feats]
     
-    preprocessor_controls = get_preprocessor(
-        df=controls_preprocessed,
+    preprocessor_controls = get_preprocessor_with_impute(
+        X_train=controls_preprocessed,
         categorical_cols=categorical_cols,
         numeric_cols=num_feats,
+        binary_cols=bin_feats,
         verbose=False
     )
     X_majority = preprocessor_controls.fit_transform(controls_preprocessed)
@@ -401,7 +401,7 @@ def train_and_evaluate_oct(
     print(f"TRAINING OCT MODEL: {config_name}")
     print(f"{'='*80}\n")
     
-    from model_IAI import finetune_oct, evaluate_binary_oct
+    from public.model_IAI import finetune_oct, evaluate_binary_oct
     
     # Track resources before training
     resources_before = get_resource_usage()
@@ -488,12 +488,12 @@ def main():
     print(f"✓ Loaded original data: {df_og.shape}")
     
     # Setup columns (same as notebook)
-    BIN_FLAG_COLUMNS = model_pipeline.get_bin_flag_columns(df_og) + [
+    BIN_FLAG_COLUMNS = get_bin_flag_columns(df_og) + [
         'lab_monitoring_adherent', 'nephrology_consult_adherent', 'early_nephrology_referral'
     ]
     STAGE_COLUMNS = [col for col in df_og.columns if "stage" in col.lower()]
     CAT_COLUMNS = df_og.select_dtypes(include=["object", "category"]).columns.tolist()
-    TRUE_NUM_COLUMNS = model_pipeline.get_true_num_columns(df_og, CAT_COLUMNS) + [
+    TRUE_NUM_COLUMNS = get_true_num_columns(df_og, CAT_COLUMNS) + [
         'util_2017', 'total_increasing_quarters_2017', 'total_lab_tests', 
         'ckd_visit_count', 'quarters_with_labs', 'nephrology_visit_count', 
         'days_to_nephrology', 'MEDIAN_INCOME'
@@ -530,10 +530,10 @@ def main():
     print(f"✓ Feature columns: {len(feature_cols)}")
     
     # Train/test split
-    train_ids, test_ids, train_pd, test_pd = model_pipeline.train_test_split_enrol(
+    train_ids, test_ids, train_pd, test_pd =train_test_split_enrol(
         df_og, target_col="cost_stratum_2018", test_size=0.3, verbose=False, random_state=TRAIN_TEST_SEED
     )
-    val_ids, test_ids, val_pd, test_pd = model_pipeline.train_test_split_enrol(
+    val_ids, test_ids, val_pd, test_pd = train_test_split_enrol(
         test_pd, target_col=TARGET_COL, test_size=0.5, verbose=False,random_state=TRAIN_TEST_SEED
     )
     
