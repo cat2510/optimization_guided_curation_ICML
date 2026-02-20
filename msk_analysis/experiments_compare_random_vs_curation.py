@@ -5,10 +5,11 @@ experiments_compare_random_vs_curation.py
 Three experiments to diagnose when/why optimal curation underperforms
 random undersampling.
 
-Experiments:
+Experiment 3:
   1. Stage A only: k-center dispersed 2N controls vs random 2N
   2. Stage B 1:2 matching: full two-stage with matching_ratio=2 vs random
   3. Stage B 1:1 + extra dispersed: N matched + N dispersed vs random
++ Extended with Exp4–Exp12 (matched + {random/max_dispersed} multiples).
 
 All use same data split, OCT pipeline, and training set size (N cases + 2N controls).
 
@@ -37,8 +38,16 @@ import sys
 import os
 import argparse
 import time
+import json as _json
 import traceback
 from typing import List, Optional, Tuple
+
+# #region agent log
+_DEBUG_LOG_PATH = "/Users/cat2510/my_projects/.cursor/debug-d2e558.log"
+def _dbg(msg, data=None, hyp=None):
+    with open(_DEBUG_LOG_PATH, "a") as _f:
+        _f.write(_json.dumps({"sessionId": "d2e558", "message": msg, "data": data or {}, "hypothesisId": hyp, "timestamp": int(time.time() * 1000)}) + "\n")
+# #endregion
 
 import numpy as np
 import pandas as pd
@@ -392,6 +401,11 @@ def load_metrics_from_predictions(
     gmean_recall = balanced["gmean_opt"]["recall"]
     gmean_specificity = balanced["gmean_opt"]["specificity"]
 
+    from sklearn.metrics import precision_recall_curve, f1_score
+    prec_curve, rec_curve, thresholds_pr = precision_recall_curve(y_test_arr, y_proba)
+    f1_scores = 2 * prec_curve * rec_curve / (prec_curve + rec_curve + 1e-10)
+    optimal_f1 = float(f1_scores.max())
+
     num_leaves = int(pred_df["leaf_assignment"].nunique()) if "leaf_assignment" in pred_df.columns else np.nan
 
     return {
@@ -399,7 +413,9 @@ def load_metrics_from_predictions(
         "pr_auc": pr_auc,
         "best_mcc": best_mcc,
         "recall_mcc": recall_mcc,
+        "specificity_mcc": specificity_mcc,
         "precision_mcc": tp / (tp + fp) if (tp + fp) > 0 else 0.0,
+        "optimal_f1": optimal_f1,
         "balanced_recall_gmean": gmean_recall,
         "balanced_specificity_gmean": gmean_specificity,
         "num_leaves": num_leaves,
@@ -488,7 +504,7 @@ def parse_args():
     p.add_argument("--quota_enabled", action="store_true", help="Enable quota constraints") #- Sets to True when present (default: False)
     p.add_argument("--parquet_path", type=str, default="msk_2017_18_full.parquet")
     p.add_argument("--distances_dir", type=str,
-                   default="./precomputed_distances_msk_medical_only") 
+                   default="./precomputed_distances_msk_with_cost_features") 
     p.add_argument("--feature_set", type=str, default="all_cost", choices=["medical_only", "all_cost", "less_cost"])
     p.add_argument("--resume", action="store_true", #- Sets to True when present (default: False)
                    help="Skip runs already in experiment_summary.csv; load training CSV when it exists")
@@ -617,6 +633,99 @@ def main():
     all_rows = []
     K = 2 * N  # target majority count
     preds_dir = os.path.join(results_dir, "predictions")
+    cache_dir = os.path.join(results_dir, "cache_ids")
+    os.makedirs(cache_dir, exist_ok=True)
+    # ------------------------------------------------------------------
+    # Caching helpers for Exp4–Exp12
+    # ------------------------------------------------------------------
+    def _cache_path(name: str, seed: int) -> str:
+        return os.path.join(cache_dir, f"{name}_s{seed}.npy")
+
+    def load_or_compute_ids(name: str, seed: int, compute_fn) -> np.ndarray:
+        """Load cached IDs from .npy if available, otherwise compute, cache, and return."""
+        path = _cache_path(name, seed)
+        if os.path.exists(path):
+            ids = np.load(path)
+            print(f"    [cache] Loaded {len(ids)} IDs from {os.path.basename(path)}")
+            return ids
+        ids = compute_fn()
+        np.save(path, ids)
+        print(f"    [cache] Saved {len(ids)} IDs to {os.path.basename(path)}")
+        return ids
+
+    def get_matched_1N(seed: int) -> np.ndarray:
+        """Stage B 1:1 matched controls (exactly N unique ids). Cached."""
+        name = f"matched_1N_seedmethod_{args.stageA_seed_method}_Mpool_{M_pool}"
+        return load_or_compute_ids(name, seed, lambda: sample_stageB_matched_controls(
+            control_enrolids, case_enrolids, dnn_matrix, dnn_enrolids, pn_h5,
+            target_count=N, matching_ratio=1, M_pool=M_pool,
+            seed_method=args.stageA_seed_method, seed=seed,
+            quota_cfg=quota_cfg, X_majority_leaf=X_majority_leaf, verbose=True,
+        ))
+    def get_stageA_order(seed: int, k_max: int) -> np.ndarray:
+        """
+        Stage A farthest-first order up to k_max (on full control pool).
+        Cached once per seed; used to take prefixes for 2N/3N/…/10N extras
+        without forming restricted-pool submatrices.
+        """
+        name = f"stageA_order_k{k_max}_seedmethod_{args.stageA_seed_method}_Mpool_{M_pool}"
+        def _compute():
+            ids, _ = sample_stageA_dispersed_controls(
+                control_enrolids, dnn_matrix, dnn_enrolids, pn_h5,
+                case_enrolids, k_max, args.stageA_seed_method, seed, M_pool,
+                X_majority_leaf=X_majority_leaf, verbose=True,
+            )
+            return ids
+        return load_or_compute_ids(name, seed, _compute)
+    def get_random_perm_excluding(seed: int, exclude_ids: np.ndarray) -> np.ndarray:
+        """
+        Deterministic permutation of remaining controls (excluding exclude_ids),
+        so Exp5/7/9/11 are nested prefixes.
+        """
+        exclude = set(int(x) for x in exclude_ids)
+        remaining = np.array([e for e in control_enrolids if int(e) not in exclude], dtype=np.int64)
+        rng = np.random.RandomState(seed + 202603)  # stable offset
+        perm = rng.permutation(remaining)
+        return perm
+    def take_first_k_excluding(order: np.ndarray, exclude_ids: np.ndarray, k: int) -> np.ndarray:
+        """Take first k ids from `order` that are not in exclude_ids."""
+        exclude = set(int(x) for x in exclude_ids)
+        out = []
+        for eid in order:
+            ie = int(eid)
+            if ie in exclude:
+                continue
+            out.append(ie)
+            if len(out) >= k:
+                break
+        return np.array(out, dtype=np.int64)
+
+    # ------------------------------------------------------------------
+    # Exp4–Exp12 spec: total training = N cases + (1N matched) + (mN extras)
+    # ------------------------------------------------------------------
+    EXP_SPECS = [
+        ("exp4",  "random",        1),
+        ("exp5",  "random",        2),
+        ("exp6",  "max_dispersed", 2),
+        ("exp7",  "random",        3),
+        ("exp8",  "max_dispersed", 3),
+        ("exp9",  "random",        5),
+        ("exp10", "max_dispersed", 5),
+        ("exp11", "random",        10),
+        ("exp12", "max_dispersed", 10),
+    ]
+    MAX_MULT = max(m for _, _, m in EXP_SPECS)
+    # For max_dispersed extras: compute a long Stage A order once,
+    # long enough that after removing matched we can still take MAX_MULT*N.
+    # Slack helps in case StageA order contains many matched ids early.
+    STAGEA_SLACK = 512
+    STAGEA_KMAX = min(M_pool, len(control_enrolids), (1 + MAX_MULT) * N + STAGEA_SLACK)
+
+    if (1 + MAX_MULT) * N > len(control_enrolids):
+        raise ValueError(
+            f"Not enough controls for largest experiment: need {(1+MAX_MULT)*N}, "
+            f"have {len(control_enrolids)}"
+        )
 
     def _pred_path(exp_name, variant, seed):
         return os.path.join(preds_dir, f"oct_predictions_{exp_name}_{variant}_s{seed}.csv")
@@ -813,10 +922,101 @@ def main():
             traceback.print_exc()
             all_rows.append({"experiment": exp_name, "variant": "error", "seed": seed, "error": str(e)})
 
+    # ------------------------------------------------------------------
+    # Exp4–Exp12: N cases + N matched + mN extras (random or max_dispersed)
+    # ------------------------------------------------------------------
+    print("\n" + "#" * 80)
+    print("EXPERIMENTS 4–12: Matched + {Random/Max-Dispersed} Extras")
+    print("#" * 80)
+    for (exp_name, extra_type, mult) in EXP_SPECS:
+        print("\n" + "#" * 80)
+        print(f"{exp_name.upper()}: 1N minority + 1N matched + {mult}N {extra_type}")
+        print("#" * 80)
+        for seed in seeds:
+            print(f"\n  --- seed={seed} ---")
+            variant = f"matched_1N_plus_{mult}N_{extra_type}"
+            pred_path = _pred_path(exp_name, variant, seed)
+            total_controls = (1 + mult) * N
+            try:
+                if args.resume and os.path.exists(pred_path):
+                    m = load_metrics_from_predictions(pred_path, test_pd[target_col])
+                    all_rows.append({
+                        "experiment": exp_name, "variant": variant, "seed": seed,
+                        "n_cases": N, "n_controls": total_controls, **m,
+                    })
+                    print(f"    {variant}: SKIP (loaded) PR-AUC={m.get('pr_auc', 0):.4f}")
+                    continue
+
+                # 1) matched 1N (cached)
+                match_ids = get_matched_1N(seed)
+                # #region agent log
+                _dbg("matched_1N", {"exp": exp_name, "seed": seed, "n_unique": int(len(np.unique(match_ids))), "expected_N": N}, hyp="H1")
+                # #endregion
+                if len(np.unique(match_ids)) != N:
+                    raise AssertionError(f"{exp_name}: matched_ids not unique or wrong size: {len(np.unique(match_ids))} vs N={N}")
+
+                # 2) extras
+                if extra_type == "random":
+                    perm = get_random_perm_excluding(seed, match_ids)
+                    extra_k = mult * N
+                    extra_ids = perm[:extra_k].astype(np.int64)
+                elif extra_type == "max_dispersed":
+                    stageA_order = get_stageA_order(seed, STAGEA_KMAX)
+                    extra_k = mult * N
+                    extra_ids = take_first_k_excluding(stageA_order, match_ids, extra_k)
+                    if len(extra_ids) < extra_k:
+                        # deterministic top-up from random remaining
+                        perm = get_random_perm_excluding(seed, np.concatenate([match_ids, extra_ids]))
+                        need = extra_k - len(extra_ids)
+                        extra_ids = np.concatenate([extra_ids, perm[:need]]).astype(np.int64)
+                else:
+                    raise ValueError(f"Unknown extra_type: {extra_type}")
+
+                # 3) combine controls (no overlap by construction)
+                ctrl_ids = np.concatenate([match_ids, extra_ids]).astype(np.int64)
+                overlap = len(set(int(x) for x in match_ids) & set(int(x) for x in extra_ids))
+                ctrl_ids = np.unique(ctrl_ids)
+                # #region agent log
+                _dbg("combine_controls", {"exp": exp_name, "seed": seed, "mult": mult, "extra_type": extra_type, "n_match": len(match_ids), "n_extra": len(extra_ids), "overlap": overlap, "n_unique_ctrl": int(len(ctrl_ids)), "expected": int(total_controls)}, hyp="H2,H3")
+                # #endregion
+                if len(ctrl_ids) != total_controls:
+                    raise AssertionError(
+                        f"{exp_name}: expected {total_controls} controls, got {len(ctrl_ids)} "
+                        f"(overlap or shortage)."
+                    )
+                def _create_train():
+                    return pd.concat([
+                        cases,
+                        controls[controls["ENROLID"].isin(ctrl_ids)],
+                ], ignore_index=True)
+                train_df = _load_or_create_train(exp_name, variant, seed, _create_train)
+                # #region agent log
+                n_cases_train = int((train_df[target_col] == 1).sum())
+                n_ctrl_train = int((train_df[target_col] == 0).sum())
+                _dbg("train_df_composition", {"exp": exp_name, "seed": seed, "n_cases": n_cases_train, "n_controls": n_ctrl_train, "total": len(train_df), "expected_cases": N, "expected_controls": int(total_controls)}, hyp="H4")
+                # #endregion
+                m = train_and_evaluate_oct(
+                    train_df, val_pd, test_pd, feature_cols, target_col,
+                    CAT_COLUMNS, TRUE_NUM_COLUMNS, BIN_FLAG_COLUMNS,
+                    results_dir, f"{exp_name}_{variant}_s{seed}", TRAIN_TEST_SEED,
+                )
+                all_rows.append({
+                    "experiment": exp_name, "variant": variant, "seed": seed,
+                    "n_cases": N, "n_controls": total_controls, **m,
+                })
+                # #region agent log
+                _dbg("exp_complete", {"exp": exp_name, "seed": seed, "pr_auc": m.get("pr_auc"), "auc": m.get("auc"), "best_mcc": m.get("best_mcc")}, hyp="H5")
+                # #endregion
+                print(f"    {variant}: PR-AUC={m.get('pr_auc', 0):.4f} AUC={m.get('auc', 0):.4f}")
+            except Exception as e:
+                print(f"    ERROR: {e}")
+                traceback.print_exc()
+                all_rows.append({"experiment": exp_name, "variant": variant, "seed": seed, "error": str(e)})
+
     # ----- Save summary -----
     df_out = pd.DataFrame(all_rows)
     summary_path = os.path.join(results_dir, "experiment_summary.csv")
-    df_out.to_csv(summary_path, index=False)
+    df_out.to_csv(summary_path,mode='a', index=False, header=not os.path.exists(summary_path))
     print(f"\nSaved {len(df_out)} rows to {summary_path}")
 
     agg = df_out.groupby(["experiment", "variant"]).agg({
@@ -835,3 +1035,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

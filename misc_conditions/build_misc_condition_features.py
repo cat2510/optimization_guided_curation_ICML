@@ -147,8 +147,8 @@ def build_icd_onehot(
     df_claims: DataFrame,
     baseline_year: int,
     condition_regex: str,
-    k_condition: int = 25,
-    k_comorb: int = 25,
+    k_condition: int = 3,
+    k_comorb: int = 20,
     enrolid_col: str = "ENROLID",
     date_col: str = "SVCDATE",
 ) -> Tuple[DataFrame, List[str], List[str]]:
@@ -264,7 +264,7 @@ def build_medication_onehot(
     df_redbook: DataFrame,
     cohort_enrollees: DataFrame,
     baseline_year: int,
-    topk_thercls: int = 50,
+    topk_thercls: int = 20,
     enrolid_col: str = "ENROLID",
     date_col: str = "SVCDATE",
 ) -> Tuple[DataFrame, Dict[str, str], List[str]]:

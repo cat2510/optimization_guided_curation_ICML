@@ -502,7 +502,7 @@ def main():
             eval_start = time.perf_counter()
             save_sfx = (
                 f"curated_r{ratio:.2f}_"
-                f"{params[0]}_{params[1]}_{params[2]}"
+                f"{params['depth']}_{params['minbucket']}_{params['cp']}"
             )
             metrics = evaluate_binary_oct(
                 model,
@@ -541,9 +541,9 @@ def main():
                 "M_pool": args.M_pool,
                 "case_subset_mode": args.case_subset_mode,
                 "matching_mean_cost": mean_match_cost,
-                "best_depth": params[0],
-                "best_minbucket": params[1],
-                "best_cp": params[2],
+                "best_depth": params['depth'],
+                "best_minbucket": params['minbucket'],
+                "best_cp": params['cp'],
                 "val_pr_auc": val_pr_auc,
                 "test_auc": metrics.get("auc"),
                 "test_pr_auc": metrics.get("pr_auc"),
@@ -646,7 +646,7 @@ def main():
                 eval_start = time.perf_counter()
                 save_sfx = (
                     f"random_r{ratio:.2f}_s{seed}_"
-                    f"{params[0]}_{params[1]}_{params[2]}"
+                    f"{params['depth']}_{params['minbucket']}_{params['cp']}"
                 )
                 metrics = evaluate_binary_oct(
                     model,
@@ -685,9 +685,9 @@ def main():
                     "M_pool": np.nan,
                     "case_subset_mode": np.nan,
                     "matching_mean_cost": np.nan,
-                    "best_depth": params[0],
-                    "best_minbucket": params[1],
-                    "best_cp": params[2],
+                    "best_depth": params['depth'],
+                    "best_minbucket": params['minbucket'],
+                    "best_cp": params['cp'],
                     "val_pr_auc": val_pr_auc,
                     "test_auc": metrics.get("auc"),
                     "test_pr_auc": metrics.get("pr_auc"),
