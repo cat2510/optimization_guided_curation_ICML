@@ -26,7 +26,6 @@ Usage
     --outdir          Output directory (default: ./exp_random_vs_curation)
     --stageA_seed_method  {centroid,density,random,smart} (default: centroid)
     --M_pool          Candidate pool size for Stage A/B (default: min(50000, n_controls))
-    --quota_enabled   Enable quota constraints (default: False)
     --parquet_path    Path to parquet dataset (default: msk_2017_18_full.parquet)
     --distances_dir   Precomputed distances directory
     --debug_alignment Run ID-alignment diagnostics and hard assertions, then exit
@@ -71,6 +70,7 @@ try:
         choose_seed_centroid,
         choose_seed_max_density,
         choose_seed_closest_to_positives_from_pn,
+        kmeanspp_metric_indices,
     )
 except ImportError:
     if parent_dir not in sys.path:
@@ -154,11 +154,7 @@ def sample_stageA_dispersed_controls(
         raise ValueError("dnn_ids must be subset of leaf_controls_enrolids")
     # d_nn rows/cols correspond to dnn_ids; leaf_controls may differ
     n_avail = d_nn.shape[0]
-    M_eff = min(k, M_pool, n_avail)
-    if M_eff < k and verbose:
-        print(f"  [Stage A] WARNING: M_pool/k cap: requested k={k}, using M_eff={M_eff}")
-
-    k_eff = min(k, M_eff, n_avail)
+    k_eff = min(k, M_pool, n_avail)
     if k_eff != k and verbose:
         print(f"  [Stage A] WARNING: requested k={k}, available {n_avail}; using k_eff={k_eff}")
 
@@ -197,7 +193,9 @@ def sample_stageA_dispersed_controls(
         raise ValueError(f"Unknown seed_method: {seed_method}")
 
     # Run k-center
-    cand_idx = farthest_first_kcenter_indices(d_nn, k_eff, seed_idx)
+    rng = np.random.RandomState(seed + 1337)  # offset avoids coupling to other random uses
+    cand_idx = kmeanspp_metric_indices(d_nn, k_eff, seed_idx, rng)
+    #cand_idx = farthest_first_kcenter_indices(d_nn, k_eff, seed_idx)
     selected_enrolids = dnn_ids[cand_idx]
 
     # Mean min distance from selected controls to their nearest case (for logging)
@@ -217,7 +215,6 @@ def sample_stageB_matched_controls(
     M_pool: int,
     seed_method: str,
     seed: int,
-    quota_cfg: Optional[dict],
     X_majority_leaf: Optional[np.ndarray] = None,
     verbose: bool = True,
 ) -> np.ndarray:
@@ -238,6 +235,7 @@ def sample_stageB_matched_controls(
         leaf_nn_enrolids_npy=leaf_nn_enrolids_npy,
         pn_h5_path=pn_h5_path,
         M=M_eff,
+        use_kmeanspp=True,
         use_adaptive_pool=False,
         force_nearest_per_case=False,
         force_topm=1,
@@ -246,7 +244,6 @@ def sample_stageB_matched_controls(
         random_state=seed,
         matching_ratio=matching_ratio,
         case_weighting=None,
-        quota_cfg=quota_cfg,
         X_majority_leaf=X_majority_leaf,
     )
 
@@ -363,7 +360,9 @@ def sample_stageA_on_restricted_pool(
     else:
         seed_idx = choose_seed_random(len(remaining_ids), random_state=seed)
 
-    cand_idx = farthest_first_kcenter_indices(d_nn_sub, k, seed_idx)
+    #cand_idx = farthest_first_kcenter_indices(d_nn_sub, k, seed_idx)
+    rng = np.random.RandomState(seed + 1337)  # offset avoids coupling to other random uses
+    cand_idx = kmeanspp_metric_indices(d_nn_sub, k, seed_idx, rng)
     return remaining_ids[cand_idx]
 
 
@@ -495,16 +494,15 @@ def parse_args():
     p = argparse.ArgumentParser(description="Compare random vs curation experiments")
     p.add_argument("--seeds", type=str, default="0",
                    help="Comma-separated seeds (default: 0)")
-    p.add_argument("--outdir", type=str, default="./exp_random_vs_curation_all_features_smart_seed",
+    p.add_argument("--outdir", type=str, default="./kmeanspp_exp_random_vs_curation_medical_only_for_prediction",
                    help="Output directory")
     p.add_argument("--stageA_seed_method", choices=["centroid", "density", "random", "smart"],
                    default="smart", help="Stage A seed selection")
     p.add_argument("--M_pool", type=int, default=None,
                    help="Candidate pool size (default: n_controls//2))")
-    p.add_argument("--quota_enabled", action="store_true", help="Enable quota constraints") #- Sets to True when present (default: False)
     p.add_argument("--parquet_path", type=str, default="msk_2017_18_full.parquet")
     p.add_argument("--distances_dir", type=str,
-                   default="./precomputed_distances_msk_with_cost_features") 
+                   default="./precomputed_distances_msk_medical_only") 
     p.add_argument("--feature_set", type=str, default="all_cost", choices=["medical_only", "all_cost", "less_cost"])
     p.add_argument("--resume", action="store_true", #- Sets to True when present (default: False)
                    help="Skip runs already in experiment_summary.csv; load training CSV when it exists")
@@ -520,14 +518,11 @@ def main():
     results_dir = os.path.join(outdir, "results")
     os.makedirs(results_dir, exist_ok=True)
 
-    quota_cfg = {"enabled": True, "T": 5, "mode": "pool_mass", "K_per_bin": 25} if args.quota_enabled else None
-
     print("=" * 80)
     print("EXPERIMENTS: Random vs Curation")
     print("=" * 80)
     print(f"  Seeds: {seeds}")
     print(f"  Stage A seed method: {args.stageA_seed_method}")
-    print(f"  Quota enabled: {args.quota_enabled}")
     print()
 
     # Load data (same as two_stage_iterative)
@@ -660,7 +655,7 @@ def main():
             control_enrolids, case_enrolids, dnn_matrix, dnn_enrolids, pn_h5,
             target_count=N, matching_ratio=1, M_pool=M_pool,
             seed_method=args.stageA_seed_method, seed=seed,
-            quota_cfg=quota_cfg, X_majority_leaf=X_majority_leaf, verbose=True,
+            X_majority_leaf=X_majority_leaf, verbose=True,
         ))
     def get_stageA_order(seed: int, k_max: int) -> np.ndarray:
         """
@@ -840,7 +835,7 @@ def main():
                 stageB_ids = sample_stageB_matched_controls(
                     control_enrolids, case_enrolids, dnn_matrix, dnn_enrolids, pn_h5,
                     K, matching_ratio=2, M_pool=M_pool, seed_method=args.stageA_seed_method,
-                    seed=seed, quota_cfg=quota_cfg, X_majority_leaf=X_majority_leaf, verbose=True,
+                    seed=seed, X_majority_leaf=X_majority_leaf, verbose=True,
                 )
 
                 def _create_stageB():
@@ -886,7 +881,7 @@ def main():
                 match_ids = sample_stageB_matched_controls(
                     control_enrolids, case_enrolids, dnn_matrix, dnn_enrolids, pn_h5,
                     N, matching_ratio=1, M_pool=M_pool, seed_method=args.stageA_seed_method,
-                    seed=seed, quota_cfg=quota_cfg, X_majority_leaf=X_majority_leaf, verbose=True,
+                    seed=seed, X_majority_leaf=X_majority_leaf, verbose=True,
                 )
                 # N dispersed from remaining
                 disp_ids = sample_stageA_on_restricted_pool(
