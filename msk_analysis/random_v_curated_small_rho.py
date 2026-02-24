@@ -17,7 +17,6 @@ Approach – *truncate cases* (deterministic, no changes to solver):
                 training controls.
                 Training set = ALL positives  +  sampled controls.
 
-Quota logic is DISABLED (quota_cfg=None).
 
 Usage
 -----
@@ -30,7 +29,7 @@ Usage
         [--output_dir ./random_vs_curated_small_ratios]
 """
 
-import sys
+import sys, glob
 import os
 import argparse
 import time
@@ -92,9 +91,9 @@ def parse_args():
     )
     p.add_argument(
         "--ratios", nargs="+", type=float,
-        default=[0.25, 0.35, 0.5, 0.65, 0.8, 1.0],
+        default=[0.25, 0.5, 0.75, 1.0],
         help="Control-to-positive ratios to sweep "
-             "(default: 0.25 0.35 0.5 0.65 0.8 1.0)",
+             "(default: 0.25 0.5 0.75 1.0)",
     )
     p.add_argument(
         "--random_seeds", nargs="+", type=int,
@@ -102,7 +101,7 @@ def parse_args():
         help="Seeds for random baseline (default: 0 1 2 ... 9)",
     )
     p.add_argument(
-        "--M_pool", type=int, default=50000,
+        "--M_pool", type=int, default=80000,
         help="Candidate pool size M for k-center (default: 50000)",
     )
     p.add_argument(
@@ -112,8 +111,8 @@ def parse_args():
     )
     p.add_argument(
         "--output_dir", type=str,
-        default="./random_vs_curated_small_ratios",
-        help="Output directory (default: ./random_vs_curated_small_ratios)",
+        default="./random_vs_curated_small_ratios_kmeanspp",
+        help="Output directory (default: ./random_vs_curated_small_ratios_kmeanspp)",
     )
     p.add_argument(
         "--train_test_seed", type=int, default=123,
@@ -137,7 +136,7 @@ def parse_args():
     )
     p.add_argument(
         "--distances_dir", type=str,
-        default="./precomputed_distances_msk_with_cost_features",
+        default="./precomputed_distances_msk_medical_only",
         help="Directory with precomputed distances",
     )
     p.add_argument(
@@ -145,7 +144,13 @@ def parse_args():
         default="msk_2017_18_full.parquet",
         help="Path to parquet dataset",
     )
+
+    p.add_argument("--resume", action="store_true",
+                   help="Resume from existing results")
+    p.add_argument("--use_kmeanspp", action="store_true",
+                   help="Use k-means++ for seed selection")
     return p.parse_args()
+
 
 
 # ============================================================================
@@ -238,6 +243,52 @@ def compute_num_leaves(model, X_df, preprocessor, feature_names):
     X_proc_df = pd.DataFrame(X_proc, columns=feature_names)
     leaves = model.apply(X_proc_df)
     return int(len(pd.unique(leaves)))
+
+
+def load_metrics_from_predictions(
+    pred_path: str,
+    y_test: pd.Series,
+) -> dict:
+    """
+    Load a predictions CSV and compute metrics (AUC, PR-AUC, MCC, etc.).
+    Use when retraining is skipped because predictions already exist.
+    """
+    pred_df = pd.read_csv(pred_path)
+    if "predicted_proba" not in pred_df.columns:
+        raise ValueError(f"predictions file missing 'predicted_proba': {pred_path}")
+    y_proba = pred_df["predicted_proba"].values
+    y_test_arr = np.asarray(y_test).astype(int)
+    if len(y_proba) != len(y_test_arr):
+        raise ValueError(f"length mismatch: pred={len(y_proba)}, test={len(y_test_arr)}")
+
+    auc = roc_auc_score(y_test_arr, y_proba)
+    pr_auc = average_precision_score(y_test_arr, y_proba)
+    mcc_res = best_mcc_threshold(y_test_arr, y_proba)
+    best_mcc = mcc_res["mcc"]
+    y_pred_mcc = mcc_res["y_pred"]
+
+    tn, fp, fn, tp = confusion_matrix(y_test_arr, y_pred_mcc).ravel()
+    recall_mcc = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    specificity_mcc = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+
+    balanced = best_balanced_threshold(y_test_arr, y_proba)
+    gmean_recall = balanced["gmean_opt"]["recall"]
+    gmean_specificity = balanced["gmean_opt"]["specificity"]
+
+    from sklearn.metrics import precision_recall_curve, f1_score
+    prec_curve, rec_curve, thresholds_pr = precision_recall_curve(y_test_arr, y_proba)
+    f1_scores = 2 * prec_curve * rec_curve / (prec_curve + rec_curve + 1e-10)
+    optimal_f1 = float(f1_scores.max())
+
+    num_leaves = int(pred_df["leaf_assignment"].nunique()) if "leaf_assignment" in pred_df.columns else np.nan
+    row = {     "num_leaves": num_leaves,
+                "test_auc": auc,
+                "test_pr_auc": pr_auc,
+                "test_best_mcc": best_mcc,
+                "gmean_recall": gmean_recall,
+                "gmean_specificity": gmean_specificity,
+    }
+    return row
 
 
 # ============================================================================
@@ -382,11 +433,42 @@ def main():
     total_random = len(args.ratios) * len(args.random_seeds)
     total_runs = total_curated + total_random
     run_idx = 0
-
+    
     for ratio_idx, ratio in enumerate(args.ratios, 1):
+        run_dir = os.path.join(OUTPUT_DIR, f"curated_r{ratio:.2f}")
+        os.makedirs(run_dir, exist_ok=True)
+        os.makedirs(os.path.join(run_dir, "predictions"), exist_ok=True)
         nC = math.ceil(ratio * nP)
         nC = min(nC, n_controls)  # safety cap
 
+        if args.resume and os.path.exists(run_dir):
+            pattern = os.path.join(
+                run_dir,
+                "predictions",
+                f"oct_predictions_{ratio:.2f}_*.csv"
+            )
+            files = glob.glob(pattern)  
+            if len(files) > 0:
+                path = files[0]
+                print(f"Loading metrics from {path}")
+                metrics = load_metrics_from_predictions(path, y_test)
+                row = {
+                    "method": "curated",
+                    "ratio": ratio,
+                    "nP": nP,
+                    "nC": nC,
+                    "seed": np.nan,
+                    "best_depth": np.nan,
+                    "best_minbucket": np.nan,
+                    "best_cp": np.nan,
+                    **metrics,
+                    "matching_time_s": np.nan,
+                    "matching_mean_cost": np.nan,
+                }
+                all_results.append(row)
+                continue
+       
+            
         print(f"\n{'#'*80}")
         print(
             f"RATIO {ratio_idx}/{len(args.ratios)}: r={ratio:.2f}  |  "
@@ -406,10 +488,7 @@ def main():
         )
         print(f"  {'='*72}")
 
-        run_dir = os.path.join(OUTPUT_DIR, f"curated_r{ratio:.2f}")
-        os.makedirs(run_dir, exist_ok=True)
-        os.makedirs(os.path.join(run_dir, "predictions"), exist_ok=True)
-
+        
         try:
             curated_start = time.perf_counter()
 
@@ -432,6 +511,7 @@ def main():
                 leaf_nn_enrolids_npy=dnn_enrolids_npy,
                 pn_h5_path=PN_H5_PATH,
                 M=args.M_pool,
+                use_kmeanspp=args.use_kmeanspp,
                 use_adaptive_pool=False,
                 force_nearest_per_case=False,
                 force_topm=1,
@@ -439,7 +519,6 @@ def main():
                 seed_method=args.seed_method,
                 matching_ratio=1,
                 case_weighting=None,
-                quota_cfg=None,
             )
             matching_time = time.perf_counter() - matching_start
 
@@ -480,7 +559,6 @@ def main():
 
             # --- Train OCT ---
             print(f"\n    TRAINING OCT ...")
-            train_start = time.perf_counter()
             model, params, grid_df, preprocessor, feat_names = finetune_oct(
                 X_train=undersampled[feature_cols],
                 y_train=undersampled[target_col],
@@ -495,11 +573,6 @@ def main():
                 verbose=False,
                 random_seed=TRAIN_TEST_SEED,
             )
-            train_time = time.perf_counter() - train_start
-            val_pr_auc = float(grid_df.iloc[0]["pr_auc"])  # best val PR-AUC
-
-            # --- Evaluate on test ---
-            eval_start = time.perf_counter()
             save_sfx = (
                 f"curated_r{ratio:.2f}_"
                 f"{params['depth']}_{params['minbucket']}_{params['cp']}"
@@ -515,7 +588,6 @@ def main():
                 results_dir=run_dir,
                 save_suffix=save_sfx,
             )
-            eval_time = time.perf_counter() - eval_start
             total_time = time.perf_counter() - curated_start
 
             num_leaves = compute_num_leaves(
@@ -538,25 +610,17 @@ def main():
                 "nP": nP,
                 "nC": nC,
                 "seed": np.nan,
-                "M_pool": args.M_pool,
-                "case_subset_mode": args.case_subset_mode,
-                "matching_mean_cost": mean_match_cost,
                 "best_depth": params['depth'],
                 "best_minbucket": params['minbucket'],
                 "best_cp": params['cp'],
-                "val_pr_auc": val_pr_auc,
+                "num_leaves": num_leaves,
                 "test_auc": metrics.get("auc"),
                 "test_pr_auc": metrics.get("pr_auc"),
                 "test_best_mcc": metrics.get("best_mcc"),
                 "gmean_recall": metrics.get("balanced_recall_gmean"),
                 "gmean_specificity": metrics.get("balanced_specificity_gmean"),
-                "num_leaves": num_leaves,
                 "matching_time_s": matching_time,
-                "training_time_s": train_time,
-                "eval_time_s": eval_time,
-                "total_time_s": total_time,
-                "undersample_path": us_path,
-                "run_dir": run_dir,
+                "matching_mean_cost": mean_match_cost,
             }
             all_results.append(row)
 
@@ -576,6 +640,7 @@ def main():
         # 6b. RANDOM BASELINE (per seed)
         # ==============================================================
         for seed_idx, seed in enumerate(args.random_seeds, 1):
+
             run_idx += 1
             print(f"\n  {'='*72}")
             print(
@@ -590,131 +655,146 @@ def main():
             os.makedirs(rnd_dir, exist_ok=True)
             os.makedirs(os.path.join(rnd_dir, "predictions"), exist_ok=True)
 
-            try:
-                rnd_start = time.perf_counter()
-
-                # --- Sample nC controls uniformly ---
-                rng = np.random.RandomState(seed)
-                sampled_idx = rng.choice(n_controls, size=nC, replace=False)
-                sampled_ctrl_enrolids = control_enrolids[sampled_idx]
-
-                # --- Build training set ---
-                all_minority = train_pd[train_pd[target_col] == 1].copy()
-                sampled_majority = train_pd[
-                    (train_pd[target_col] == 0)
-                    & (train_pd["ENROLID"].isin(set(sampled_ctrl_enrolids)))
-                ].copy()
-                undersampled_rnd = pd.concat(
-                    [all_minority, sampled_majority],
-                    axis=0,
-                    ignore_index=True,
-                )
-                print(
-                    f"    Training set: {len(undersampled_rnd):,}  "
-                    f"(nP={len(all_minority)}, nC={len(sampled_majority)})"
-                )
-
-                # --- Save undersampled CSV ---
-                us_path = os.path.join(
+            if args.resume:
+                pattern = os.path.join(
                     rnd_dir,
-                    f"undersampled_random_r{ratio:.2f}_s{seed}.csv",
+                    "predictions",
+                    f"oct_predictions_random_r{ratio:.2f}_s{seed}_*.csv"
                 )
-                undersampled_rnd.to_csv(us_path, index=False)
-                print(f"    Saved undersampled dataset: {us_path}")
+                files = glob.glob(pattern)  
+                if len(files) > 0:
+                    path = files[0]
+                    print(f"Loading metrics from {path}")
+                    metrics = load_metrics_from_predictions(path, y_test)
+                    row = {
+                        "method": "random",
+                        "ratio": ratio,
+                        "nP": nP,
+                        "nC": nC,
+                        "seed": seed,
+                        "best_depth": np.nan,
+                        "best_minbucket": np.nan,
+                        "best_cp": np.nan,
+                        **metrics,
+                        "matching_time_s": np.nan,
+                        "matching_mean_cost": np.nan,
+                    }
+                    all_results.append(row)
 
-                # --- Train OCT ---
-                print(f"\n    TRAINING OCT ...")
-                train_start = time.perf_counter()
-                model, params, grid_df, preprocessor, feat_names = finetune_oct(
-                    X_train=undersampled_rnd[feature_cols],
-                    y_train=undersampled_rnd[target_col],
-                    X_val=X_val,
-                    y_val=y_val,
-                    categorical_cols=CAT_COLUMNS,
-                    numeric_cols=TRUE_NUM_COLUMNS,
-                    binary_cols=BIN_FLAG_COLUMNS,
-                    depths=args.depths,
-                    minbuckets=args.minbuckets,
-                    cps=args.cps,
-                    verbose=False,
-                    random_seed=TRAIN_TEST_SEED,
-                )
-                train_time = time.perf_counter() - train_start
-                val_pr_auc = float(grid_df.iloc[0]["pr_auc"])
+            else:
+                try:
+                    rnd_start = time.perf_counter()
 
-                # --- Evaluate on test ---
-                eval_start = time.perf_counter()
-                save_sfx = (
-                    f"random_r{ratio:.2f}_s{seed}_"
-                    f"{params['depth']}_{params['minbucket']}_{params['cp']}"
-                )
-                metrics = evaluate_binary_oct(
-                    model,
-                    X_test,
-                    y_test,
-                    preprocessor,
-                    feat_names,
-                    X_val_df=X_val,
-                    y_val=y_val,
-                    results_dir=rnd_dir,
-                    save_suffix=save_sfx,
-                )
-                eval_time = time.perf_counter() - eval_start
-                total_time = time.perf_counter() - rnd_start
+                    # --- Sample nC controls uniformly ---
+                    rng = np.random.RandomState(seed)
+                    sampled_idx = rng.choice(n_controls, size=nC, replace=False)
+                    sampled_ctrl_enrolids = control_enrolids[sampled_idx]
 
-                num_leaves = compute_num_leaves(
-                    model, X_test, preprocessor, feat_names
-                )
+                    # --- Build training set ---
+                    all_minority = train_pd[train_pd[target_col] == 1].copy()
+                    sampled_majority = train_pd[
+                        (train_pd[target_col] == 0)
+                        & (train_pd["ENROLID"].isin(set(sampled_ctrl_enrolids)))
+                    ].copy()
+                    undersampled_rnd = pd.concat(
+                        [all_minority, sampled_majority],
+                        axis=0,
+                        ignore_index=True,
+                    )
+                    
+                    print(
+                        f"    Training set: {len(undersampled_rnd):,}  "
+                        f"(nP={len(all_minority)}, nC={len(sampled_majority)})"
+                    )
 
-                print(
-                    f"\n    RANDOM r={ratio:.2f} s={seed}  DONE  "
-                    f"PR-AUC={metrics.get('pr_auc', float('nan')):.4f}  "
-                    f"AUC={metrics.get('auc', float('nan')):.4f}  "
-                    f"MCC={metrics.get('best_mcc', float('nan')):.4f}  "
-                    f"leaves={num_leaves}  "
-                    f"({total_time:.1f}s)"
-                )
+                    # --- Save undersampled CSV ---
+                    us_path = os.path.join(
+                        rnd_dir,
+                        f"undersampled_random_r{ratio:.2f}_s{seed}.csv",
+                    )
+                    undersampled_rnd.to_csv(us_path, index=False)
+                    print(f"    Saved undersampled dataset: {us_path}")
 
-                # --- Collect result row ---
-                row = {
-                    "method": "random",
-                    "ratio": ratio,
-                    "nP": nP,
-                    "nC": nC,
-                    "seed": seed,
-                    "M_pool": np.nan,
-                    "case_subset_mode": np.nan,
-                    "matching_mean_cost": np.nan,
-                    "best_depth": params['depth'],
-                    "best_minbucket": params['minbucket'],
-                    "best_cp": params['cp'],
-                    "val_pr_auc": val_pr_auc,
-                    "test_auc": metrics.get("auc"),
-                    "test_pr_auc": metrics.get("pr_auc"),
-                    "test_best_mcc": metrics.get("best_mcc"),
-                    "gmean_recall": metrics.get("balanced_recall_gmean"),
-                    "gmean_specificity": metrics.get("balanced_specificity_gmean"),
-                    "num_leaves": num_leaves,
-                    "matching_time_s": np.nan,
-                    "training_time_s": train_time,
-                    "eval_time_s": eval_time,
-                    "total_time_s": total_time,
-                    "undersample_path": us_path,
-                    "run_dir": rnd_dir,
-                }
-                all_results.append(row)
+                    # --- Train OCT ---
+                    print(f"\n    TRAINING OCT ...")
+                    model, params, grid_df, preprocessor, feat_names = finetune_oct(
+                        X_train=undersampled_rnd[feature_cols],
+                        y_train=undersampled_rnd[target_col],
+                        X_val=X_val,
+                        y_val=y_val,
+                        categorical_cols=CAT_COLUMNS,
+                        numeric_cols=TRUE_NUM_COLUMNS,
+                        binary_cols=BIN_FLAG_COLUMNS,
+                        depths=args.depths,
+                        minbuckets=args.minbuckets,
+                        cps=args.cps,
+                        verbose=False,
+                        random_seed=TRAIN_TEST_SEED,
+                    )
+                    
+                    # --- Evaluate on test ---
+                    save_sfx = (
+                        f"random_r{ratio:.2f}_s{seed}_"
+                        f"{params['depth']}_{params['minbucket']}_{params['cp']}"
+                    )
+                    metrics = evaluate_binary_oct(
+                        model,
+                        X_test,
+                        y_test,
+                        preprocessor,
+                        feat_names,
+                        X_val_df=X_val,
+                        y_val=y_val,
+                        results_dir=rnd_dir,
+                        save_suffix=save_sfx,
+                    )
+                    total_time = time.perf_counter() - rnd_start
 
-            except Exception as e:
-                print(f"\n    ERROR (random r={ratio:.2f} s={seed}): {e}")
-                traceback.print_exc()
-                all_results.append({
-                    "method": "random",
-                    "ratio": ratio,
-                    "nP": nP,
-                    "nC": nC,
-                    "seed": seed,
-                    "error": str(e),
-                })
+                    num_leaves = compute_num_leaves(
+                        model, X_test, preprocessor, feat_names
+                    )
+
+                    print(
+                        f"\n    RANDOM r={ratio:.2f} s={seed}  DONE  "
+                        f"PR-AUC={metrics.get('pr_auc', float('nan')):.4f}  "
+                        f"AUC={metrics.get('auc', float('nan')):.4f}  "
+                        f"MCC={metrics.get('best_mcc', float('nan')):.4f}  "
+                        f"leaves={num_leaves}  "
+                        f"({total_time:.1f}s)"
+                    )
+
+                    # --- Collect result row ---
+                    row = {
+                        "method": "random",
+                        "ratio": ratio,
+                        "nP": nP,
+                        "nC": nC,
+                        "seed": seed,
+                        "best_depth": params['depth'],
+                        "best_minbucket": params['minbucket'],
+                        "best_cp": params['cp'],
+                        "num_leaves": num_leaves,
+                        "test_auc": metrics.get("auc"),
+                        "test_pr_auc": metrics.get("pr_auc"),
+                        "test_best_mcc": metrics.get("best_mcc"),
+                        "gmean_recall": metrics.get("balanced_recall_gmean"),
+                        "gmean_specificity": metrics.get("balanced_specificity_gmean"),
+                        "matching_time_s": np.nan,
+                        "matching_mean_cost": np.nan,
+                    }
+                    all_results.append(row)
+
+                except Exception as e:
+                    print(f"\n    ERROR (random r={ratio:.2f} s={seed}): {e}")
+                    traceback.print_exc()
+                    all_results.append({
+                        "method": "random",
+                        "ratio": ratio,
+                        "nP": nP,
+                        "nC": nC,
+                        "seed": seed,
+                        "error": str(e),
+                    })
 
     # ==================================================================
     # 7. SAVE SUMMARY CSV & PRINT COMPARISON
@@ -729,7 +809,7 @@ def main():
 
     results_df = pd.DataFrame(all_results)
     summary_path = os.path.join(OUTPUT_DIR, "random_vs_curated_comparison.csv")
-    results_df.to_csv(summary_path, index=False)
+    results_df.to_csv(summary_path, mode='a', index=False, header=not os.path.exists(summary_path))
     print(f"Saved {len(results_df)} rows to: {summary_path}\n")
 
     # --- Pretty-print comparison table ---

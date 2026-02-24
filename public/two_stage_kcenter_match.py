@@ -188,7 +188,7 @@ def choose_seed_closest_to_positives_from_pn(
 
 def choose_seed_random(
     n_controls: int,
-    random_state: Optional[int] = None
+    random_state: Optional[int] = 123
 ) -> int:
     """
     Select a random control as the initial seed for k-center.
@@ -620,7 +620,7 @@ def two_stage_kcenter_then_match(
     force_topm: int = 1,
     assignment_topk_start: int | None = None,  # None => exact full edges
     seed_method: str = "smart",  # "smart", "random", "centroid", or "density"
-    random_state: Optional[int] = None,  # for reproducibility when seed_method="random"
+    random_state: Optional[int] = 123,  # for reproducibility when seed_method="random"
     X_majority_leaf: Optional[np.ndarray] = None,  # Required for "centroid" method
     density_epsilon: Optional[float] = None,  # Optional for "density" method
     density_percentile: float = 10.0,  # For auto-selecting epsilon in "density"

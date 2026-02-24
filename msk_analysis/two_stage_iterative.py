@@ -39,7 +39,7 @@ df_msk_spark = spark.read.format("parquet").load("msk_2017_18_full.parquet")
 df_og = df_msk_spark.toPandas()
 
 TRAIN_TEST_SEED = 123
-BASE_DIR = "./sensitivity_medical_only_features_150_minbucket"
+BASE_DIR = "./sensitivity_medical_only_features_150_minbucket_kmeanspp"
 RESULTS_DIR = os.path.join(BASE_DIR, "results") #undersampled dataset directory
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -47,20 +47,9 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 MATCHING_RATIO = 1  # 1:1 matching (can be changed)
 CASE_WEIGHTING = None  # Options: None, "boundary"
 USE_ADAPTIVE_POOL = False  # Options: True, False
+USE_KMEANSPP = True
 SEED_METHOD = "smart"  # Options: "smart", "centroid", "density", "random"
 
-# Bin-quota constraints for representativeness (optional)
-# Set to None to disable, or a dict to enable:
-#   e.g. dict(enabled=True, T=5, mode="pool_mass", K_per_bin=25)
-QUOTA_CFG = {
-    "enabled": False,
-    "T": 5,
-    "mode": "tilted",           # quota computation mode (proportional to bin counts)
-    "binning": "population",       # NEW: use population-based cutpoints & quotas
-    "pop_S": 50000,                # population subset size (default 50k)
-    "pop_subset": "sorted_prefix", # deterministic subset selection
-    "K_per_bin": 25,
-}
 FORCE_NEAREST_PER_CASE = False #last step in two_stage_kcenter_match.py
 # MSK-specific feature column definitions
 # Binary flag columns: comorbidity flags, MSK category flags, medication flags
@@ -114,8 +103,7 @@ else:
     raise ValueError("No 2018 target column found. Need either 'top_2_pct_cost_2018' or 'annual_cost_2018_deflated'")
 # Exclude all columns containing "2018" from features (to prevent leakage)
 # Also exclude ENROLID and target column
-exclude_cols = ["ENROLID", target_col] + [col for col in df_og.columns 
-if "2018" in col] + COST_COLUMNS
+exclude_cols = ["ENROLID", target_col] + [col for col in df_og.columns if "2018" in col] + COST_COLUMNS
 feature_cols = [c for c in df_og.columns if c not in exclude_cols]
 
 #TODO try different distance metrics for precompute_distances: 'euclidean' (L2), 'manhattan' (L1), 'chebyshev' (L_infinity)
@@ -177,10 +165,10 @@ print(f"  Ratio: {n_controls/n_cases:.2f}:1\n")
 
 # Generate pool sizes M to test
 # Range from n_cases to n_controls//2 in reasonably separated steps
-M_min = n_controls // 4
-M_max = n_controls // 2
+M_min = n_controls // 8 
+M_max = 100000
 # Create steps: use approximately 10-15 steps, with larger steps for larger ranges
-num_steps = 4
+num_steps = 8
 if M_max - M_min < num_steps:
     # If range is small, test every value
     M_values = list(range(M_min, M_max + 1))
@@ -211,7 +199,6 @@ print(f"{'='*80}\n")
 for m_idx, M in enumerate(M_values, 1):
     print(f"\n{'#'*80}")
     print(f"ITERATION {m_idx}/{len(M_values)}: M = {M:,} (fixed pool)")
-    print(f"    Quota config: {QUOTA_CFG}")
     print(f"{'#'*80}\n")
     
     iteration_start_time = time.perf_counter()
@@ -227,7 +214,8 @@ for m_idx, M in enumerate(M_values, 1):
         print(f"  Configuration:")
         print(f"    Matching ratio: 1:{MATCHING_RATIO}")
         print(f"    Case weighting: {CASE_WEIGHTING}")
-        print(f"    Adaptive pool: False (fixed pool size)")
+        print(f"    Adaptive pool: {USE_ADAPTIVE_POOL}")
+        print(f"    Use k-means++: {USE_KMEANSPP}")
         print(f"    Seed method: {SEED_METHOD}")
         print(f"    Candidate pool size (M): {M:,} ({M/n_controls*100:.1f}% of controls)")
         
@@ -240,17 +228,17 @@ for m_idx, M in enumerate(M_values, 1):
             leaf_nn_enrolids_npy=dnn_enrolids_npy,
             pn_h5_path=PN_H5_PATH,
             M=M,
-            use_adaptive_pool=False,  # Fixed pool size
+            use_adaptive_pool=USE_ADAPTIVE_POOL,  # Fixed pool size
             tau=None,  # Not used when adaptive_pool=False
             plateau_eps=0.01,
             force_nearest_per_case=FORCE_NEAREST_PER_CASE,
             force_topm=1,
-            assignment_topk_start=None,  # Exoh matching
+            assignment_topk_start=None,  # exact matching
             seed_method=SEED_METHOD,
             matching_ratio=MATCHING_RATIO,
             X_majority_leaf=None,  # Not needed when using precomputed distances
             case_weighting=CASE_WEIGHTING,
-            quota_cfg=QUOTA_CFG,
+            use_kmeanspp=USE_KMEANSPP,
         )
         
         matching_end_time = time.perf_counter()
@@ -327,18 +315,15 @@ for m_idx, M in enumerate(M_values, 1):
             balanced_model, X_test, y_test, preprocessor, feature_names, 
             X_val_df=X_val, y_val=y_val, results_dir=results_dir, save_suffix=save_suffix)
         
-        evaluation_end_time = time.perf_counter()
-        evaluation_time = evaluation_end_time - evaluation_start_time
-        total_time = time.perf_counter() - iteration_start_time
-        
-        print(f"\n  ✓ Model training and evaluation complete:")
-        print(f"     Total iteration time: {total_time:.2f}s")
         
         if isinstance(metrics, dict):
             print(f"     Test PR-AUC: {metrics.get('pr_auc', 'N/A'):.4f}" if isinstance(metrics.get('pr_auc'), (int, float)) else f"     Test PR-AUC: {metrics.get('pr_auc', 'N/A')}")
             print(f"     Test AUC: {metrics.get('auc', 'N/A'):.4f}" if isinstance(metrics.get('auc'), (int, float)) else f"     Test AUC: {metrics.get('auc', 'N/A')}")
             print(f"     Test Best MCC: {metrics.get('best_mcc', 'N/A'):.4f}" if isinstance(metrics.get('best_mcc'), (int, float)) else f"     Test Best MCC: {metrics.get('best_mcc', 'N/A')}")
-        
+        if isinstance(balanced_params, dict):
+            bd, bm, bcp = balanced_params["depth"], balanced_params["minbucket"], balanced_params["cp"]
+        else:
+            bd, bm, bcp = balanced_params
         # Store results
         result_row = {
             'M': M,
@@ -347,13 +332,11 @@ for m_idx, M in enumerate(M_values, 1):
             'n_train_samples': len(undersampled_training_data),
             'n_train_minority': (undersampled_training_data[target_col] == 1).sum(),
             'n_train_majority': (undersampled_training_data[target_col] == 0).sum(),
-            'best_depth': balanced_params['depth'],
-            'best_minbucket': balanced_params['minbucket'],
-            'best_cp': balanced_params['cp'],
-            'matching_time_seconds': 0,
+            'best_depth': bd,
+            'best_minbucket': bm,
+            'best_cp': bcp,
+            'matching_time_seconds': matching_time,
             'training_time_seconds': training_time,
-            'evaluation_time_seconds': evaluation_time,
-            'total_time_seconds': total_time,
         }
         
         # Add metrics
@@ -377,160 +360,7 @@ for m_idx, M in enumerate(M_values, 1):
         })
         continue
 
-# ============================================================================
-# PHASE 2: Test with adaptive pool to find stopping size
-# ============================================================================
-"""
-print(f"\n{'='*80}")
-print("PHASE 2: Testing adaptive pool (adaptive_pool=True)")
-print(f"{'='*80}\n")
 
-print(f"Running adaptive pool to find stopping size M...")
-
-iteration_start_time = time.perf_counter()
-matching_start_time = time.perf_counter()
-
-try:
-    matching_result = two_stage_kcenter_then_match(
-        leaf_controls_enrolids=controls['ENROLID'].values.astype(np.int64),
-        leaf_cases_enrolids=cases['ENROLID'].values.astype(np.int64),
-        leaf_nn_matrix_npy=dnn_matrix_npy,
-        leaf_nn_enrolids_npy=dnn_enrolids_npy,
-        pn_h5_path=PN_H5_PATH,
-        M=M_max,  # Start with max, but will stop early
-        use_adaptive_pool=True,  # Adaptive pool enabled
-        tau=None,  # Auto-compute from 95th percentile
-        plateau_eps=0.01,
-        force_nearest_per_case=True,
-        force_topm=1,
-        assignment_topk_start=None,  # Exact matching
-        seed_method=SEED_METHOD,
-        matching_ratio=MATCHING_RATIO,
-        X_majority_leaf=None,  # Not needed when using precomputed distances
-        case_weighting=CASE_WEIGHTING,
-        quota_cfg=QUOTA_CFG,
-    )
-    
-    matching_end_time = time.perf_counter()
-    matching_time = matching_end_time - matching_start_time
-    
-    # Extract results
-    selected_control_enrolids = matching_result["selected_control_enrolids"]
-    candidate_majority_enrolids = matching_result.get("candidate_majority_enrolids", [])
-    actual_M = len(candidate_majority_enrolids) if len(candidate_majority_enrolids) > 0 else len(set(selected_control_enrolids))
-    all_match_costs = matching_result["match_costs"]
-    
-    print(f"\n  ✓ Adaptive pool matching complete!")
-    print(f"    Mean matching cost: {all_match_costs.mean():.4f}")
-    print(f"    Matching time: {matching_time:.2f}s")
-    
-    # Build undersampled dataset
-    all_minority = train_pd[train_pd[target_col] == 1].copy()
-    unique_majority_enrolids = list(set(selected_control_enrolids))
-    selected_majority = train_pd[
-        (train_pd[target_col] == 0) & 
-        (train_pd['ENROLID'].isin(unique_majority_enrolids))
-    ].copy()
-    
-    undersampled_training_data = pd.concat([all_minority, selected_majority], axis=0, ignore_index=True)
-    
-    print(f"\n  ✓ Undersampled dataset created:")
-    print(f"     Total samples: {len(undersampled_training_data):,}")
-    print(f"     Class distribution:")
-    print(undersampled_training_data[target_col].value_counts().sort_index())
-    
-    # Train and evaluate OCT
-    print(f"\n  {'='*76}")
-    print(f"  TRAINING OCT MODEL")
-    print(f"  {'='*76}")
-    
-    training_start_time = time.perf_counter()
-    
-    balanced_model, balanced_params, _, preprocessor, feature_names = finetune_oct(
-        X_train=undersampled_training_data[[col for col in feature_cols]],
-        y_train=undersampled_training_data[target_col],
-        X_val=X_val,
-        y_val=y_val,
-        categorical_cols=CAT_COLUMNS,
-        numeric_cols=TRUE_NUM_COLUMNS,
-        binary_cols=BIN_FLAG_COLUMNS,
-        depths=[5, 7],
-        minbuckets=[150],
-        cps=[0.0001, 0.001, 0.01],
-        verbose=False,
-        random_seed=TRAIN_TEST_SEED
-    )
-    
-    training_end_time = time.perf_counter()
-    training_time = training_end_time - training_start_time
-    
-    # Evaluate
-    evaluation_start_time = time.perf_counter()
-    
-    metrics = evaluate_binary_oct(
-        balanced_model, X_test, y_test, preprocessor, feature_names, 
-        X_val_df=X_val, y_val=y_val,
-        results_dir=BASE_DIR, 
-        save_suffix=f"adaptive_{balanced_params[0]}_{balanced_params[1]}_{balanced_params[2]}"
-    )
-    
-    evaluation_end_time = time.perf_counter()
-    evaluation_time = evaluation_end_time - evaluation_start_time
-    total_time = time.perf_counter() - iteration_start_time
-    
-    print(f"\n  ✓ Model training and evaluation complete:")
-    print(f"     Best params: depth={balanced_params[0]}, minbucket={balanced_params[1]}, cp={balanced_params[2]}")
-    print(f"     Training time: {training_time:.2f}s")
-    print(f"     Evaluation time: {evaluation_time:.2f}s")
-    print(f"     Total iteration time: {total_time:.2f}s")
-    
-    if isinstance(metrics, dict):
-        print(f"     Test PR-AUC: {metrics.get('pr_auc', 'N/A'):.4f}" if isinstance(metrics.get('pr_auc'), (int, float)) else f"     Test PR-AUC: {metrics.get('pr_auc', 'N/A')}")
-        print(f"     Test AUC: {metrics.get('auc', 'N/A'):.4f}" if isinstance(metrics.get('auc'), (int, float)) else f"     Test AUC: {metrics.get('auc', 'N/A')}")
-        print(f"     Test Best MCC: {metrics.get('best_mcc', 'N/A'):.4f}" if isinstance(metrics.get('best_mcc'), (int, float)) else f"     Test Best MCC: {metrics.get('best_mcc', 'N/A')}")
-    
-    # Store results
-    result_row = {
-        'M': actual_M,
-        'M_pct_of_controls': actual_M / n_controls * 100,
-        'adaptive_pool': True,
-        'n_train_samples': len(undersampled_training_data),
-        'n_train_minority': (undersampled_training_data[target_col] == 1).sum(),
-        'n_train_majority': (undersampled_training_data[target_col] == 0).sum(),
-        'best_depth': balanced_params[0],
-        'best_minbucket': balanced_params[1],
-        'best_cp': balanced_params[2],
-        'matching_time_seconds': matching_time,
-        'training_time_seconds': training_time,
-        'evaluation_time_seconds': evaluation_time,
-        'total_time_seconds': total_time,
-    }
-    
-    # Add metrics
-    if isinstance(metrics, dict):
-        result_row.update(metrics)
-    
-    all_results.append(result_row)
-    
-    # Save undersampled dataset
-    config_name = f"cw_{CASE_WEIGHTING}_pool_True_seed_{SEED_METHOD}"
-    undersample_path = os.path.join(RESULTS_DIR, f"adaptive_M{actual_M}_{config_name}.csv")
-    undersampled_training_data.to_csv(undersample_path, index=False)
-    print(f"     ✓ Saved undersampled dataset: {undersample_path}")
-    
-except Exception as e:
-    print(f"\n  ✗ ERROR in adaptive pool iteration:")
-    print(f"    {e}")
-    import traceback
-    traceback.print_exc()
-    
-    all_results.append({
-        'M': None,
-        'M_pct_of_controls': None,
-        'adaptive_pool': True,
-        'error': str(e),
-    })
-"""
 # ============================================================================
 # FINAL COMPARISON
 # ============================================================================

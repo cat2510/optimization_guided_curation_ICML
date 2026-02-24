@@ -135,6 +135,7 @@ def sample_stageA_dispersed_controls(
     seed_method: str,
     seed: int,
     M_pool: int,
+    use_kmeanspp: bool = True,
     X_majority_leaf: Optional[np.ndarray] = None,
     verbose: bool = True,
 ) -> Tuple[np.ndarray, Optional[float]]:
@@ -193,9 +194,11 @@ def sample_stageA_dispersed_controls(
         raise ValueError(f"Unknown seed_method: {seed_method}")
 
     # Run k-center
-    rng = np.random.RandomState(seed + 1337)  # offset avoids coupling to other random uses
-    cand_idx = kmeanspp_metric_indices(d_nn, k_eff, seed_idx, rng)
-    #cand_idx = farthest_first_kcenter_indices(d_nn, k_eff, seed_idx)
+    if use_kmeanspp:
+        rng = np.random.RandomState(seed + 1337)  # offset avoids coupling to other random uses
+        cand_idx = kmeanspp_metric_indices(d_nn, k_eff, seed_idx, rng)
+    else:
+        cand_idx = farthest_first_kcenter_indices(d_nn, k_eff, seed_idx)
     selected_enrolids = dnn_ids[cand_idx]
 
     # Mean min distance from selected controls to their nearest case (for logging)
@@ -215,6 +218,7 @@ def sample_stageB_matched_controls(
     M_pool: int,
     seed_method: str,
     seed: int,
+    use_kmeanspp: bool = True,
     X_majority_leaf: Optional[np.ndarray] = None,
     verbose: bool = True,
 ) -> np.ndarray:
@@ -235,7 +239,7 @@ def sample_stageB_matched_controls(
         leaf_nn_enrolids_npy=leaf_nn_enrolids_npy,
         pn_h5_path=pn_h5_path,
         M=M_eff,
-        use_kmeanspp=True,
+        use_kmeanspp=use_kmeanspp,
         use_adaptive_pool=False,
         force_nearest_per_case=False,
         force_topm=1,
@@ -290,6 +294,7 @@ def sample_stageA_on_restricted_pool(
     seed: int,
     X_majority_leaf: Optional[np.ndarray],
     id_to_position_in_full: dict,
+    use_kmeanspp: bool = True,
     verbose: bool = True,
     debug_alignment: bool = False,
 ) -> np.ndarray:
@@ -360,9 +365,11 @@ def sample_stageA_on_restricted_pool(
     else:
         seed_idx = choose_seed_random(len(remaining_ids), random_state=seed)
 
-    #cand_idx = farthest_first_kcenter_indices(d_nn_sub, k, seed_idx)
-    rng = np.random.RandomState(seed + 1337)  # offset avoids coupling to other random uses
-    cand_idx = kmeanspp_metric_indices(d_nn_sub, k, seed_idx, rng)
+    if use_kmeanspp:
+        rng = np.random.RandomState(seed + 1337)  # offset avoids coupling to other random uses
+        cand_idx = kmeanspp_metric_indices(d_nn_sub, k, seed_idx, rng)
+    else:
+        cand_idx = farthest_first_kcenter_indices(d_nn_sub, k, seed_idx)
     return remaining_ids[cand_idx]
 
 
@@ -407,20 +414,24 @@ def load_metrics_from_predictions(
 
     num_leaves = int(pred_df["leaf_assignment"].nunique()) if "leaf_assignment" in pred_df.columns else np.nan
 
+    from public.model_IAI import recall_at_specificity
+    recall_at_spec_06, achieved_spec_06, threshold_spec_06 = recall_at_specificity(y_test_arr, y_proba, target_specificity=0.60)
     return {
+        "best_depth": np.nan,
+        "best_minbucket": np.nan,
+        "best_cp": np.nan,
+        "num_leaves": num_leaves,
         "auc": auc,
         "pr_auc": pr_auc,
         "best_mcc": best_mcc,
         "recall_mcc": recall_mcc,
         "specificity_mcc": specificity_mcc,
-        "precision_mcc": tp / (tp + fp) if (tp + fp) > 0 else 0.0,
         "optimal_f1": optimal_f1,
         "balanced_recall_gmean": gmean_recall,
         "balanced_specificity_gmean": gmean_specificity,
-        "num_leaves": num_leaves,
-        "best_depth": np.nan,
-        "best_minbucket": np.nan,
-        "best_cp": np.nan,
+        "recall_at_specificity_0.6": float(recall_at_spec_06),
+        "achieved_specificity_0.6": float(achieved_spec_06),
+        "threshold_specificity_0.6": float(threshold_spec_06),
     }
 
 
@@ -506,6 +517,8 @@ def parse_args():
     p.add_argument("--feature_set", type=str, default="all_cost", choices=["medical_only", "all_cost", "less_cost"])
     p.add_argument("--resume", action="store_true", #- Sets to True when present (default: False)
                    help="Skip runs already in experiment_summary.csv; load training CSV when it exists")
+    p.add_argument("--use_kmeanspp", action="store_true",
+                   help="Use k-means++ for seed selection")
     p.add_argument("--debug_alignment", action="store_true",
                    help="Run ID-alignment diagnostics and hard assertions (no training)")
     return p.parse_args()
@@ -668,7 +681,7 @@ def main():
             ids, _ = sample_stageA_dispersed_controls(
                 control_enrolids, dnn_matrix, dnn_enrolids, pn_h5,
                 case_enrolids, k_max, args.stageA_seed_method, seed, M_pool,
-                X_majority_leaf=X_majority_leaf, verbose=True,
+                X_majority_leaf=X_majority_leaf, verbose=True, use_kmeanspp=args.use_kmeanspp,
             )
             return ids
         return load_or_compute_ids(name, seed, _compute)
@@ -734,14 +747,13 @@ def main():
         train_df.to_csv(path, index=False)
         return train_df
 
-    
-    print("\n" + "#" * 80)
-    print("EXPERIMENT 0: Random undersample")
-    print("#" * 80)
     for seed in seeds:
+        print("\n" + "#" * 80)
+        print("EXPERIMENT 0: Random undersample")
+        print("#" * 80)
         print(f"\n  --- seed={seed} ---")
         # S_random
-        exp_name = "random_undersample"
+        exp_name = "exp0_rnd"
         pred_rnd = _pred_path(exp_name, "random", seed)
         if args.resume and os.path.exists(pred_rnd):
             m_rnd = load_metrics_from_predictions(pred_rnd, test_pd[target_col])
@@ -766,12 +778,11 @@ def main():
                 "n_cases": N, "n_controls": K, **m_rnd,
             })
             print(f"    Random: PR-AUC={m_rnd.get('pr_auc', 0):.4f} AUC={m_rnd.get('auc', 0):.4f}")
-    print("\n" + "#" * 80)
-    print("EXPERIMENT 1: Stage A only (k-center dispersed)")
-    print("#" * 80)
-    for seed in seeds:  
+    
+        print("\n" + "#" * 80)
+        print("EXPERIMENT 1: Stage A only (k-center dispersed)")
+        print("#" * 80) 
         exp_name = "exp1"
-        # ----- Experiment 1: Stage A only -----
         print(f"seed={seed} Stage A: SAMPLING AND TRAINING...")
 
         try:
@@ -787,7 +798,7 @@ def main():
                 stageA_ids, mean_min = sample_stageA_dispersed_controls(
                     control_enrolids, dnn_matrix, dnn_enrolids, pn_h5,
                     case_enrolids, K, args.stageA_seed_method, seed, M_pool,
-                    X_majority_leaf=X_majority_leaf, verbose=True,
+                    X_majority_leaf=X_majority_leaf, verbose=True, use_kmeanspp=args.use_kmeanspp,
                 )
 
                 def _create_stageA():
@@ -811,12 +822,6 @@ def main():
             traceback.print_exc()
             all_rows.append({"experiment": exp_name, "variant": "error", "seed": seed, "error": str(e)})
 
-    # ----- Experiment 2: Stage B 1:2 matching -----
-    print("\n" + "#" * 80)
-    print("EXPERIMENT 2: Stage B 1:2 matching")
-    print("#" * 80)
-
-    for seed in seeds:
         print("\n" + "#" * 80)
         print("EXPERIMENT 2: Stage B 1:2 matching")
         print("#" * 80)
@@ -835,7 +840,7 @@ def main():
                 stageB_ids = sample_stageB_matched_controls(
                     control_enrolids, case_enrolids, dnn_matrix, dnn_enrolids, pn_h5,
                     K, matching_ratio=2, M_pool=M_pool, seed_method=args.stageA_seed_method,
-                    seed=seed, X_majority_leaf=X_majority_leaf, verbose=True,
+                    seed=seed, X_majority_leaf=X_majority_leaf, verbose=True, use_kmeanspp=args.use_kmeanspp,
                 )
 
                 def _create_stageB():
@@ -881,13 +886,13 @@ def main():
                 match_ids = sample_stageB_matched_controls(
                     control_enrolids, case_enrolids, dnn_matrix, dnn_enrolids, pn_h5,
                     N, matching_ratio=1, M_pool=M_pool, seed_method=args.stageA_seed_method,
-                    seed=seed, X_majority_leaf=X_majority_leaf, verbose=True,
+                    seed=seed, X_majority_leaf=X_majority_leaf, verbose=True, use_kmeanspp=args.use_kmeanspp,
                 )
                 # N dispersed from remaining
                 disp_ids = sample_stageA_on_restricted_pool(
                     control_enrolids, match_ids, dnn_matrix, dnn_enrolids, pn_h5,
                     case_enrolids, N, args.stageA_seed_method, seed,
-                    X_majority_leaf, id_to_pos, verbose=True,
+                    X_majority_leaf, id_to_pos, verbose=True, use_kmeanspp=args.use_kmeanspp,
                 )
                 mix_ids = np.unique(np.concatenate([match_ids, disp_ids]))[:K]
                 if len(mix_ids) < K:

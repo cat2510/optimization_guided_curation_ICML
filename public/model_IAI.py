@@ -50,7 +50,7 @@ def recall_at_specificity(y_true, y_score, target_specificity: float = 0.60):
         best_i = idx[np.argmax(tpr[idx])]
         return float(tpr[best_i]), float(specificity[best_i]), float(thresholds[best_i])
 
-    # If constraint not achievable, pick point with maximal specificity (i.e., minimal FPR)
+    print("Constraint not achievable, pick point with maximal specificity (i.e., minimal FPR)")
     best_i = int(np.argmax(specificity))
     return float(tpr[best_i]), float(specificity[best_i]), float(thresholds[best_i])
 
