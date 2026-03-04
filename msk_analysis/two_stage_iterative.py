@@ -103,7 +103,7 @@ else:
     raise ValueError("No 2018 target column found. Need either 'top_2_pct_cost_2018' or 'annual_cost_2018_deflated'")
 # Exclude all columns containing "2018" from features (to prevent leakage)
 # Also exclude ENROLID and target column
-exclude_cols = ["ENROLID", target_col] + [col for col in df_og.columns if "2018" in col] + COST_COLUMNS
+exclude_cols = ["ENROLID", target_col] + [col for col in df_og.columns if "2018" in col] 
 feature_cols = [c for c in df_og.columns if c not in exclude_cols]
 
 #TODO try different distance metrics for precompute_distances: 'euclidean' (L2), 'manhattan' (L1), 'chebyshev' (L_infinity)
