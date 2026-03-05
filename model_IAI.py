@@ -35,10 +35,15 @@ def recall_at_specificity(y_true, y_score, target_specificity: float = 0.60):
     Uses ROC curve (thresholds on y_score). If no threshold reaches target specificity,
     returns the closest (max specificity) operating point.
 
-    Note: In imbalanced settings, there may be many thresholds; this is O(n log n) dominated by sort.
+    When all scores are constant (degenerate classifier), returns (0, 1, threshold)
+    since predict-all-negative is the only way to achieve high specificity.
     """
     y_true = np.asarray(y_true).astype(int)
     y_score = np.asarray(y_score).astype(float)
+
+    if np.ptp(y_score) == 0:
+        c = float(np.max(y_score))
+        return 0.0, 1.0, (c + 1.0 if np.isfinite(c) else np.inf)
 
     fpr, tpr, thresholds = roc_curve(y_true, y_score)
     specificity = 1.0 - fpr
@@ -546,11 +551,12 @@ def best_mcc_threshold(y_true, y_proba):
     if np.unique(y_true).size < 2:
         return {"threshold": np.nan, "mcc": np.nan, "y_pred": np.zeros_like(y_true)}
 
-    # If all probabilities identical, any threshold yields constant predictions -> MCC will be 0 (or NaN)
-    if np.all(y_proba == y_proba[0]):
-        y_pred = (y_proba >= y_proba[0]).astype(int)  # all 1s
-        mcc = matthews_corrcoef(y_true, y_pred) if np.unique(y_pred).size > 1 else 0.0
-        return {"threshold": float(y_proba[0]), "mcc": float(mcc), "y_pred": y_pred}
+    # If all probabilities identical: prefer predict-all-negative (consistent with best_balanced_threshold)
+    if np.ptp(y_proba) == 0:
+        c = float(np.max(y_proba))
+        thresh = c + 1.0 if np.isfinite(c) else np.inf
+        y_pred = np.zeros_like(y_true, dtype=int)
+        return {"threshold": thresh, "mcc": 0.0, "y_pred": y_pred}
 
     # Candidate thresholds: midpoints between sorted unique probabilities
     uniq = np.unique(y_proba)
@@ -809,24 +815,55 @@ def best_balanced_threshold(y_true, y_prob):
     Returns two candidates:
       - gmean_opt: maximizes sqrt(recall * specificity)
       - minside_opt: maximizes min(recall, specificity)
+
+    When all scores are constant (e.g. tree with no splits), roc_curve may return
+    only one operating point. We prefer "predict all negative" (recall=0, spec=1)
+    over "predict all positive" (recall=1, spec=0) since a degenerate tree typically
+    predicts the majority class.
     """
+    y_prob = np.asarray(y_prob).astype(float)
+    if np.ptp(y_prob) == 0:
+        # All scores identical: degenerate classifier. Prefer predict-all-negative.
+        c = float(np.max(y_prob))
+        thresh_inf = c + 1.0 if np.isfinite(c) else np.inf
+        return {
+            "gmean_opt": {
+                "threshold": thresh_inf,
+                "recall": 0.0,
+                "specificity": 1.0,
+                "gmean": 0.0,
+                "min_recall_spec": 0.0,
+            },
+            "minside_opt": {
+                "threshold": thresh_inf,
+                "recall": 0.0,
+                "specificity": 1.0,
+                "gmean": 0.0,
+                "min_recall_spec": 0.0,
+            },
+        }
+
     fpr, tpr, thresholds = roc_curve(y_true, y_prob)
     specificity = 1 - fpr
     recall = tpr
 
     gmean = np.sqrt(recall * specificity)
-    idx_g = int(np.argmax(gmean))
+    max_g = np.max(gmean)
+    ties_g = np.flatnonzero(gmean >= max_g - 1e-12)
+    idx_g = int(ties_g[np.argmax(thresholds[ties_g])])  # tie-break: prefer highest threshold
 
     min_side = np.minimum(recall, specificity)
-    idx_min = int(np.argmax(min_side))
+    max_m = np.max(min_side)
+    ties_m = np.flatnonzero(min_side >= max_m - 1e-12)
+    idx_min = int(ties_m[np.argmax(thresholds[ties_m])])
 
     def pack(idx):
         return {
-            "threshold": thresholds[idx],
-            "recall": recall[idx],
-            "specificity": specificity[idx],
-            "gmean": np.sqrt(recall[idx] * specificity[idx]),
-            "min_recall_spec": min(recall[idx], specificity[idx]),
+            "threshold": float(thresholds[idx]),
+            "recall": float(recall[idx]),
+            "specificity": float(specificity[idx]),
+            "gmean": float(np.sqrt(recall[idx] * specificity[idx])),
+            "min_recall_spec": float(min(recall[idx], specificity[idx])),
         }
 
     return {"gmean_opt": pack(idx_g), "minside_opt": pack(idx_min)}
