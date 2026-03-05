@@ -755,6 +755,11 @@ def evaluate_binary_oct(
         out.to_csv(pred_path, index=False)
         print(f"✓ Saved OCT predictions to: {pred_path}")
         _save_tree_splits(iai_model, tree_path)
+        # Save interactive tree HTML in the same folder as splits
+        if hasattr(iai_model, "write_html"):
+            html_path = tree_path.replace(".json", ".html")
+            iai_model.write_html(html_path)
+            print(f"✓ Saved OCT tree visualization to: {html_path}")
 
     print(f"AUC score: {auc:.3f}")
     print(f"PR-AUC (Average Precision): {pr_auc:.3f}")
