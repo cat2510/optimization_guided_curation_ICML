@@ -27,14 +27,15 @@ import os
 import sys
 from typing import List, Tuple
 
-import h5py
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 # Path setup
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+script_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.abspath(os.path.join(script_dir, "../.."))
 sys.path.insert(0, parent_dir)
+sys.path.insert(0, script_dir)
 
 from public.model_IAI import (
     get_bin_flag_columns,
@@ -42,7 +43,7 @@ from public.model_IAI import (
     get_true_num_columns,
     train_test_split_enrol,
 )
-from msk_analysis.scripts.msk_feature_groups import (
+from msk_feature_groups import (
     get_cost_columns_2017,
     get_utilization_columns,
     get_za_coarse_phenotype_columns,
@@ -54,6 +55,7 @@ from public.precompute_distances import (
     precompute_leaf_dnn_memmap,
     save_distances_hdf5,
 )
+from tie_diagnostics import run_tie_diagnostics
 from pyspark.sql import SparkSession
 
 TRAIN_TEST_SEED = 123
@@ -133,63 +135,6 @@ def precompute_gower_dnn_memmap(
         dnn_mm[s:e, :] = block
     del dnn_mm
     return dnn_matrix_path, dnn_enrolids_path
-
-
-def run_tie_degeneracy_diagnostics(pn_h5_path: str, sample_size: int = 50000) -> None:
-    """
-    Sample distances from PN H5 and print:
-      - number of unique values
-      - fraction of top-5 most frequent distances
-    Detects tie-degeneracy (e.g., sqrt(k) for binary Euclidean).
-    """
-    with h5py.File(pn_h5_path, "r") as f:
-        d = f["distances"]
-        n_maj, n_min = d.shape[0], d.shape[1]
-        rng = np.random.default_rng(42)
-        n_sample = min(sample_size, n_maj * n_min)
-        idx_maj = rng.integers(0, n_maj, size=n_sample)
-        idx_min = rng.integers(0, n_min, size=n_sample)
-        # h5py requires fancy indices in increasing order; read row-by-row
-        sample = np.empty(n_sample, dtype=np.float32)
-        for row in np.unique(idx_maj):
-            mask = idx_maj == row
-            cols = idx_min[mask]
-            row_data = d[row, :]  # full row slice (h5py allows this)
-            sample[mask] = row_data[cols]
-    uniq, counts = np.unique(sample.ravel(), return_counts=True)
-    n_unique = len(uniq)
-    total = counts.sum()
-    top5_frac = counts[np.argsort(-counts)[:5]].sum() / total
-    print(f"  [Tie diagnostics] unique values: {n_unique:,} | top-5 freq frac: {top5_frac:.4f}")
-    if n_unique < 20:
-        print(f"  [WARN] Very few unique distances ({n_unique}) - possible tie degeneracy")
-    if top5_frac > 0.8:
-        print(f"  [WARN] Top-5 distances account for {top5_frac:.1%} - possible tie degeneracy")
-
-
-def run_tie_degeneracy_diagnostics_dnn(dnn_matrix_path: str, sample_size: int = 50000) -> None:
-    """
-    Sample control-control distances from D-N-N matrix and compute:
-      - unique values, top-5 freq frac
-    If top-5 freq is small and uniques are reasonably large, Stage A is fine.
-    """
-    dnn = np.load(dnn_matrix_path, mmap_mode="r")
-    n = dnn.shape[0]
-    rng = np.random.default_rng(42)
-    n_sample = min(sample_size, n * n)
-    idx_i = rng.integers(0, n, size=n_sample)
-    idx_j = rng.integers(0, n, size=n_sample)
-    sample = dnn[idx_i, idx_j]
-    del dnn
-    uniq, counts = np.unique(sample.ravel(), return_counts=True)
-    n_unique = len(uniq)
-    total = counts.sum()
-    top5_frac = counts[np.argsort(-counts)[:5]].sum() / total
-    print(f"  [D-N-N tie diagnostics] unique values: {n_unique:,} | top-5 freq frac: {top5_frac:.4f}")
-    if n_unique < 20:
-        print(f"  [WARN] Very few unique D-N-N distances ({n_unique}) - possible tie degeneracy")
-    if top5_frac > 0.8:
-        print(f"  [WARN] Top-5 D-N-N distances account for {top5_frac:.1%} - possible tie degeneracy")
 
 
 def prepare_za_features(
@@ -295,7 +240,7 @@ def run_za_coarse_phenotype(
         save_distances_hdf5(dist_pn, maj_ids, min_ids, pn_h5)
     else:
         print(f"  Found PN: {pn_h5}")
-    run_tie_degeneracy_diagnostics(pn_h5)
+    run_tie_diagnostics(pn_h5_path=pn_h5, unique_threshold=200, top5_threshold=0.05)
     dnn_mat = os.path.join(dnn_dir, "leaf_global_dnn_matrix.npy")
     if not os.path.exists(dnn_mat):
         print("  Computing D-N-N (Euclidean)...")
@@ -310,7 +255,7 @@ def run_za_coarse_phenotype(
         np.save(os.path.join(dnn_dir, "leaf_global_dnn_enrolids.npy"), maj_ids)
     else:
         print(f"  Found D-N-N: {dnn_dir}")
-    run_tie_degeneracy_diagnostics_dnn(dnn_mat)
+    run_tie_diagnostics(dnn_matrix_path=dnn_mat, unique_threshold=200, top5_threshold=0.05)
 
 
 def run_zb_intensity_context(
@@ -348,7 +293,7 @@ def run_zb_intensity_context(
         save_distances_hdf5(dist_pn, maj_ids, min_ids, pn_h5)
     else:
         print(f"  Found PN: {pn_h5}")
-    run_tie_degeneracy_diagnostics(pn_h5)
+    run_tie_diagnostics(pn_h5_path=pn_h5, unique_threshold=200, top5_threshold=0.05)
     dnn_mat = os.path.join(dnn_dir, "leaf_global_dnn_matrix.npy")
     if not os.path.exists(dnn_mat):
         print("  Computing D-N-N (Gower)...")
@@ -356,6 +301,7 @@ def run_zb_intensity_context(
         np.save(os.path.join(dnn_dir, "leaf_global_dnn_enrolids.npy"), maj_ids)
     else:
         print(f"  Found D-N-N: {dnn_dir}")
+    run_tie_diagnostics(dnn_matrix_path=dnn_mat, unique_threshold=200, top5_threshold=0.05)
 
 
 def main():

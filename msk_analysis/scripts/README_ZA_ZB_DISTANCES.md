@@ -4,11 +4,19 @@
 
 Stage A (k-center dispersion) and Stage B (minority-majority matching) can use different feature sets and distance metrics via precomputed artifacts. This avoids tie-heavy Euclidean in sparse binary medical spaces and tail-heavy dispersion in cost-intensity spaces.
 
-## New Distance Folders
+## Z_A Presets (Stage A)
+
+| Preset | Features | Metric (default) |
+|--------|----------|------------------|
+| `ZA_v0_flags_only` | 18 `has_*` flags (current baseline) | Euclidean |
+| `ZA_v1_flags_plus_counts` | Flags + comorbidity_count, msk_flag_count, non_msk_comorbidity_count | Gower |
+| `ZA_v2_flags_plus_intensity_norm` | ZA_v1 + log1p(intensity), age continuous | Gower |
+| `za_coarse_phenotype` | Legacy: same as ZA_v0 | Euclidean |
+
+## Z_B (Stage B)
 
 | Folder | Purpose | Features | Metric |
 |--------|---------|----------|--------|
-| `precomputed_distances_msk_za_coarse_phenotype/` | Stage A (dispersion) | Coarse clinical phenotype: comorbidity flags (`has_*`), no raw cost/intensity | Euclidean |
 | `precomputed_distances_msk_zb_intensity_context/` | Stage B (matching) | Utilization + context: claims, demographics, cost intensity; excludes granular dx/med | Gower |
 
 ### Feature group utilities (scripts/msk_feature_groups.py)
@@ -23,14 +31,17 @@ validate_no_2018_leakage() – checks features for 2018 leakage
 
 ## How to Build
 
-Run from `msk_analysis`:
-
+**Legacy (za_coarse_phenotype + zb_intensity_context):**
 ```bash
 cd msk_analysis
 python scripts/precompute_msk_distances_za_zb.py --parquet msk_2017_18_full.parquet --seed 123
 ```
 
-This creates both folders. Use `--za_only` or `--zb_only` to build just one.
+**Z_A variants (recommended for tie-degeneracy fix):**
+```bash
+python scripts/precompute_msk_ZA_variants.py --za_preset ZA_v1_flags_plus_counts --metric gower --compute_dnn 1 --compute_pn 0 --run_diagnostics 1
+python scripts/precompute_msk_ZA_variants.py --za_preset ZA_v2_flags_plus_intensity_norm --metric gower --compute_dnn 1 --run_stageA_overlap_test 1
+```
 
 ## Artifact Schema (compatible with `two_stage_kcenter_then_match`)
 
@@ -53,7 +64,9 @@ High tie fraction or very few unique values indicate possible tie degeneracy.
 
 ```bash
 cd msk_analysis
-python run_za_zb_stage_ablation.py --stageA za_coarse_phenotype --stageB zb_intensity_context
+python scripts/run_za_zb_stage_ablation.py --stageA ZA_v1_flags_plus_counts --stageB zb_intensity_context
+# or legacy:
+python scripts/run_za_zb_stage_ablation.py --stageA za_coarse_phenotype --stageB zb_intensity_context
 ```
 
-Stage A uses DNN matrix from the `--stageA` folder; Stage B uses PN H5 from the `--stageB` folder.
+Stage A uses DNN matrix from the `--stageA` folder; Stage B uses PN H5 from the `--stageB` folder. Results (including selected_majority_cost2018_median, timestamps) are appended to `za_zb_stage_ablation_results/summary.csv`.

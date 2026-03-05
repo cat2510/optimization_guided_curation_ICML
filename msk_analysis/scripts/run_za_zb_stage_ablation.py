@@ -4,26 +4,24 @@ run_za_zb_stage_ablation.py
 ===========================
 Runner for two-stage sampling with Stage A and Stage B pointing to different
 distance folders. No changes to sampling logic - only path construction.
-
-Usage:
-  cd msk_analysis
-  python scripts/run_za_zb_stage_ablation.py --stageA za_coarse_phenotype --stageB zb_intensity_context
-  # not recommended: --stageA zb_intensity_context --stageB za_coarse_phenotype
-
-Valid folder names: za_coarse_phenotype, zb_intensity_context, medical_only,
-  with_cost_features, cost_only (must exist under precomputed_distances_msk_<name>/)
+Logs cost distribution of selected majority, timestamps, and OCT metrics.
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import sys
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+script_dir = os.path.dirname(os.path.abspath(__file__))
+msk_dir = os.path.dirname(script_dir)
+parent_dir = os.path.dirname(msk_dir)
 sys.path.insert(0, parent_dir)
+sys.path.insert(0, msk_dir)
 
 from public.model_IAI import (
     get_bin_flag_columns,
@@ -38,6 +36,36 @@ from pyspark.sql import SparkSession
 
 TRAIN_TEST_SEED = 123
 DIST_DIR_TEMPLATE = "./precomputed_distances_msk_{distance_features}"
+TARGET_COL = "annual_cost_2018_deflated" # only used for get_selected_majority_cost_stats(), not target_col in this specific script, which is "top_2_pct_cost_2018"
+FILTER_COL = "top_2_pct_cost_2018" # only used for get_selected_majority_cost_stats()
+
+SUMMARY_COLUMNS = [
+    "combo_tag", "stageA", "stageB", "run_timestamp",
+    "mean_match_cost", "q50_match_cost", "q90_match_cost",
+    "selected_majority_cost2018_median", "selected_majority_cost2018_q25",
+    "selected_majority_cost2018_q75", "selected_majority_cost2018_mean",
+    "pr_auc", "auc", "best_mcc", "best_depth", "best_minbucket", "best_cp",
+]
+
+
+def get_selected_majority_cost_stats(
+    csv_path: str,
+    target_col: str = TARGET_COL,
+    filter_col: str = FILTER_COL,
+) -> dict:
+    """Cost distribution of selected majority only (filter_col==0)."""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+    df = pd.read_csv(csv_path, usecols=[target_col, filter_col])
+    maj = df[df[filter_col] == 0][target_col]
+    if len(maj) == 0:
+        raise ValueError(f"No majority rows (filter_col==0) in {csv_path}")
+    return {
+        "selected_majority_cost2018_median": float(maj.median()),
+        "selected_majority_cost2018_q25": float(maj.quantile(0.25)),
+        "selected_majority_cost2018_q75": float(maj.quantile(0.75)),
+        "selected_majority_cost2018_mean": float(maj.mean()),
+    }
 
 
 def get_distance_paths(distance_features: str, seed: int):
@@ -69,7 +97,7 @@ def main():
 
     spark = SparkSession.builder.appName("ZAZBStageAblation").getOrCreate()
     df = spark.read.format("parquet").load(args.parquet).toPandas()
-    target_col = "top_2_pct_cost_2018"
+    target_col = "top_2_pct_cost_2018" # in this specific script, this is not TARGET_COL, which is "annual_cost_2018_deflated"
     if target_col not in df.columns and "annual_cost_2018_deflated" in df.columns:
         thresh = df["annual_cost_2018_deflated"].quantile(0.98)
         df[target_col] = (df["annual_cost_2018_deflated"] >= thresh).astype(int)
@@ -121,6 +149,21 @@ def main():
     train_undersampled.to_csv(csv_path, index=False)
     print(f"Saved undersampled CSV: {csv_path}")
 
+    if TARGET_COL not in train_undersampled.columns:
+        raise ValueError(f"annual_cost_2018_deflated missing in data; required for cost diagnostics")
+    cost_stats = get_selected_majority_cost_stats(csv_path)
+    match_costs = result.get("match_costs")
+    match_stats = {}
+    if match_costs is not None and hasattr(match_costs, "__len__") and len(match_costs) > 0:
+        mc = np.asarray(match_costs)
+        match_stats = {
+            "mean_match_cost": float(np.mean(mc)),
+            "q50_match_cost": float(np.quantile(mc, 0.50)),
+            "q90_match_cost": float(np.quantile(mc, 0.90)),
+        }
+    print(f"  Selection diagnostics: mean_match_cost={match_stats.get('mean_match_cost', 'N/A')} | "
+          f"selected_majority_cost2018_median={cost_stats['selected_majority_cost2018_median']:,.0f}")
+
     # OCT
     model, params, _, preprocessor, feat_names = finetune_oct(
         X_train=train_undersampled[feature_cols],
@@ -146,7 +189,30 @@ def main():
         results_dir=oct_dir,
         save_suffix=f"{bd}_{bm}_{bcp}",
     )
+    run_timestamp = datetime.now(timezone.utc).isoformat()
+    summary_path = os.path.join(args.outdir, "summary.csv")
+    row = {
+        "combo_tag": combo_tag,
+        "stageA": args.stageA,
+        "stageB": args.stageB,
+        "run_timestamp": run_timestamp,
+        **match_stats,
+        **cost_stats,
+        "pr_auc": metrics.get("pr_auc"),
+        "auc": metrics.get("auc"),
+        "best_mcc": metrics.get("best_mcc"),
+        "best_depth": bd,
+        "best_minbucket": bm,
+        "best_cp": bcp,
+    }
+    write_header = not os.path.exists(summary_path)
+    with open(summary_path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SUMMARY_COLUMNS, extrasaction="ignore")
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
     print(f"PR-AUC: {metrics.get('pr_auc', 0):.4f}  AUC: {metrics.get('auc', 0):.4f}")
+    print(f"Summary appended to {summary_path}")
     print("Done.")
 
 

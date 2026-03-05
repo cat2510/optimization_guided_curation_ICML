@@ -88,7 +88,7 @@ def parse_args():
     p.add_argument("--random_seeds", nargs="+", type=int, default=list(range(5)),
                    help="Seeds for random 1:1 baseline")
 
-    p.add_argument("--M_pool", type=int, default=50000)
+    p.add_argument("--M_pool", type=int, default=50000) # or 80000 for E11 Mar 5
     p.add_argument("--seed_method", type=str, default="smart")
 
     # OCT grid
@@ -466,6 +466,10 @@ def run_one_cohort(code: str, spark: SparkSession, args) -> list[dict]:
             save_suffix=save_sfx,
         )
 
+        # Save model JSON for deployment (HTML is saved by evaluate_binary_oct)
+        if hasattr(model, "write_json"):
+            model.write_json(str(curated_dir / f"oct_model_{save_sfx}.json"))
+
         extra = evaluate_oct_custom(
             model, X_val, y_val, X_test, y_test,
             preprocessor, feat_names,
@@ -563,6 +567,10 @@ def run_one_cohort(code: str, spark: SparkSession, args) -> list[dict]:
                 results_dir=str(rnd_dir),
                 save_suffix=save_sfx,
             )
+
+            # Save model JSON for deployment (HTML is saved by evaluate_binary_oct)
+            if hasattr(model, "write_json"):
+                model.write_json(str(rnd_dir / f"oct_model_{save_sfx}.json"))
 
             extra = evaluate_oct_custom(
                 model, X_val, y_val, X_test, y_test,

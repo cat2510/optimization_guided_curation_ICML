@@ -7,6 +7,17 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
+import numpy as np
+import pandas as pd
+
+ZA_PRESETS = ["ZA_v0_flags_only", "ZA_v1_flags_plus_counts", "ZA_v2_flags_plus_intensity_norm"]
+
+# MSK subgroup flags (Arthropathies, Dorsopathies, etc.)
+MSK_SUBGROUP_FLAGS = [
+    "has_Arthropathies", "has_Dorsopathies", "has_Soft_tissue",
+    "has_Osteopathies", "has_Other_MSK",
+]
+
 
 def _exclude_2018(col: str) -> bool:
     """True if column should be excluded (2018 leakage)."""
@@ -98,6 +109,77 @@ def get_za_coarse_phenotype_columns(
     # Also exclude columns that appear in cost/util
     exclude = set(cost_cols) | set(utilization_cols)
     return [c for c in coarse if c not in exclude]
+
+
+def _get_base_za_flags(df, bin_flag_cols: List[str], cost_cols: List[str], utilization_cols: List[str]) -> List[str]:
+    """Base 18 has_* flags (no cost-derived). Same logic as get_za_coarse_phenotype_columns."""
+    coarse = [
+        c for c in bin_flag_cols
+        if c in df.columns and c.startswith("has_") and not _exclude_2018(c)
+    ]
+    cost_kw = ["increasing", "decreasing", "cost", "quarterly", "deriv", "skewness", "kurtosis", "cv", "range"]
+    coarse = [c for c in coarse if not any(kw in c.lower() for kw in cost_kw)]
+    exclude = set(cost_cols) | set(utilization_cols)
+    return [c for c in coarse if c not in exclude]
+
+
+def get_ZA_columns(
+    df: pd.DataFrame,
+    preset_name: str,
+    bin_flag_cols: List[str],
+    cat_cols: List[str],
+    cost_cols: List[str],
+    utilization_cols: List[str],
+) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Return (df_copy_with_derived_cols, feature_column_list) for the Z_A preset.
+    df_copy may have temporary derived columns added; originals unchanged.
+    """
+    df = df.copy()
+    base_flags = _get_base_za_flags(df, bin_flag_cols, cost_cols, utilization_cols)
+    if not base_flags:
+        raise ValueError("No base has_* flags found for Z_A")
+
+    cols = list(base_flags)
+
+    if preset_name == "ZA_v0_flags_only":
+        return df, cols
+
+    # ZA_v1: add counts
+    msk_flags = [c for c in MSK_SUBGROUP_FLAGS if c in df.columns]
+    non_msk_comorbidity = [c for c in base_flags if c not in set(msk_flags)]
+    df["_za_comorbidity_count"] = df[base_flags].sum(axis=1).astype(int)
+    df["_za_msk_flag_count"] = df[msk_flags].sum(axis=1).astype(int) if msk_flags else 0
+    df["_za_non_msk_comorbidity_count"] = df[non_msk_comorbidity].sum(axis=1).astype(int) if non_msk_comorbidity else 0
+    cols.extend(["_za_comorbidity_count", "_za_msk_flag_count", "_za_non_msk_comorbidity_count"])
+
+    if preset_name == "ZA_v1_flags_plus_counts":
+        return df, cols
+
+    # ZA_v2: add intensity (log1p note that this is not available in MSK data) and age 
+    util_cols = [c for c in df.columns if "claims" in c.lower() or "util" in c.lower() or "n_unique" in c.lower() or "n_dx" in c.lower()]
+    util_cols = [c for c in util_cols if not _exclude_2018(c)]
+    intensity_col = None
+    if util_cols:
+        for cand in ["total_claims_2017", "utilization_total_2017", "n_unique_dx_2017", "unique_dx_count_2017"]:
+            if cand in df.columns:
+                intensity_col = cand
+                break
+        if intensity_col is None and util_cols:
+            intensity_col = util_cols[0]
+    if intensity_col:
+        col = np.asarray(df[intensity_col].fillna(0).values, dtype=np.float64)
+        p99 = np.nanpercentile(col, 99.5)
+        col = np.clip(col, 0, p99)
+        df["_za_intensity_log1p"] = np.log1p(col)
+        cols.append("_za_intensity_log1p")
+
+    if "AGEGRP" in df.columns:
+        #age_map = {"18-24": 1, "25-34": 2, "35-44": 3, "45-54": 4, "55-64": 5, "65+": 6}
+        df["_za_age_continuous"] = df["AGEGRP"].astype(float)
+        cols.append("_za_age_continuous")
+
+    return df, cols
 
 
 def get_zb_intensity_context_columns(
