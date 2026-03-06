@@ -231,8 +231,8 @@ def augment_one_condition(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_dir", type=str, default="/Users/charles/DATA/misc_conditions")
-    parser.add_argument("--features_dir", type=str, default="/Users/charles/DATA/misc_conditions_features")
-    parser.add_argument("--out_dir", type=str, default="/Users/charles/DATA/misc_conditions_features_augmented")
+    parser.add_argument("--features_dir", type=str, default="/Users/cat2510/scratch/misc_conditions_features")
+    parser.add_argument("--out_dir", type=str, default="/Users/cat2510/scratch/misc_conditions_features_augmented")
     parser.add_argument("--baseline_year", type=int, default=2017)
     parser.add_argument("--outcome_year", type=int, default=2018)
     parser.add_argument("--codes", type=str, default="")

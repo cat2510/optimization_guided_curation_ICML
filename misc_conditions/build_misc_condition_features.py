@@ -80,13 +80,19 @@ def build_annual_costs_and_labels(
     baseline_year: int,
     outcome_year: int,
     inflation: Dict[int, float],
+    outcome_years: Optional[List[int]] = None,
     enrolid_col: str = "ENROLID",
     date_col: str = "SVCDATE",
 ) -> Tuple[DataFrame, Dict[str, float]]:
     """
-    Creates deflated annual costs for baseline/outcome years + percentile labels for outcome year.
+    Creates deflated annual costs for baseline/outcome years + percentile labels.
+    When outcome_years is provided (e.g. [2018, 2019] for I25/I50), labels are positive if
+    the enrollee is in top 2%/5%/10% in *any* of those years.
     Uses RX-only filtering if possible (to match your MSK approach), otherwise uses all claims.
     """
+    years_to_use = outcome_years if outcome_years else [outcome_year]
+    all_years = [baseline_year] + years_to_use
+
     df_claims = ensure_date(df_claims, date_col)
     cost_col = pick_cost_column(df_claims)
 
@@ -95,7 +101,7 @@ def build_annual_costs_and_labels(
 
     df = (
         df_claims.withColumn("YEAR", F.year(F.col(date_col)))
-                 .filter(F.col("YEAR").isin([baseline_year, outcome_year]))
+                 .filter(F.col("YEAR").isin(all_years))
                  .withColumn("inflation_factor", infl_expr[F.col("YEAR")])
                  .withColumn("COST_DEF", F.col(cost_col) / F.col("inflation_factor"))
                  .drop("inflation_factor")
@@ -117,24 +123,50 @@ def build_annual_costs_and_labels(
         annual.filter(F.col("YEAR") == baseline_year)
               .select(enrolid_col, F.col("annual_cost_deflated").alias(f"annual_cost_{baseline_year}_deflated"))
     )
-    out = (
-        annual.filter(F.col("YEAR") == outcome_year)
-              .select(enrolid_col, F.col("annual_cost_deflated").alias(f"annual_cost_{outcome_year}_deflated"))
-    )
 
-    merged = base.join(out, on=enrolid_col, how="inner")
+    merged = base
+    for y in years_to_use:
+        out = (
+            annual.filter(F.col("YEAR") == y)
+                  .select(enrolid_col, F.col("annual_cost_deflated").alias(f"annual_cost_{y}_deflated"))
+        )
+        how = "inner" if len(years_to_use) == 1 else "left"
+        merged = merged.join(out, on=enrolid_col, how=how)
 
-    out_cost_col = f"annual_cost_{outcome_year}_deflated"
-    # Approx quantiles for thresholding (fast)
-    p90, p95, p98 = merged.approxQuantile(out_cost_col, [0.90, 0.95, 0.98], 0.001)
-    thresholds = {"p90": float(p90), "p95": float(p95), "p98": float(p98)}
+    if len(years_to_use) == 1:
+        out_cost_col = f"annual_cost_{outcome_year}_deflated"
+        p90, p95, p98 = merged.approxQuantile(out_cost_col, [0.90, 0.95, 0.98], 0.001)
+        thresholds = {"p90": float(p90), "p95": float(p95), "p98": float(p98)}
+        merged = (
+            merged.withColumn(f"top_10_pct_cost_{outcome_year}", (F.col(out_cost_col) >= F.lit(p90)).cast("int"))
+                  .withColumn(f"top_5_pct_cost_{outcome_year}",  (F.col(out_cost_col) >= F.lit(p95)).cast("int"))
+                  .withColumn(f"top_2_pct_cost_{outcome_year}",  (F.col(out_cost_col) >= F.lit(p98)).cast("int"))
+        )
+    else:
+        label_suffix = "_".join(str(y) for y in years_to_use)
+        top10_col = f"top_10_pct_cost_{label_suffix}"
+        top5_col = f"top_5_pct_cost_{label_suffix}"
+        top2_col = f"top_2_pct_cost_{label_suffix}"
+        top10_parts, top5_parts, top2_parts = [], [], []
+        thresholds = {}
+        for y in years_to_use:
+            out_cost_col = f"annual_cost_{y}_deflated"
+            p90, p95, p98 = merged.approxQuantile(out_cost_col, [0.90, 0.95, 0.98], 0.001)
+            thresholds[f"p90_{y}"] = float(p90)
+            thresholds[f"p95_{y}"] = float(p95)
+            thresholds[f"p98_{y}"] = float(p98)
+            top10_parts.append(F.when(F.col(out_cost_col) >= F.lit(p90), 1).otherwise(0))
+            top5_parts.append(F.when(F.col(out_cost_col) >= F.lit(p95), 1).otherwise(0))
+            top2_parts.append(F.when(F.col(out_cost_col) >= F.lit(p98), 1).otherwise(0))
+        merged = (
+            merged.withColumn(top10_col, F.greatest(*top10_parts).cast("int"))
+                  .withColumn(top5_col, F.greatest(*top5_parts).cast("int"))
+                  .withColumn(top2_col, F.greatest(*top2_parts).cast("int"))
+        )
+        merged = merged.withColumn(f"top_10_pct_cost_{outcome_year}", F.col(top10_col))
+        merged = merged.withColumn(f"top_5_pct_cost_{outcome_year}", F.col(top5_col))
+        merged = merged.withColumn(f"top_2_pct_cost_{outcome_year}", F.col(top2_col))
 
-
-    merged = (
-        merged.withColumn(f"top_10_pct_cost_{outcome_year}", (F.col(out_cost_col) >= F.lit(p90)).cast("int"))
-              .withColumn(f"top_5_pct_cost_{outcome_year}",  (F.col(out_cost_col) >= F.lit(p95)).cast("int"))
-              .withColumn(f"top_2_pct_cost_{outcome_year}",  (F.col(out_cost_col) >= F.lit(p98)).cast("int"))
-    )
     return merged, thresholds
 
 
@@ -636,7 +668,7 @@ def build_features_for_condition(
     condition_regex = rf"^{re.escape(code.upper())}"
     print("Build annual cost labels and thresholds")
 
-    # 1) annual cost labels
+    # 1) annual cost labels (I25/I50 dual-year labels are applied in misc_conditions.ipynb)
     costs_labels, thresholds = build_annual_costs_and_labels(
         df_claims, baseline_year, outcome_year, inflation
     )
@@ -713,7 +745,7 @@ def build_features_for_condition(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_dir", type=str, default="/Users/charles/DATA/misc_conditions")
-    parser.add_argument("--out_dir", type=str, default="/Users/cat2510/my_projects/other_conditions/misc_conditions_features")
+    parser.add_argument("--out_dir", type=str, default="/Users/cat2510/scratch/misc_conditions_features")
     parser.add_argument("--baseline_year", type=int, default=2017)
     parser.add_argument("--outcome_year", type=int, default=2018)
     parser.add_argument("--codes", type=str, default="")  # comma-separated override
@@ -733,7 +765,7 @@ def main():
         _ = df_redbook.count()  # materialize cache
         print(f"Loaded redbook: /Users/Charles/DATA/ckd/redbook")
     else:
-        print(f"[WARN] redbook not found at {args.redbook_dir}; skipping medication features.")
+        print(f"[WARN] redbook not found at {rb_path}; skipping medication features.")
 
     base_dir = Path(args.base_dir)
     out_dir = Path(args.out_dir)
@@ -765,6 +797,8 @@ def main():
             k_cond_icd=args.k_cond_icd,
             k_comorb_icd=args.k_comorb_icd,
             k_proc=args.k_proc,
+            df_redbook=df_redbook,
+            k_med_thercls=args.add_k_med_thercls,
         )
 
     spark.stop()

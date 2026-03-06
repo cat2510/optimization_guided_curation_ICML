@@ -66,7 +66,7 @@ except Exception:
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--codes", type=str,
-                   default="I25,I50", #"C50,C61,E10,E11,E66,E78,F32,"" ## E78 and E66 are GIANT!!
+                   default="I25", #"C50,C61,E10,E11,E66,E78,"" ## F32, E78 and E66 are GIANT!!
                    help="Comma-separated cohort codes")
     p.add_argument("--features_dir", type=str,
                    default="/Users/cat2510/my_projects/misc_conditions/misc_conditions_features_with_meds",
@@ -74,7 +74,7 @@ def parse_args():
     p.add_argument("--baseline_year", type=int, default=2017)
     p.add_argument("--outcome_year", type=int, default=2018)
     p.add_argument("--train_test_seed", type=int, default=123)
-    p.add_argument("--output_root", type=str, default="./oct_vanilla_multi_cohort")
+    p.add_argument("--output_root", type=str, default="/Users/cat2510/scratch/oct_vanilla_multi_cohort")
 
     # OCT grid (small, as requested)
     p.add_argument("--depths", nargs="+", type=int, default=[7])
@@ -127,34 +127,6 @@ def pick_feature_cols(df: pd.DataFrame, target_col: str, outcome_year: int) -> l
     return cols
 
 
-def _predict_scores(model, X_df, preprocessor, feat_names) -> np.ndarray:
-    Xp = preprocessor.transform(X_df)
-    Xp_df = pd.DataFrame(Xp, columns=feat_names)
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(Xp_df)
-        proba = np.asarray(proba)
-        if proba.ndim == 2 and proba.shape[1] >= 2:
-            return proba[:, 1].astype(float)
-        return proba.reshape(-1).astype(float)
-    # fallback
-    return np.asarray(model.predict(Xp_df)).astype(float)
-
-
-def _rates_at_threshold(y_true: np.ndarray, scores: np.ndarray, thr: float) -> dict:
-    y_pred = (scores >= thr).astype(int)
-    if _HAS_SK:
-        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    else:
-        tn = int(((y_true == 0) & (y_pred == 0)).sum())
-        fp = int(((y_true == 0) & (y_pred == 1)).sum())
-        fn = int(((y_true == 1) & (y_pred == 0)).sum())
-        tp = int(((y_true == 1) & (y_pred == 1)).sum())
-
-    recall = tp / (tp + fn) if (tp + fn) else 0.0
-    spec = tn / (tn + fp) if (tn + fp) else 0.0
-    gmean = math.sqrt(max(recall * spec, 0.0))
-    return {"recall": recall, "specificity": spec, "gmean": gmean, "threshold": float(thr)}
-
 # ----------------------------
 # Per-cohort runner
 # ----------------------------
@@ -168,6 +140,13 @@ def run_one_cohort(code: str, args) -> dict:
 
     target_col = ensure_target(df, args.outcome_year)
     feature_cols = pick_feature_cols(df, target_col, args.outcome_year)
+
+    if len(df) > 1_000_000:
+        from sklearn.model_selection import train_test_split
+        df, _ = train_test_split(
+            df, train_size=0.5, stratify=df[target_col], random_state=args.train_test_seed
+        )
+        print(f"  Sampled to {len(df):,} rows (stratified on {target_col})")
 
     BIN_FLAG_COLUMNS = get_bin_flag_columns(df)
     CAT_COLUMNS = get_cat_columns(df)
@@ -253,20 +232,12 @@ def run_one_cohort(code: str, args) -> dict:
     }
 
     # merge std metrics (AUC/PR-AUC etc. if present) + threshold metrics
-    if isinstance(metrics_std, dict):
-        for k, v in metrics_std.items():
-            # keep only JSON-safe scalars
-            if isinstance(v, (int, float, np.integer, np.floating)) or v is None:
-                row[f"test_{k}"] = float(v) if v is not None else np.nan
+    for k, v in metrics_std.items():
+        # keep only JSON-safe scalars
+        if isinstance(v, (int, float, np.integer, np.floating)) or v is None:
+            row[f"test_{k}"] = float(v) if v is not None else np.nan
 
-    print(
-        f"  DONE | "
-        f"recall@Gmean={row['test_recall_at_best_gmean']:.3f}, "
-        f"spec@Gmean={row['test_specificity_at_best_gmean']:.3f} | "
-        f"recall@spec>=0.6={row['test_recall_at_specfloor']:.3f}, "
-        f"spec@spec>=0.6={row['test_specificity_at_specfloor']:.3f} | "
-        f"time={train_time:.1f}s train + {eval_time:.1f}s eval"
-    )
+    
     return row
 
 

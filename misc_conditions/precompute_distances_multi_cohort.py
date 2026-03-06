@@ -51,7 +51,7 @@ def parse_args():
 
     # Where to write distances; uses template to match later training script
     p.add_argument("--distances_dir_template", type=str,
-                   default="./precomputed_distances_{code}_with_cost_features",
+                   default="/Users/cat2510/scratch/precomputed_distances_{code}_with_cost_features",
                    help="Where to write distances per cohort")
 
     p.add_argument("--train_test_seed", type=int, default=123)
@@ -158,6 +158,13 @@ def run_one(code: str, args):
 
     target_col = ensure_target(df, args.outcome_year)
     feat_cols = pick_feature_cols(df, target_col, args.outcome_year, args.feature_regex)
+
+    if len(df) > 1_000_000:
+        from sklearn.model_selection import train_test_split
+        df, _ = train_test_split(
+            df, train_size=0.5, stratify=df[target_col], random_state=args.train_test_seed
+        )
+        print(f"  Sampled to {len(df):,} rows (stratified on {target_col})")
 
     print(f"  Target: {target_col} | Features: {len(feat_cols)}")
 

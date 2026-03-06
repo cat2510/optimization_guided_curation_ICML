@@ -80,28 +80,30 @@ def parse_args():
     p.add_argument("--outcome_year", type=int, default=2018)
 
     p.add_argument("--distances_dir_template", type=str,
-                   default="/Users/cat2510/my_projects/misc_conditions/precomputed_distances_{code}_100_features",
+                   default="/Users/cat2510/scratch/precomputed_distances_{code}_with_cost_features",
                    help="Template for cohort-specific distance dir, e.g. ./precomputed_distances_{code}")
 
+    p.add_argument("--sample_huge_cohort", action="store_true", default=False,
+                   help="Sample huge cohort to half the number of rows")
     p.add_argument("--train_test_seed", type=int, default=123)
 
     p.add_argument("--random_seeds", nargs="+", type=int, default=list(range(5)),
                    help="Seeds for random 1:1 baseline")
 
-    p.add_argument("--M_pool", type=int, default=50000) # or 80000 for E11 Mar 5
-    p.add_argument("--seed_method", type=str, default="smart")
+    p.add_argument("--M_pool", type=int, default=80000) # or 80000 for E11 Mar 5
+    p.add_argument("--seed_method", type=str, default="random")
 
     # OCT grid
     p.add_argument("--depths", nargs="+", type=int, default=[7])
     p.add_argument("--minbuckets", nargs="+", type=int, default=[100])
-    p.add_argument("--cps", nargs="+", type=float, default=[0.0001, 0.001, 0.01])
+    p.add_argument("--cps", nargs="+", type=float, default=[0.0001, 0.01,0.001])
 
     # Evaluation
     p.add_argument("--spec_floor", type=float, default=0.60,
                    help="Specificity floor for 'max recall subject to spec>=floor' thresholding on val")
 
     # Output
-    p.add_argument("--output_root", type=str, default="/Users/cat2510/my_projects/misc_conditions/oct_curated_vs_random_1to1_multi")
+    p.add_argument("--output_root", type=str, default="/Users/cat2510/scratch/oct_curated_vs_random_1to1_multi")
     p.add_argument("--spark_app", type=str, default="CuratedVsRandom1to1MultiCohort")
 
     return p.parse_args()
@@ -334,12 +336,19 @@ def run_one_cohort(code: str, spark: SparkSession, args) -> list[dict]:
     print(f"  Features: {feat_path}")
 
     # Load features parquet
-    df_spark = spark.read.format("parquet").load(str(feat_path))
-    df = df_spark.toPandas()
+    df = pd.read_parquet(str(feat_path))
+
 
     target_col, feature_cols = pick_target_and_features(df, args.baseline_year, args.outcome_year)
     print(f"  Target: {target_col}")
     print(f"  #features: {len(feature_cols)}")
+
+    if len(df) > 1_000_000 and args.sample_huge_cohort:
+        from sklearn.model_selection import train_test_split
+        df, _ = train_test_split(
+            df, train_size=0.5, stratify=df[target_col], random_state=args.train_test_seed
+        )
+        print(f"  Sampled to {len(df):,} rows (stratified on {target_col})")
 
     # Column types for OCT preprocessor (your helpers)
     BIN_FLAG_COLUMNS = get_bin_flag_columns(df)
@@ -420,7 +429,6 @@ def run_one_cohort(code: str, spark: SparkSession, args) -> list[dict]:
             seed_method=args.seed_method,
             matching_ratio=1,
             case_weighting=None,
-            quota_cfg=None,
         )
         matching_time = time.perf_counter() - match_t0
 
