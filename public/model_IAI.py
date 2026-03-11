@@ -91,10 +91,57 @@ def train_test_split_enrol(df, target_col, test_size=0.3, random_state=42,verbos
 def get_cat_columns(df):
     cols= df.select_dtypes(include=["object","category","string"]).columns.tolist()
     return [col for col in cols if col != "ENROLID"]
-def get_bin_flag_columns(df):
-    return [col for col in df.columns if col.startswith("has_") or "THRCLS" in col.upper()
-    or col.endswith("adherent") or col.startswith("early_")
-    or col.startswith("is_") or "is_increasing" in col.lower() or "is_decreasing" in col.lower()]
+
+
+import pandas as pd
+import numpy as np
+
+def is_binary_01_series(s: pd.Series) -> bool:
+    """
+    Return True if the non-missing values of s are only in {0, 1},
+    allowing int/float/bool representations like 0, 1, 0.0, 1.0, True, False.
+    """
+    non_null = s.dropna()
+    if non_null.empty:
+        return False
+
+    # Convert bools to ints; leave numerics as numerics
+    if pd.api.types.is_bool_dtype(non_null):
+        vals = set(non_null.astype(int).unique())
+        return vals.issubset({0, 1})
+
+    # Try numeric coercion; if strings like "0"/"1" appear, this still works
+    coerced = pd.to_numeric(non_null, errors="coerce")
+    if coerced.isna().any():
+        return False
+
+    vals = set(coerced.unique())
+    return vals.issubset({0, 1})
+
+
+def get_bin_flag_columns(df: pd.DataFrame):
+    bin_cols = []
+
+    for col in df.columns:
+        col_l = col.lower()
+
+        name_match = (
+            col.startswith("has_")
+            or "thrcls" in col.upper()
+            or col.endswith("adherent")
+            or col.startswith("early_")
+            or "is_" in col_l
+            or "increasing" in col_l
+            or "decreasing" in col_l
+        )
+
+        value_match = is_binary_01_series(df[col])
+
+        if name_match or value_match:
+            bin_cols.append(col)
+
+    return bin_cols
+    
 def get_true_num_columns(df, CAT_COLUMNS,BIN_FLAG_COLUMNS):
     return [
         col for col in df.columns
