@@ -104,62 +104,6 @@ def get_true_num_columns(df, CAT_COLUMNS,BIN_FLAG_COLUMNS):
     ]
 
 
-def train_oct_with_feature_names(X_train, y_train, 
-                                 categorical_cols, numeric_cols,
-                                 max_depth=5, minbucket=50, cp=0.001):
-    """
-    Train IAI with proper feature names by transforming data first
-    
-    This is the RECOMMENDED approach - transform first, then train IAI directly
-    """
-    
-    # Step 1: Create and fit preprocessor
-    preprocessor = get_preprocessor_with_impute(X_train, categorical_cols, numeric_cols)
-    
-    # Step 2: Fit and transform
-    X_train_transformed = preprocessor.fit_transform(X_train)
-    
-    # Step 3: Get feature names after transformation
-    feature_names = []
-    
-    for name, transformer, columns in preprocessor.transformers_:
-        if name == 'ohe':
-            # OneHotEncoder - get encoded feature names
-            ohe_features = transformer.get_feature_names_out(columns)
-            feature_names.extend(ohe_features)
-        elif name == 'num':
-            # StandardScaler - keeps same names
-            feature_names.extend(columns)
-        elif name == 'remainder':
-            # Passthrough features
-            if preprocessor.remainder == 'passthrough':
-                # Get columns not in other transformers
-                all_cols = X_train.columns.tolist()
-                used_cols = []
-                for _, _, cols in preprocessor.transformers_[:-1]:
-                    used_cols.extend(cols)
-                remainder_cols = [c for c in all_cols if c not in used_cols]
-                feature_names.extend(remainder_cols)
-    
-    # Step 4: Create DataFrames with proper feature names
-    X_train_df = pd.DataFrame(X_train_transformed, columns=feature_names)
-    
-    # Step 5: Train IAI directly (no pipeline needed)
-    
-    iai_model = iai.OptimalTreeClassifier(
-        max_depth=max_depth,
-        minbucket=minbucket,
-        cp=cp,
-        random_seed=42,
-        missingdatamode='always_left'  # Handle missing data: always_left, always_right, or separate_class
-    )
-    
-    iai_model.fit(X_train_df, y_train)
-    
-     
-    return iai_model, preprocessor, feature_names
-
-
 def get_preprocessor_with_impute(X_train, categorical_cols, numeric_cols, binary_cols=None, verbose=True):
     """
     Build preprocessor with conditional imputation.

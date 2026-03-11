@@ -1,0 +1,88 @@
+cat2510@Charles msk_analysis % python train_vanilla_oct.py 
+WARNING: import of MainInclude.eval into Main conflicts with an existing identifier; ignored.
+WARNING: could not import MainInclude.include into Main
+WARNING: import of MainInclude.eval into Main conflicts with an existing identifier; ignored.
+WARNING: could not import MainInclude.include into Main
+WARNING: Using incubator modules: jdk.incubator.vector
+Using Spark's default log4j profile: org/apache/spark/log4j2-defaults.properties
+Setting default log level to "WARN".
+To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
+26/03/06 18:07:56 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+26/03/06 18:07:56 WARN Utils: Service 'SparkUI' could not bind on port 4040. Attempting port 4041.
+26/03/06 18:07:56 WARN Utils: Service 'SparkUI' could not bind on port 4041. Attempting port 4042.
+26/03/06 18:07:58 WARN SparkStringUtils: Truncated the string representation of a plan since it was too large. This behavior can be adjusted by setting 'spark.sql.debug.maxToStringFields'.
+categorical cols:  ['direct_msk_cost_pattern_2017', 'direct_msk_cost_stability_2017', 'msk_procedure_cost_pattern_2017', 'msk_procedure_cost_stability_2017', 'comorbidity_only_cost_pattern_2017', 'comorbidity_only_cost_stability_2017', 'AGEGRP', 'SEX', 'REGION', 'EESTATU'] ... (10 total)
+stage cols:  []
+cost cols (sample):  ['2017Q1_direct_msk_cost_3month', '2017Q1_msk_procedure_cost_3month', '2017Q1_comorbidity_only_cost_3month', '2017Q2_direct_msk_cost_3month', '2017Q2_msk_procedure_cost_3month', '2017Q2_comorbidity_only_cost_3month', '2017Q3_direct_msk_cost_3month', '2017Q3_msk_procedure_cost_3month', '2017Q3_comorbidity_only_cost_3month', '2017Q4_direct_msk_cost_3month'] ... (72 total)
+Number of leftover columns: 0
+
+Available 2018 target columns: ['annual_cost_2018_deflated', 'top_10_pct_cost_2018', 'top_5_pct_cost_2018', 'top_2_pct_cost_2018']
+Using top_2_pct_cost_2018 as target column
+Train shape: (175777, 115), Test shape: (75333, 115)
+Feature cols: 110
+(175777, 115)
+Finetuning IAI OCT with variants=['oct'], depths=[5, 7], minbuckets=[100, 200, 300], cps=[1e-05, 0.0001, 0.001, 0.01] (best PR-AUC)
+→ Building preprocessor w/ conditional imputation:
+   • Cat: OHE on: ['direct_msk_cost_pattern_2017', 'direct_msk_cost_stability_2017', 'msk_procedure_cost_pattern_2017', 'msk_procedure_cost_stability_2017', 'comorbidity_only_cost_pattern_2017', 'comorbidity_only_cost_stability_2017', 'AGEGRP', 'SEX', 'REGION', 'EESTATU']
+   • Num: scale on: ['2017Q1_direct_msk_cost_3month', '2017Q1_msk_procedure_cost_3month', '2017Q1_comorbidity_only_cost_3month', '2017Q2_direct_msk_cost_3month', '2017Q2_msk_procedure_cost_3month', '2017Q2_comorbidity_only_cost_3month', '2017Q3_direct_msk_cost_3month', '2017Q3_msk_procedure_cost_3month', '2017Q3_comorbidity_only_cost_3month', '2017Q4_direct_msk_cost_3month', '2017Q4_msk_procedure_cost_3month', '2017Q4_comorbidity_only_cost_3month', 'direct_msk_cost_annual', 'msk_procedure_cost_annual', 'comorbidity_only_cost_annual', 'direct_msk_cost_deriv_Q1_Q2_2017', 'direct_msk_cost_deriv_Q2_Q3_2017', 'direct_msk_cost_deriv_Q3_Q4_2017', 'direct_msk_total_increasing_quarters_2017', 'direct_msk_is_consistently_increasing_2017', 'direct_msk_is_consistently_decreasing_2017', 'direct_msk_avg_quarterly_derivative_2017', 'direct_msk_quarterly_std_2017', 'direct_msk_quarterly_skewness_2017', 'direct_msk_quarterly_kurtosis_2017', 'direct_msk_quarterly_cv_2017', 'direct_msk_quarterly_max_2017', 'direct_msk_quarterly_min_2017', 'direct_msk_quarterly_range_2017', 'msk_procedure_cost_deriv_Q1_Q2_2017', 'msk_procedure_cost_deriv_Q2_Q3_2017', 'msk_procedure_cost_deriv_Q3_Q4_2017', 'msk_procedure_total_increasing_quarters_2017', 'msk_procedure_is_consistently_increasing_2017', 'msk_procedure_is_consistently_decreasing_2017', 'msk_procedure_avg_quarterly_derivative_2017', 'msk_procedure_quarterly_std_2017', 'msk_procedure_quarterly_skewness_2017', 'msk_procedure_quarterly_kurtosis_2017', 'msk_procedure_quarterly_cv_2017', 'msk_procedure_quarterly_max_2017', 'msk_procedure_quarterly_min_2017', 'msk_procedure_quarterly_range_2017', 'comorbidity_only_cost_deriv_Q1_Q2_2017', 'comorbidity_only_cost_deriv_Q2_Q3_2017', 'comorbidity_only_cost_deriv_Q3_Q4_2017', 'comorbidity_only_total_increasing_quarters_2017', 'comorbidity_only_is_consistently_increasing_2017', 'comorbidity_only_is_consistently_decreasing_2017', 'comorbidity_only_avg_quarterly_derivative_2017', 'comorbidity_only_quarterly_std_2017', 'comorbidity_only_quarterly_skewness_2017', 'comorbidity_only_quarterly_kurtosis_2017', 'comorbidity_only_quarterly_cv_2017', 'comorbidity_only_quarterly_max_2017', 'comorbidity_only_quarterly_min_2017', 'comorbidity_only_quarterly_range_2017']
+   • Binary: passthrough (no scaling) on: ['has_Anemia', 'has_Atherosclerotic_Heart_Disease', 'has_Chronic_Pain', 'has_Depression_Anxiety', 'has_Gastroesophageal_Reflux_Disease', 'has_General_Health_Check', 'has_Hyperlipidemia', 'has_Hypertension', 'has_Long_term_Drug_Therapy', 'has_Obesity', 'has_Sleep_Apnea', 'has_Type_2_Diabetes', 'has_Vitamin_D_Deficiency', 'has_Arthropathies', 'has_Dorsopathies', 'has_Soft_tissue', 'has_Osteopathies', 'has_Other_MSK', 'direct_msk_is_increasing_Q1_Q2_2017', 'direct_msk_is_increasing_Q2_Q3_2017', 'direct_msk_is_increasing_Q3_Q4_2017', 'msk_procedure_is_increasing_Q1_Q2_2017', 'msk_procedure_is_increasing_Q2_Q3_2017', 'msk_procedure_is_increasing_Q3_Q4_2017', 'comorbidity_only_is_increasing_Q1_Q2_2017', 'comorbidity_only_is_increasing_Q2_Q3_2017', 'comorbidity_only_is_increasing_Q3_Q4_2017', 'has_Antihistamines_Comb_', 'has_Anti_Infective_Agents', 'has_Autonomic_Drugs', 'has_Blood_Form_Coagul_Agents', 'has_Cardiovascular_Agents', 'has_Central_Nervous_System', 'has_Diagnostic_Agents', 'has_Electrolytic_Caloric_Water', 'has_Respiratory_Tract_Agents', 'has_Eye_Ear_Nose_Throat', 'has_Gastrointestinal_Drugs', 'has_Hormones_Synthetic_Subst', 'has_Immunosuppressants', 'has_Skin_Mucous_Membrane', 'has_Vitamins_Comb', 'has_Misc_Therapeutic_Agents']
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:01:46
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:01:45
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:01:44
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:01:42
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:01:41
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:01:45
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:01:45
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:01:43
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:01:42
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:01:43
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:01:41
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:01:40
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:02:23
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:02:19
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:02:20
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:02:25
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:02:03
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:02:02
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:02:05
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:02:04
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:02:07
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:02:06
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:02:07
+Training trees...                  100%|████████████████████████████████████████████████████| Time: 0:02:06
+Best params: {'variant': 'oct', 'hyperplane_config': None, 'depth': 5, 'minbucket': 100, 'cp': 1e-05} @ PR-AUC: 0.0398
+Test dataset for OCT application: 37,667 samples
+✓ Predictions completed
+Computing optimal thresholds on validation set (37,666 samples)
+  Applied validation-set thresholds to test set for evaluation
+✓ Saved OCT predictions to: msk_vanilla_oct//predictions/oct_predictions_best_vanilla.csv
+✓ Saved split table (4 splits) to: msk_vanilla_oct//oct_tree_best_vanilla_splits.csv
+✓ Saved OCT tree visualization to: msk_vanilla_oct//oct_tree_best_vanilla.html
+AUC score: 0.600
+PR-AUC (Average Precision): 0.035
+Best MCC (test set, threshold from val): 0.060 @ threshold=0.095731
+Sensitivity (Recall) @MCC*: 0.022
+Specificity @MCC*: 0.998
+Balanced (G-mean) recall (test set, threshold from val): 0.343
+Balanced (G-mean) specificity (test set, threshold from val): 0.848
+Recall @ specificity>=0.60: 0.343 (achieved spec=0.848, thr=0.033452)
+Number of leaves: 5
+
+================================================================================
+MODEL TRAINING COMPLETE
+================================================================================
+
+✅ Trained OCT on K-Center undersampled data:
+   - Training samples: 175,777
+
+⏱️  Runtime:
+   - OCT training time: 3127.26s
+   - Evaluation time: 13.81s
+   - Total time: 3141.07s
+   - Best parameters: {'variant': 'oct', 'hyperplane_config': None, 'depth': 5, 'minbucket': 100, 'cp': 1e-05}
+   - Metrics: {'auc': 0.6003694760801072, 'pr_auc': np.float64(0.03532007034044854),
+    'best_mcc': np.float64(0.05964282058323076), 'recall_mcc': 0.02197802197802198, 
+    'specificity_mcc': 0.9982132705270852, 'optimal_f1': 0.0979020979020979, 
+    'balanced_recall_gmean': 0.3434065934065934, 'balanced_specificity_gmean': 0.8484257830477273, 
+    'recall_at_specificity_0.6': 0.3434065934065934, 'achieved_specificity_0.6': 0.8484257830477273, 
+    'threshold_specificity_0.6': 0.033452256033578175}

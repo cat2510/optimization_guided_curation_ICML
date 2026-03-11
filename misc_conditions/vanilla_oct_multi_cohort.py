@@ -105,26 +105,8 @@ def resolve_feature_path(features_dir: Path, code: str, baseline_year: int, outc
     raise FileNotFoundError(f"No features parquet found for {code}. Tried: {candidates}")
 
 
-def ensure_target(df: pd.DataFrame, outcome_year: int) -> str:
-    target_col = f"top_2_pct_cost_{outcome_year}"
-    annual_col = f"annual_cost_{outcome_year}_deflated"
-
-    if target_col in df.columns:
-        return target_col
-    if annual_col in df.columns:
-        thr = float(df[annual_col].quantile(0.98))
-        df[target_col] = (df[annual_col] >= thr).astype(int)
-        print(f"  Created {target_col} from {annual_col} @98th pct = {thr:,.2f}")
-        return target_col
-    raise ValueError(f"Need either '{target_col}' or '{annual_col}' in the parquet.")
-
-
-def pick_feature_cols(df: pd.DataFrame, target_col: str, outcome_year: int) -> list[str]:
-    exclude = ["ENROLID", target_col] + [c for c in df.columns if str(outcome_year) in c]
-    cols = [c for c in df.columns if c not in exclude]
-    if not cols:
-        raise ValueError("No feature columns left after excluding leakage columns.")
-    return cols
+# Target/feature logic imported from curated (handles outcome_year as int or list for I25/I50)
+from curated_vs_random_1to1_multi_cohort_oct import pick_target_and_features
 
 
 # ----------------------------
@@ -138,8 +120,8 @@ def run_one_cohort(code: str, args) -> dict:
     df = pd.read_parquet(feat_path)
 
 
-    target_col = ensure_target(df, args.outcome_year)
-    feature_cols = pick_feature_cols(df, target_col, args.outcome_year)
+    outcome_years = [2018, 2019] if code in ("I25", "I50") else args.outcome_year
+    target_col, feature_cols = pick_target_and_features(df, args.baseline_year, outcome_years)
 
     if len(df) > 1_000_000:
         from sklearn.model_selection import train_test_split

@@ -15,6 +15,31 @@ def load_nn_memmap(nn_matrix_npy: str, nn_enrolids_npy: str):
     maj_ids = np.load(nn_enrolids_npy)            # (n,) int
     return d_nn, maj_ids
 
+
+def load_nn(nn_matrix_path: str, nn_enrolids_path: str):
+    """
+    Load majority-majority distances from .npy (memmap) or .h5 (HDF5 compressed).
+    Use HDF5 for large matrices to save disk (~3-5x smaller with gzip).
+    Returns (d_nn, maj_ids) where d_nn supports d_nn[i,:] slicing.
+    """
+    maj_ids = np.load(nn_enrolids_path)
+    if nn_matrix_path.endswith('.h5') or nn_matrix_path.endswith('.hdf5'):
+        f = h5py.File(nn_matrix_path, "r")
+        d_dset = f["distances"]
+        # Wrap so we can close file when done; support shape + __getitem__
+        class _H5DnnView:
+            def __getitem__(self, key):
+                return np.asarray(d_dset[key], dtype=np.float32)
+            @property
+            def shape(self):
+                return d_dset.shape
+        d_nn = _H5DnnView()
+        d_nn._h5_file = f  # keep file open
+        return d_nn, maj_ids
+    else:
+        d_nn = np.load(nn_matrix_path, mmap_mode="r")
+        return d_nn, maj_ids
+
 def load_pn_hdf5(pn_h5_path: str):
     """
     Loads majority-minority distances from HDF5.
@@ -706,9 +731,8 @@ def two_stage_kcenter_then_match(
         - seed_enrolid: int, the seed ENROLID selected
     """
 
-    # ---- Load leaf d^nn ----
-    d_nn = np.load(leaf_nn_matrix_npy, mmap_mode="r")
-    dnn_ids = np.load(leaf_nn_enrolids_npy)
+    # ---- Load leaf d^nn (.npy or .h5) ----
+    d_nn, dnn_ids = load_nn(leaf_nn_matrix_npy, leaf_nn_enrolids_npy)
 
     if d_nn.shape[0] != d_nn.shape[1]:
         raise ValueError("Leaf d_nn must be square.")

@@ -32,7 +32,7 @@ from public.model_IAI import (
     evaluate_binary_oct,
 )
 from public.two_stage_kcenter_match import two_stage_kcenter_then_match
-from pyspark.sql import SparkSession
+# Use pd.read_parquet (not Spark) for deterministic row order; Spark may shuffle and change train/test split.
 
 TRAIN_TEST_SEED = 123
 DIST_DIR_TEMPLATE = "./precomputed_distances_msk_{distance_features}"
@@ -95,8 +95,7 @@ def main():
         if not os.path.exists(path):
             raise FileNotFoundError(f"{label} not found: {path}")
 
-    spark = SparkSession.builder.appName("ZAZBStageAblation").getOrCreate()
-    df = spark.read.format("parquet").load(args.parquet).toPandas()
+    df = pd.read_parquet(args.parquet)
     target_col = "top_2_pct_cost_2018" # in this specific script, this is not TARGET_COL, which is "annual_cost_2018_deflated"
     if target_col not in df.columns and "annual_cost_2018_deflated" in df.columns:
         thresh = df["annual_cost_2018_deflated"].quantile(0.98)
@@ -109,8 +108,8 @@ def main():
         test_pd, target_col=target_col, test_size=0.5, verbose=False, random_state=TRAIN_TEST_SEED
     )
 
-    BIN = get_bin_flag_columns(df)
     CAT = get_cat_columns(df)
+    BIN = get_bin_flag_columns(df)
     NUM = get_true_num_columns(df, CAT, BIN)
     exclude = ["ENROLID", target_col] + [c for c in df.columns if "2018" in c]
     feature_cols = [c for c in df.columns if c not in exclude]

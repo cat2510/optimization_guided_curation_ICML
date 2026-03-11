@@ -28,6 +28,7 @@ from pathlib import Path
 import traceback
 from typing import List, Optional, Tuple
 
+import h5py
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -45,6 +46,7 @@ from public.precompute_distances import (
     compute_distances_batched,
     save_distances_hdf5,
     precompute_leaf_dnn_memmap,
+    precompute_leaf_dnn_hdf5,
 )
 
 try:
@@ -72,7 +74,7 @@ from public.model_IAI import (
     finetune_oct,
     evaluate_binary_oct,
 )
-from pyspark.sql import SparkSession
+# Use pd.read_parquet (not Spark) for deterministic row order; Spark may shuffle and change train/test split.
 from experiments_compare_random_vs_curation import (
     sample_random_controls,
     sample_stageA_dispersed_controls,
@@ -193,6 +195,45 @@ def precompute_gower_dnn_memmap(
     return dnn_matrix_path, dnn_enrolids_path
 
 
+def precompute_gower_dnn_hdf5(
+    X_majority: np.ndarray,
+    bin_col_indices: List[int],
+    ranges: np.ndarray,
+    out_dir: str,
+    batch_size: int = 750,
+    compression: str = "gzip",
+    compression_opts: int = 9,
+) -> Tuple[str, str]:
+    """D-N-N Gower distances to HDF5 (chunked + compressed). Returns (h5_path, enrolids_path)."""
+    os.makedirs(out_dir, exist_ok=True)
+    n = X_majority.shape[0]
+    n_p = X_majority.shape[1]
+    cont_col_indices = np.array([j for j in range(n_p) if j not in bin_col_indices])
+    bin_col_indices_arr = np.array(bin_col_indices)
+
+    h5_path = os.path.join(out_dir, "leaf_global_dnn_matrix.h5")
+    dnn_enrolids_path = os.path.join(out_dir, "leaf_global_dnn_enrolids.npy")
+
+    with h5py.File(h5_path, "w") as f:
+        chunk_rows = min(1000, n)
+        dset = f.create_dataset(
+            "distances",
+            shape=(n, n),
+            dtype=np.float32,
+            chunks=(chunk_rows, n),
+            compression=compression,
+            compression_opts=compression_opts,
+        )
+        for b in range((n + batch_size - 1) // batch_size):
+            s, e = b * batch_size, min((b + 1) * batch_size, n)
+            block = _compute_gower_distances(
+                X_majority[s:e], X_majority, bin_col_indices_arr, cont_col_indices, ranges, batch_size=n
+            )
+            dset[s:e, :] = block
+
+    return h5_path, dnn_enrolids_path
+
+
 def ensure_distances_for_metric(
     distance_metric: str,
     cases: pd.DataFrame,
@@ -202,19 +243,61 @@ def ensure_distances_for_metric(
     num_cols: List[str],
     bin_cols: List[str],
     distances_dir: str,
+    use_hdf5_dnn: bool = False,
 ) -> Tuple[str, str, str]:
     """
     Ensure P-N and D-N-N distance matrices exist for the given metric.
     Returns (pn_h5_path, dnn_matrix_path, dnn_enrolids_path).
 
-    For Jaccard and Hamming: uses only binary features (BIN_FLAG_COLUMNS in feature_cols),
-    since these metrics are designed for binary/categorical data.
+    use_hdf5_dnn: if True, save D-N-N as HDF5 compressed (~3-5x smaller than .npy).
+    load_nn() in two_stage supports both .npy and .h5.
     """
     os.makedirs(distances_dir, exist_ok=True)
     pn_h5 = os.path.join(distances_dir, f"distances_majority_minority_{distance_metric}.h5")
     dnn_dir = os.path.join(distances_dir, f"global_dnn_seed_{TRAIN_TEST_SEED}_{distance_metric}")
+    dnn_suffix = ".h5" if use_hdf5_dnn else ".npy"
+    dnn_matrix_path = os.path.join(dnn_dir, f"leaf_global_dnn_matrix{dnn_suffix}")
+    dnn_enrolids_path = os.path.join(dnn_dir, "leaf_global_dnn_enrolids.npy")
 
-    if distance_metric == "gower":
+    # tfidf_svd_cosine_qcost: Stage A DNN only; use Gower P-N for seed selection
+    if distance_metric == "tfidf_svd_cosine_qcost":
+        gower_pn_h5 = os.path.join(distances_dir, "distances_majority_minority_gower.h5")
+        if not os.path.exists(gower_pn_h5):
+            ensure_distances_for_metric(
+                "gower", cases, controls, feature_cols, cat_cols, num_cols, bin_cols,
+                distances_dir, use_hdf5_dnn=use_hdf5_dnn,
+            )
+        pn_h5 = gower_pn_h5
+        if os.path.exists(dnn_matrix_path) and os.path.exists(dnn_enrolids_path):
+            return pn_h5, dnn_matrix_path, dnn_enrolids_path
+        # Build TF-IDF+SVD+QuantileTransformer embedding and precompute D-N-N (cosine)
+        import tfidf_svd_qcost_embedding
+        importlib.reload(tfidf_svd_qcost_embedding)
+        from tfidf_svd_qcost_embedding import (
+            build_tfidf_svd_qcost_embedding,
+            get_cost_columns_2017,
+            run_cosine_distance_diagnostics,
+        )
+        code_cols = [c for c in bin_cols if c in feature_cols]
+        cost_cols_2017 = get_cost_columns_2017(controls)
+        Z, enrolids, meta = build_tfidf_svd_qcost_embedding(
+            controls, code_cols, cost_cols_2017, dnn_dir,
+        )
+        print(f"  Sanity: n_codes={meta['n_codes']}, svd_dim={meta['svd_dim']}, d_cost={meta['d_cost']}, alpha={meta['alpha']}")
+        run_cosine_distance_diagnostics(Z)
+        dnn_matrix_path, dnn_enrolids_path = precompute_leaf_dnn_hdf5(
+            X_majority_leaf=Z,
+            majority_enrolids_leaf=enrolids,
+            out_dir=dnn_dir,
+            leaf_id="global",
+            batch_size=750,
+            metric="cosine",
+        )
+        return pn_h5, dnn_matrix_path, dnn_enrolids_path
+
+    if os.path.exists(dnn_matrix_path) and os.path.exists(dnn_enrolids_path):
+        return pn_h5, dnn_matrix_path, dnn_enrolids_path
+    if distance_metric == "gower" and (not os.path.exists(pn_h5) or not os.path.exists(dnn_matrix_path) or not os.path.exists(dnn_enrolids_path)):
         # Gower: binary δ=1[a≠b], continuous δ=|a-b|/range_j (range from train, 1 if 0)
         from sklearn.preprocessing import OneHotEncoder
         bin_in_feature = [c for c in bin_cols if c in feature_cols]
@@ -244,29 +327,28 @@ def ensure_distances_for_metric(
             r = float(np.nanmax(col) - np.nanmin(col))
             ranges[j] = r if r > 0 else 1.0
         bin_col_indices = list(range(n_bin))
-        if not os.path.exists(pn_h5):
-            print(f"  Precomputing P-N distances (metric=gower)...")
-            dist_pn = compute_gower_distances_batched(X_majority, X_minority, bin_col_indices, ranges)
-            save_distances_hdf5(
-                dist_pn,
-                controls["ENROLID"].values.astype(np.int64),
-                cases["ENROLID"].values.astype(np.int64),
-                pn_h5,
-            )
-        else:
-            print(f"  Found P-N: {os.path.basename(pn_h5)}")
-        if not os.path.exists(os.path.join(dnn_dir, "leaf_global_dnn_matrix.npy")):
+        print(f"  Precomputing P-N distances (metric=gower)...")
+        dist_pn = compute_gower_distances_batched(X_majority, X_minority, bin_col_indices, ranges)
+        save_distances_hdf5(
+            dist_pn,
+            controls["ENROLID"].values.astype(np.int64),
+            cases["ENROLID"].values.astype(np.int64),
+            pn_h5,
+        )
+        if not os.path.exists(dnn_matrix_path) or not os.path.exists(dnn_enrolids_path):
             print(f"  Precomputing D-N-N distances (metric=gower)...")
-            dnn_matrix_path, dnn_enrolids_path = precompute_gower_dnn_memmap(
-                X_majority, bin_col_indices, ranges, dnn_dir
-            )
+            if use_hdf5_dnn:
+                dnn_matrix_path, dnn_enrolids_path = precompute_gower_dnn_hdf5(
+                    X_majority, bin_col_indices, ranges, dnn_dir
+                )
+            else:
+                dnn_matrix_path, dnn_enrolids_path = precompute_gower_dnn_memmap(
+                    X_majority, bin_col_indices, ranges, dnn_dir
+                )
             np.save(dnn_enrolids_path, controls["ENROLID"].values.astype(np.int64))
-        else:
-            dnn_matrix_path = os.path.join(dnn_dir, "leaf_global_dnn_matrix.npy")
-            dnn_enrolids_path = os.path.join(dnn_dir, "leaf_global_dnn_enrolids.npy")
         return pn_h5, dnn_matrix_path, dnn_enrolids_path
 
-    if distance_metric in ("jaccard", "hamming"):
+    elif distance_metric in ("jaccard", "hamming"):
         # Use only binary features (0/1) - appropriate for Jaccard and Hamming
         bin_in_feature = [c for c in bin_cols if c in feature_cols]
         if not bin_in_feature:
@@ -297,26 +379,27 @@ def ensure_distances_for_metric(
             cases["ENROLID"].values.astype(np.int64),
             pn_h5,
         )
-    else:
-        print(f"  Found P-N: {os.path.basename(pn_h5)}")
-
-    dnn_matrix_path = os.path.join(dnn_dir, "leaf_global_dnn_matrix.npy")
-    dnn_enrolids_path = os.path.join(dnn_dir, "leaf_global_dnn_enrolids.npy")
-    if not os.path.exists(dnn_matrix_path):
+    if not os.path.exists(dnn_matrix_path) or not os.path.exists(dnn_enrolids_path):
         print(f"  Precomputing D-N-N distances (metric={distance_metric})...")
-        precompute_leaf_dnn_memmap(
-            X_majority_leaf=X_majority,
-            majority_enrolids_leaf=controls["ENROLID"].values.astype(np.int64),
-            out_dir=dnn_dir,
-            leaf_id="global",
-            batch_size=750,
-            metric=distance_metric,
-        )
-    else:
-        print(f"  Found D-N-N: {os.path.basename(dnn_dir)}")
-
+        if use_hdf5_dnn:
+            dnn_matrix_path, dnn_enrolids_path = precompute_leaf_dnn_hdf5(
+                X_majority_leaf=X_majority,
+                majority_enrolids_leaf=controls["ENROLID"].values.astype(np.int64),
+                out_dir=dnn_dir,
+                leaf_id="global",
+                batch_size=750,
+                metric=distance_metric,
+            )
+        else:
+            precompute_leaf_dnn_memmap(
+                X_majority_leaf=X_majority,
+                majority_enrolids_leaf=controls["ENROLID"].values.astype(np.int64),
+                out_dir=dnn_dir,
+                leaf_id="global",
+                batch_size=750,
+                metric=distance_metric,
+            )
     return pn_h5, dnn_matrix_path, dnn_enrolids_path
-
 
 def run_rnd_1to1_sampling(
     control_enrolids: np.ndarray,
@@ -557,8 +640,7 @@ def main():
     print(f"  Two-stage: k-center then match | random init | no k-means++ | no adaptive pool")
     print()
 
-    spark = SparkSession.builder.appName("Exp6DistanceAblation").getOrCreate()
-    df = spark.read.format("parquet").load(args.parquet_path).toPandas()
+    df = pd.read_parquet(args.parquet_path)
 
     target_col = "top_2_pct_cost_2018"
     if target_col not in df.columns and "annual_cost_2018_deflated" in df.columns:

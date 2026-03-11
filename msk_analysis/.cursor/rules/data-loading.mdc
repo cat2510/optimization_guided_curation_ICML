@@ -1,0 +1,29 @@
+---
+description: Use pd.read_parquet for MSK data loading; avoid Spark (can shuffle rows and change train/test split)
+globs: msk_analysis/**/*.py
+alwaysApply: false
+---
+
+# MSK Data Loading
+
+## Parquet loading
+
+Use `pd.read_parquet()` for initial data loading. **Do not use SparkSession** (`spark.read.format("parquet").load(...).toPandas()`).
+
+Spark can shuffle rows during parallel reads, leading to non-deterministic row order and different train/test splits across runs.
+
+```python
+# ✅ GOOD
+import pandas as pd
+df = pd.read_parquet(args.parquet_path)
+
+# ❌ BAD
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.appName("...").getOrCreate()
+df = spark.read.format("parquet").load(path).toPandas()
+```
+
+## When to apply
+
+- Scripts that call `train_test_split_enrol` or otherwise split data for training
+- Any script that loads `msk_*.parquet` for analysis or precomputation

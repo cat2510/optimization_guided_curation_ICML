@@ -146,28 +146,50 @@ def resolve_distance_files(dist_dir: Path, seed: int) -> tuple[str, str, str]:
     return str(pn_h5), str(dnn_mat), str(dnn_ids)
 
 
-def pick_target_and_features(df: pd.DataFrame, baseline_year: int, outcome_year: int) -> tuple[str, list[str]]:
+def pick_target_and_features(
+    df: pd.DataFrame,
+    baseline_year: int,
+    outcome_year: int | list[int],
+    feature_regex: str = "",
+) -> tuple[str, list[str]]:
     """
-    Use top_2_pct_cost_<outcome_year> if present, otherwise construct from annual_cost_<outcome_year>_deflated.
-    Exclude columns containing outcome_year to prevent leakage.
+    Use top_2_pct_cost_<outcome_year> if present, otherwise construct from annual costs.
+    outcome_year can be int (e.g. 2018) or list (e.g. [2018, 2019] for I25/I50 dual-year).
+    Exclude columns containing any outcome year to prevent leakage.
     """
-    target_col = f"top_2_pct_cost_{outcome_year}"
-    annual_col = f"annual_cost_{outcome_year}_deflated"
+    years = [outcome_year] if isinstance(outcome_year, int) else outcome_year
+    label_suffix = "_".join(str(y) for y in years)
+    target_col = f"top_2_pct_cost_{label_suffix}"
 
+    # Fallback: single-year target or construct from annual cost
     if target_col not in df.columns:
-        if annual_col in df.columns:
-            thr = float(df[annual_col].quantile(0.98))
-            df[target_col] = (df[annual_col] >= thr).astype(int)
-            print(f"  Created {target_col} from {annual_col} @98th pct = {thr:,.2f}")
+        alias = f"top_2_pct_cost_{years[0]}" if years else None
+        if alias and alias in df.columns:
+            target_col = alias
         else:
-            raise ValueError(
-                f"Need either '{target_col}' or '{annual_col}' in the cohort features parquet."
-            )
+            annual_col = f"annual_cost_{years[0]}_deflated"
+            if annual_col in df.columns:
+                thr = float(df[annual_col].quantile(0.98))
+                df[target_col] = (df[annual_col] >= thr).astype(int)
+                print(f"  Created {target_col} from {annual_col} @98th pct = {thr:,.2f}")
+            else:
+                raise ValueError(
+                    f"Need '{target_col}' or '{annual_col}' in the cohort features parquet."
+                )
 
-    # leakage guard: drop outcome year columns
-    exclude = ["ENROLID", target_col] + [c for c in df.columns if str(outcome_year) in c]
+    # leakage guard: exclude columns containing any outcome year
+    def contains_outcome_year(col: str) -> bool:
+        return any(str(y) in col for y in years)
+
+    exclude = ["ENROLID", target_col] + [c for c in df.columns if contains_outcome_year(c)]
     feature_cols = [c for c in df.columns if c not in exclude]
 
+    if feature_regex:
+        pat = re.compile(feature_regex)
+        feature_cols = [c for c in feature_cols if pat.search(c)]
+
+    if not feature_cols:
+        raise ValueError("No feature columns left after exclusions/regex.")
     return target_col, feature_cols
 
 
@@ -339,7 +361,8 @@ def run_one_cohort(code: str, spark: SparkSession, args) -> list[dict]:
     df = pd.read_parquet(str(feat_path))
 
 
-    target_col, feature_cols = pick_target_and_features(df, args.baseline_year, args.outcome_year)
+    outcome_years = [2018, 2019] if code in ("I25", "I50") else args.outcome_year
+    target_col, feature_cols = pick_target_and_features(df, args.baseline_year, outcome_years)
     print(f"  Target: {target_col}")
     print(f"  #features: {len(feature_cols)}")
 

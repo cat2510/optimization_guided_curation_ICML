@@ -82,34 +82,8 @@ def resolve_feature_path(features_dir: Path, code: str, baseline_year: int, outc
     raise FileNotFoundError(f"No features parquet found for {code}. Tried: {candidates}")
 
 
-def ensure_target(df: pd.DataFrame, outcome_year: int) -> str:
-    target = f"top_2_pct_cost_{outcome_year}"
-    annual = f"annual_cost_{outcome_year}_deflated"
-
-    if target in df.columns:
-        return target
-
-    if annual in df.columns:
-        thr = float(df[annual].quantile(0.98))
-        df[target] = (df[annual] >= thr).astype(int)
-        print(f"  Created {target} from {annual} @98th pct = {thr:,.2f}")
-        return target
-
-    raise ValueError(f"Need either '{target}' or '{annual}' in features parquet.")
-
-
-def pick_feature_cols(df: pd.DataFrame, target_col: str, outcome_year: int, feature_regex: str) -> list[str]:
-    # leakage guard: remove outcome-year columns + id + target
-    exclude = ["ENROLID", target_col] + [c for c in df.columns if str(outcome_year) in c]
-    cols = [c for c in df.columns if c not in exclude]
-
-    if feature_regex:
-        pat = re.compile(feature_regex)
-        cols = [c for c in cols if pat.search(c)]
-
-    if not cols:
-        raise ValueError("No feature columns left after exclusions/regex.")
-    return cols
+# Target/feature logic imported from curated (handles outcome_year as int or list for I25/I50)
+from curated_vs_random_1to1_multi_cohort_oct import pick_target_and_features
 
 
 
@@ -156,8 +130,10 @@ def run_one(code: str, args):
     print(f"  Loading features directly via PyArrow...")
     df = pd.read_parquet(str(feat_path))
 
-    target_col = ensure_target(df, args.outcome_year)
-    feat_cols = pick_feature_cols(df, target_col, args.outcome_year, args.feature_regex)
+    outcome_years = [2018, 2019] if code in ("I25", "I50") else args.outcome_year
+    target_col, feat_cols = pick_target_and_features(
+        df, args.baseline_year, outcome_years, feature_regex=args.feature_regex
+    )
 
     if len(df) > 1_000_000:
         from sklearn.model_selection import train_test_split

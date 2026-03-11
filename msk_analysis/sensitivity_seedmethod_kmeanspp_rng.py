@@ -32,7 +32,7 @@ from typing import List, Optional
 
 import numpy as np
 import pandas as pd
-from pyspark.sql import SparkSession
+# Use pd.read_parquet (not Spark) for deterministic row order; Spark may shuffle and change train/test split.
 
 # Path setup to import project modules
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -88,8 +88,7 @@ def main():
     seed_methods = [x.strip() for x in args.seed_methods.split(",") if x.strip()]
 
     # Load data
-    spark = SparkSession.builder.appName("SensSeedMethodKMeansPP").getOrCreate()
-    df = spark.read.format("parquet").load(args.parquet_path).toPandas()
+    df = pd.read_parquet(args.parquet_path)
 
     target_col = "top_2_pct_cost_2018"
     if target_col not in df.columns and "annual_cost_2018_deflated" in df.columns:

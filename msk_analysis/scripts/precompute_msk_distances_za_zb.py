@@ -56,7 +56,7 @@ from public.precompute_distances import (
     save_distances_hdf5,
 )
 from tie_diagnostics import run_tie_diagnostics
-from pyspark.sql import SparkSession
+# Use pd.read_parquet (not Spark) for deterministic row order; Spark may shuffle and change train/test split.
 
 TRAIN_TEST_SEED = 123
 
@@ -315,8 +315,7 @@ def main():
     if args.overwrite:
         # Will be implemented by deleting/skipping exists checks in run_* - for now we skip overwrite
         pass
-    spark = SparkSession.builder.appName("PrecomputeZAZB").getOrCreate()
-    df = spark.read.format("parquet").load(args.parquet).toPandas()
+    df = pd.read_parquet(args.parquet)
     target_col = "top_2_pct_cost_2018"
     if target_col not in df.columns and "annual_cost_2018_deflated" in df.columns:
         thresh = df["annual_cost_2018_deflated"].quantile(0.98)

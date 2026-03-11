@@ -64,6 +64,7 @@ try:
     from public.two_stage_kcenter_match import (
         two_stage_kcenter_then_match,
         load_pn_hdf5,
+        load_nn,
         build_id_to_index,
         farthest_first_kcenter_indices,
         choose_seed_random,
@@ -80,6 +81,7 @@ except ImportError:
     from public.two_stage_kcenter_match import (
         two_stage_kcenter_then_match,
         load_pn_hdf5,
+        load_nn,
         build_id_to_index,
         farthest_first_kcenter_indices,
         choose_seed_random,
@@ -99,7 +101,7 @@ from public.model_IAI import (
     best_balanced_threshold,
 )
 from sklearn.metrics import roc_auc_score, average_precision_score, matthews_corrcoef, confusion_matrix
-from pyspark.sql import SparkSession
+# Use pd.read_parquet (not Spark) for deterministic row order; Spark may shuffle and change train/test split.
 
 TRAIN_TEST_SEED = 123
 OCT_DEPTHS = [7]
@@ -143,8 +145,7 @@ def sample_stageA_dispersed_controls(
     Stage A only: farthest-first k-center to select k dispersed controls.
     Returns (selected_control_enrolids, mean_min_dist_to_case or None).
     """
-    d_nn = np.load(leaf_nn_matrix_npy, mmap_mode="r")
-    dnn_ids = np.load(leaf_nn_enrolids_npy)
+    d_nn, dnn_ids = load_nn(leaf_nn_matrix_npy, leaf_nn_enrolids_npy)
 
     if d_nn.shape[0] != len(dnn_ids):
         raise ValueError("d_nn and enrolids length mismatch")
@@ -312,8 +313,7 @@ def sample_stageA_on_restricted_pool(
             print(f"  [Stage A restricted] WARNING: only {len(remaining_ids)} remaining, requested k={k}")
         k = len(remaining_ids)
 
-    d_nn = np.load(leaf_nn_matrix_npy, mmap_mode="r")
-    dnn_ids = np.load(leaf_nn_enrolids_npy)
+    d_nn, dnn_ids = load_nn(leaf_nn_matrix_npy, leaf_nn_enrolids_npy)
     rem_positions = [id_to_position_in_full[int(e)] for e in remaining_ids]
 
     # Hard assertion: verify id_to_position_in_full round-trips correctly
@@ -539,8 +539,7 @@ def main():
     print()
 
     # Load data (same as two_stage_iterative)
-    spark = SparkSession.builder.appName("ExpRandomVsCuration").getOrCreate()
-    df = spark.read.format("parquet").load(args.parquet_path).toPandas()
+    df = pd.read_parquet(args.parquet_path)
 
     target_col = "top_2_pct_cost_2018"
     if target_col not in df.columns and "annual_cost_2018_deflated" in df.columns:
