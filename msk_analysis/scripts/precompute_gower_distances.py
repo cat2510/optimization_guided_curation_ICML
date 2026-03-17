@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import h5py
 import numpy as np
@@ -64,15 +64,17 @@ def _validate_gower_binary_columns(
     binary_col_indices: np.ndarray,
     atol: float = _GOWER_BINARY_ATOL,
     rtol: float = _GOWER_BINARY_RTOL,
+    col_names: Optional[List[str]] = None,
 ) -> None:
     """Raise ValueError if any column marked as binary contains values not in {0, 1} (within tolerance)."""
     for c in binary_col_indices:
-        for name, X in [("A", X_A), ("B", X_B)]:
+        for mat_name, X in [("A", X_A), ("B", X_B)]:
             col = np.asarray(X[:, c], dtype=np.float64).ravel()
+            feat_name = col_names[c] if col_names is not None and c < len(col_names) else f"col_{c}"
             if np.any(np.isnan(col)):
                 uniq = np.unique(col[~np.isnan(col)])
                 raise ValueError(
-                    f"Gower binary column #{c} in X_{name} contains NaN. "
+                    f"Gower binary column #{c} ({feat_name!r}) in X_{mat_name} contains NaN. "
                     f"Unique non-NaN values (sample): {uniq[:20].tolist()}"
                 )
             close_to_0 = np.abs(col) <= atol + rtol * np.maximum(np.abs(col), 1e-12)
@@ -84,7 +86,7 @@ def _validate_gower_binary_columns(
                 else:
                     uniq_repr = uniq.tolist()
                 raise ValueError(
-                    f"Gower binary column #{c} in X_{name} is not binary (values must be 0 or 1). "
+                    f"Gower binary column #{c} ({feat_name!r}) in X_{mat_name} is not binary (values must be 0 or 1). "
                     f"Unique values: {uniq_repr}"
                 )
 
@@ -101,6 +103,7 @@ def _compute_gower_distances_v2(
     binary_atol: float = _GOWER_BINARY_ATOL,
     binary_rtol: float = _GOWER_BINARY_RTOL,
     use_tolerance_binary: bool = True,
+    col_names: Optional[List[str]] = None,
 ) -> np.ndarray:
     """
     Compute Gower distances between X_A (n_A x p) and X_B (n_B x p).
@@ -110,7 +113,9 @@ def _compute_gower_distances_v2(
     if ne is None:
         raise ImportError("Gower v2 requires 'numexpr'. Install with: pip install numexpr")
 
-    _validate_gower_binary_columns(X_A, X_B, binary_col_indices, atol=binary_atol, rtol=binary_rtol)
+    _validate_gower_binary_columns(
+        X_A, X_B, binary_col_indices, atol=binary_atol, rtol=binary_rtol, col_names=col_names
+    )
 
     X_A = np.asarray(X_A, dtype=np.float32)
     X_B = np.asarray(X_B, dtype=np.float32)
@@ -167,6 +172,16 @@ def _save_distances_hdf5_inline(
 # -------------------------------------------------------------------------------
 # Feature matrix construction (same logic as exp6 Gower block)
 # -------------------------------------------------------------------------------
+def _is_truly_binary(col: np.ndarray, atol: float = 1e-6, rtol: float = 1e-5) -> bool:
+    """True if all values are in {0, 1} (within tolerance)."""
+    col = np.asarray(col, dtype=np.float64).ravel()
+    if np.any(np.isnan(col)):
+        return False
+    close_0 = np.abs(col) <= atol + rtol * np.maximum(np.abs(col), 1e-12)
+    close_1 = np.abs(col - 1.0) <= atol + rtol * np.maximum(np.abs(col), 1e-12)
+    return bool(np.all(close_0 | close_1))
+
+
 def build_gower_feature_matrices(
     cases: pd.DataFrame,
     controls: pd.DataFrame,
@@ -174,28 +189,48 @@ def build_gower_feature_matrices(
     cat_cols: List[str],
     num_cols: List[str],
     bin_cols: List[str],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int], List[str]]:
     """
-    Build X_minority (cases), X_majority (controls), ranges, bin_col_indices.
+    Build X_minority (cases), X_majority (controls), ranges, bin_col_indices, col_names.
     All in float32. Order: binary | OHE(cat) | numeric.
+    Columns in bin_cols that have values outside {0,1} are demoted to continuous (δ=|a-b|/range).
+    col_names[i] is the feature name for column index i.
     """
     bin_in_feature = [c for c in bin_cols if c in feature_cols]
     num_in_feature = [c for c in num_cols if c in feature_cols]
     cat_in_feature = [c for c in cat_cols if c in feature_cols]
+    # Demote "binary" columns that actually have >2 values (e.g. 0,1,2,3) to continuous
+    real_binary: List[str] = []
+    demoted_to_num: List[str] = []
+    for c in bin_in_feature:
+        combined = np.concatenate([cases[c].values.ravel(), controls[c].values.ravel()])
+        if _is_truly_binary(combined):
+            real_binary.append(c)
+        else:
+            demoted_to_num.append(c)
+    num_in_feature = demoted_to_num + num_in_feature
+    col_names: List[str] = []
     parts_min, parts_maj = [], []
     n_bin = 0
-    if bin_in_feature:
-        parts_min.append(cases[bin_in_feature].values.astype(np.float32))
-        parts_maj.append(controls[bin_in_feature].values.astype(np.float32))
-        n_bin += len(bin_in_feature)
+    if real_binary:
+        col_names.extend(real_binary)
+        parts_min.append(cases[real_binary].values.astype(np.float32))
+        parts_maj.append(controls[real_binary].values.astype(np.float32))
+        n_bin += len(real_binary)
     if cat_in_feature:
         all_cat = pd.concat([cases[cat_in_feature], controls[cat_in_feature]], ignore_index=True)
         ohe = OneHotEncoder(drop="first", sparse_output=False, handle_unknown="ignore")
         ohe_mat = ohe.fit_transform(all_cat)
+        try:
+            ohe_names = ohe.get_feature_names_out(cat_in_feature)
+        except Exception:
+            ohe_names = [f"ohe_{i}" for i in range(ohe_mat.shape[1])]
+        col_names.extend(ohe_names.tolist() if hasattr(ohe_names, "tolist") else list(ohe_names))
         parts_min.append(ohe_mat[: len(cases)].astype(np.float32))
         parts_maj.append(ohe_mat[len(cases) :].astype(np.float32))
         n_bin += ohe_mat.shape[1]
     if num_in_feature:
+        col_names.extend(num_in_feature)
         parts_min.append(cases[num_in_feature].values.astype(np.float32))
         parts_maj.append(controls[num_in_feature].values.astype(np.float32))
     X_minority = np.hstack(parts_min) if parts_min else np.zeros((len(cases), 0), dtype=np.float32)
@@ -206,7 +241,7 @@ def build_gower_feature_matrices(
         r = float(np.nanmax(col) - np.nanmin(col))
         ranges[j] = np.float32(r if r > 0 else 1.0)
     bin_col_indices = list(range(n_bin))
-    return X_majority, X_minority, ranges, bin_col_indices
+    return X_majority, X_minority, ranges, bin_col_indices, col_names
 
 
 # -------------------------------------------------------------------------------
@@ -217,13 +252,14 @@ def compute_gower_pn_v2(
     X_minority: np.ndarray,
     bin_col_indices: List[int],
     ranges: np.ndarray,
+    col_names: Optional[List[str]] = None,
 ) -> np.ndarray:
     """P-N Gower distances (controls x cases) with v2 kernel. Full matrix in memory."""
     n_p = X_majority.shape[1]
     cont_col_indices = np.array([j for j in range(n_p) if j not in bin_col_indices])
     bin_arr = np.array(bin_col_indices)
     return _compute_gower_distances_v2(
-        X_majority, X_minority, bin_arr, cont_col_indices, ranges
+        X_majority, X_minority, bin_arr, cont_col_indices, ranges, col_names=col_names
     )
 
 
@@ -236,6 +272,7 @@ def precompute_gower_dnn_v2(
     use_hdf5: bool = False,
     compression: str = "gzip",
     compression_opts: int = 9,
+    col_names: Optional[List[str]] = None,
 ) -> Tuple[str, str]:
     """
     D-N-N (control-control) Gower with v2 kernel, batched to avoid huge allocation.
@@ -265,7 +302,7 @@ def precompute_gower_dnn_v2(
             for s in range(0, n, batch_size):
                 e = min(s + batch_size, n)
                 block = _compute_gower_distances_v2(
-                    X_majority[s:e], X_majority, bin_arr, cont_col_indices, ranges
+                    X_majority[s:e], X_majority, bin_arr, cont_col_indices, ranges, col_names=col_names
                 )
                 dset[s:e, :] = block
         return dnn_matrix_path, dnn_enrolids_path
@@ -276,7 +313,7 @@ def precompute_gower_dnn_v2(
     for s in range(0, n, batch_size):
         e = min(s + batch_size, n)
         block = _compute_gower_distances_v2(
-            X_majority[s:e], X_majority, bin_arr, cont_col_indices, ranges
+            X_majority[s:e], X_majority, bin_arr, cont_col_indices, ranges, col_names=col_names
         )
         dnn_mm[s:e, :] = block
     del dnn_mm
@@ -348,7 +385,7 @@ def main() -> None:
     NUM = get_true_num_columns(df, CAT, BIN)
     feature_cols = get_feature_columns(df, args.feature_set, target_col)
 
-    X_majority, X_minority, ranges, bin_col_indices = build_gower_feature_matrices(
+    X_majority, X_minority, ranges, bin_col_indices, col_names = build_gower_feature_matrices(
         cases, controls, feature_cols, CAT, NUM, BIN
     )
     n_controls, n_cases = X_majority.shape[0], X_minority.shape[0]
@@ -364,7 +401,7 @@ def main() -> None:
             print(f"  P-N already exists: {pn_h5}")
         else:
             print("  Computing P-N (Gower v2)...")
-            dist_pn = compute_gower_pn_v2(X_majority, X_minority, bin_col_indices, ranges)
+            dist_pn = compute_gower_pn_v2(X_majority, X_minority, bin_col_indices, ranges, col_names=col_names)
             if save_distances_hdf5 is not None:
                 save_distances_hdf5(dist_pn, majority_enrolids, minority_enrolids, pn_h5)
             else:
@@ -381,6 +418,7 @@ def main() -> None:
                 X_majority, bin_col_indices, ranges, dnn_dir,
                 batch_size=args.dnn_batch_size,
                 use_hdf5=args.use_hdf5_dnn,
+                col_names=col_names,
             )
             np.save(dnn_enrolids_path, majority_enrolids)
             print(f"  Saved D-N-N: {dnn_matrix_path}")

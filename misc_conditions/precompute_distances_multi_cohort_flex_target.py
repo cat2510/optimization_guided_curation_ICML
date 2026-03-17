@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """
-Precompute P-N and D-N-N distances for multi-cohort misc_conditions.
-Supports --metric euclidean | gower. Gower uses the v2 kernel from
-msk_analysis/scripts/precompute_gower_distances.py.
+precompute_distances_multi_cohort_flex_target.py
+================================================
 
-Sampling for giant cohorts is aligned with vanilla_oct_multi_cohort.py:
+Variant of precompute_distances_multi_cohort.py with flexible target selection,
+aligned with vanilla_oct_multi_cohort_flex_target.py.
+
+Supports --target_pct (5, 2, 1, 0.5) and --target_col override.
+Merges annual_cost_*_deflated from _with_meds when using 100feat parquets.
+distances_dir_template includes {target_suffix} so different targets use separate dirs.
+
+Sampling for giant cohorts is aligned with vanilla_oct_multi_cohort_flex_target:
   when len(df) > 500_000, keep exactly 250_000 rows (stratified, same seed).
+
+  python precompute_distances_multi_cohort_flex_target.py --metric gower --codes F32 --target_pct 1
+
 """
 import os
 import re
@@ -45,13 +54,19 @@ from public.model_IAI import (
     get_true_num_columns,
 )
 
+from vanilla_oct_multi_cohort_flex_target import (
+    pick_target_and_features,
+    _merge_annual_cost_from_with_meds,
+    VALID_TARGET_PCTS,
+    DEFAULT_TARGET_PCT,
+)
+
 
 def parse_args():
     p = argparse.ArgumentParser()
 
     p.add_argument("--codes", type=str,
-                   default="E78, E66", 
-                   # E10, E11, C50 are in scratch folder! C61 in current folder
+                   default="E78, E66",
                    help="Comma-separated ICD10 root codes")
 
     p.add_argument("--features_dir", type=str,
@@ -61,10 +76,16 @@ def parse_args():
     p.add_argument("--baseline_year", type=int, default=2017)
     p.add_argument("--outcome_year", type=int, default=2018)
 
-    # Where to write distances; uses template to match later training script
+    p.add_argument("--target_pct", type=float, default=DEFAULT_TARGET_PCT,
+                   choices=VALID_TARGET_PCTS,
+                   help=f"Top-cost percentile: one of {VALID_TARGET_PCTS}. Default: {DEFAULT_TARGET_PCT}%%")
+    p.add_argument("--target_col", type=str, default=None,
+                   help="Override: explicit target column (e.g. top_1_pct_cost_2018). If set, ignores --target_pct.")
+
+    # Where to write distances; template uses {code} and {target_suffix} (e.g. top2pct, top0_5pct)
     p.add_argument("--distances_dir_template", type=str,
-                   default="/Users/cat2510/scratch/precomputed_distances_{code}_with_cost_features",
-                   help="Where to write distances per cohort")
+                   default="/Users/cat2510/scratch/precomputed_distances_{code}_top{target_suffix}pct",
+                   help="Where to write distances per cohort. Use {code} and {target_suffix} (auto from --target_pct).")
 
     p.add_argument("--train_test_seed", type=int, default=123)
 
@@ -76,7 +97,6 @@ def parse_args():
     p.add_argument("--use_hdf5_dnn", action="store_true",
                    help="save as HDF5 (compressed) instead of .npy memmap.")
 
-    # Feature selection knobs
     p.add_argument("--feature_regex", type=str, default="",
                    help="Optional regex to keep only matching feature columns (applied after leakage exclusion). "
                         "Example: '^(med_|has_)'")
@@ -87,8 +107,18 @@ def parse_args():
     return p.parse_args()
 
 
+def _target_suffix_from_args(args) -> str:
+    """Derive target_suffix for distances_dir_template: '2', '1', '5', '0_5'."""
+    if args.target_col:
+        m = re.match(r"top_(\d+(?:_\d+)?)_pct_cost_", args.target_col)
+        if m:
+            return m.group(1)  # e.g. "0_5", "1", "2"
+        return "custom"
+    return "0_5" if args.target_pct == 0.5 else str(int(args.target_pct))
+
+
 def resolve_feature_path(features_dir: Path, code: str, baseline_year: int, outcome_year: int) -> Path:
-    """Same candidate order as vanilla_oct_multi_cohort so the same parquet is used per cohort."""
+    """Same candidate order as vanilla_oct_multi_cohort_flex_target."""
     candidates = [
         features_dir / f"{code}_features_{baseline_year}_{outcome_year}_100feat.parquet",
         features_dir / f"{code}_features_{baseline_year}_{outcome_year}_with_meds.parquet",
@@ -98,13 +128,6 @@ def resolve_feature_path(features_dir: Path, code: str, baseline_year: int, outc
         if p.exists():
             return p
     raise FileNotFoundError(f"No features parquet found for {code}. Tried: {candidates}")
-
-
-# Target/feature logic imported from curated (handles outcome_year as int or list for I25/I50)
-from curated_vs_random_1to1_multi_cohort_oct import pick_target_and_features
-
-
-
 
 
 def maybe_compute_pn_gower(pn_h5_path, X_maj, X_min, maj_ids, min_ids, bin_col_indices, ranges, args, col_names=None):
@@ -139,18 +162,25 @@ def run_one(code: str, args):
 
     feat_path = resolve_feature_path(Path(args.features_dir), code, args.baseline_year, args.outcome_year)
     print(f"  Features: {feat_path}")
-
-    # FIX: Bypass Spark to avoid Java Heap OOM
-    # Use PyArrow to load only the necessary columns directly into Pandas
-    print(f"  Loading features directly via PyArrow...")
     df = pd.read_parquet(str(feat_path))
 
     outcome_years = [2018, 2019] if code in ("I25", "I50") else args.outcome_year
-    target_col, feat_cols = pick_target_and_features(
-        df, args.baseline_year, outcome_years, feature_regex=args.feature_regex
+
+    # 100feat parquets lack annual_cost_*_deflated; merge from _with_meds if needed
+    df = _merge_annual_cost_from_with_meds(
+        df, feat_path, Path(args.features_dir), code, args.baseline_year, args.outcome_year
     )
 
-    # Align with vanilla_oct_multi_cohort: same 250k subset for giant cohorts
+    target_col, feat_cols = pick_target_and_features(
+        df,
+        args.baseline_year,
+        outcome_years,
+        target_col=args.target_col,
+        target_pct=args.target_pct,
+        feature_regex=args.feature_regex,
+    )
+
+    # Align with vanilla_oct_multi_cohort_flex_target: same 250k subset for giant cohorts
     if len(df) > 500_000:
         from sklearn.model_selection import train_test_split
         df, _ = train_test_split(
@@ -162,23 +192,22 @@ def run_one(code: str, args):
 
     print(f"  Target: {target_col} | Features: {len(feat_cols)}")
 
-    # Split (Using your existing helper)
     _, _, train_pd, test_pd = train_test_split_enrol(
         df, target_col=target_col, test_size=0.3, verbose=False, random_state=args.train_test_seed
     )
-    
+
     cases_mask = train_pd[target_col] == 1
     controls_mask = train_pd[target_col] == 0
     maj_ids = train_pd.loc[controls_mask, "ENROLID"].values.astype(np.int64)
     min_ids = train_pd.loc[cases_mask, "ENROLID"].values.astype(np.int64)
 
-    dist_dir = Path(args.distances_dir_template.format(code=code))
+    target_suffix = _target_suffix_from_args(args)
+    dist_dir = Path(args.distances_dir_template.format(code=code, target_suffix=target_suffix))
     dist_dir.mkdir(parents=True, exist_ok=True)
     pn_h5_path = dist_dir / "distances_majority_minority.h5"
     dnn_out_dir = dist_dir / f"global_dnn_seed_{args.train_test_seed}"
 
     if args.metric == "gower":
-        # Gower: use msk_analysis precompute_gower_distances (v2 kernel)
         import precompute_gower_distances as gower_module
         cases_pd = train_pd.loc[cases_mask]
         controls_pd = train_pd.loc[controls_mask]
@@ -194,24 +223,29 @@ def run_one(code: str, args):
 
     print(f"  ✓ Cohort {code} Complete.")
 
+
 def main():
     """
-  Gower (same 250k sampling as vanilla_oct_multi_cohort for giant cohorts):
-  python precompute_distances_multi_cohort.py \\
+  Gower with flexible target (aligned with vanilla_oct_multi_cohort_flex_target):
+  python precompute_distances_multi_cohort_flex_target.py \\
     --metric gower \\
     --codes E78,E66 \\
+    --target_pct 2 \\
     --features_dir /path/to/features \\
-    --distances_dir_template ./precomputed_distances_{code}_gower \\
+    --distances_dir_template /scratch/precomputed_distances_{code}_top{target_suffix}pct \\
     --train_test_seed 123
 
+  Use --target_pct 1 for top 1% cost, --target_pct 0.5 for top 0.5%.
   Requires msk_analysis at ../msk_analysis (for precompute_gower_distances) and numexpr.
   """
     args = parse_args()
     codes = [c.strip().upper() for c in args.codes.split(",") if c.strip()]
 
+    target_suffix = _target_suffix_from_args(args)
     print(f"Processing Codes: {codes}")
-    
-    # WE REMOVED THE SPARK SESSION INITIALIZATION
+    print(f"Target: {args.target_col or f'top {args.target_pct}%'}")
+    print(f"Distances dir template: {args.distances_dir_template} (target_suffix={target_suffix})")
+
     for code in codes:
         try:
             run_one(code, args)
@@ -221,6 +255,7 @@ def main():
             traceback.print_exc()
 
     print("\nDone.")
+
 
 if __name__ == "__main__":
     main()

@@ -127,9 +127,6 @@ def get_bin_flag_columns(df: pd.DataFrame):
 
         name_match = (
             col.startswith("has_")
-            or "is_" in col_l
-            or "increasing" in col_l
-            or "decreasing" in col_l
         )
 
         value_match = is_binary_01_series(df[col])
