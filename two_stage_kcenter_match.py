@@ -130,7 +130,7 @@ def farthest_first_adaptive_pool(
 
     return selected, float(min_to_pool.mean())
 
-def farthest_first_kcenter_indices(d_nn, M: int, seed_idx: int) -> List[int]:
+def farthest_first_kcenter_indices(d_nn, M: int, seed_idx: int, use_tqdm: bool = False) -> List[int]:
     """
     Farthest-first k-center on majority space using precomputed d_nn.
     d_nn: (n, n) memmap/ndarray float32 symmetric
@@ -151,7 +151,14 @@ def farthest_first_kcenter_indices(d_nn, M: int, seed_idx: int) -> List[int]:
     # mark selected nodes as -inf so they won't be selected again
     min_dist[seed_idx] = -np.inf
 
-    for t in range(1, M):
+    it = range(1, M)
+    if use_tqdm:
+        try:
+            from tqdm import tqdm
+            it = tqdm(it, desc="k-center", total=M - 1, unit="center")
+        except ImportError:
+            pass
+    for t in it:
         nxt = int(np.argmax(min_dist))
         selected[t] = nxt
         # update min_dist with new center
@@ -162,7 +169,7 @@ def farthest_first_kcenter_indices(d_nn, M: int, seed_idx: int) -> List[int]:
     return selected.tolist()
 
 
-def kmeanspp_metric_indices(d_nn, M: int, seed_idx: int, rng: np.random.RandomState):
+def kmeanspp_metric_indices(d_nn, M: int, seed_idx: int, rng: np.random.RandomState, use_tqdm: bool = False):
     """
     k-means++ (D^2) seeding using a precomputed distance matrix d_nn.
     Picks next center with prob proportional to (distance to nearest selected)^2.
@@ -181,7 +188,14 @@ def kmeanspp_metric_indices(d_nn, M: int, seed_idx: int, rng: np.random.RandomSt
     min_dist = np.array(d_nn[seed_idx, :], dtype=np.float32)
     min_dist[seed_idx] = 0.0
 
-    for t in range(1, M):
+    it = range(1, M)
+    if use_tqdm:
+        try:
+            from tqdm import tqdm
+            it = tqdm(it, desc="k-means++", total=M - 1, unit="center")
+        except ImportError:
+            pass
+    for t in it:
         w = (min_dist ** 2).astype(np.float64)
         w[selected[:t]] = 0.0  # prevent reselection
         s = w.sum()

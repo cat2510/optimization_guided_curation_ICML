@@ -146,6 +146,7 @@ def save_distances_hdf5(distances, majority_ids, minority_ids, filepath, compres
     Save distances in HDF5 format with metadata (chunked + compressed).
     HDF5 supports reading directly from compressed format (no separate unzip needed).
     Use compression_opts=9 for max compression; 4 for faster write/read.
+    Always saves as float32 for half the disk size of float64.
 
     File structure:
         /distances: (n_majority, n_minority) float32 array
@@ -154,12 +155,12 @@ def save_distances_hdf5(distances, majority_ids, minority_ids, filepath, compres
         /metadata: attributes with shape, dtype, etc.
     """
     print(f"\nSaving to HDF5: {filepath} (compression={compression}, level={compression_opts})")
-    
+    distances_f32 = np.asarray(distances, dtype=np.float32)
     with h5py.File(filepath, 'w') as f:
-        chunk_size = (min(1000, distances.shape[0]), distances.shape[1])
+        chunk_size = (min(1000, distances_f32.shape[0]), distances_f32.shape[1])
         f.create_dataset(
             'distances',
-            data=distances,
+            data=distances_f32,
             chunks=chunk_size,
             compression=compression,
             compression_opts=compression_opts
@@ -170,9 +171,9 @@ def save_distances_hdf5(distances, majority_ids, minority_ids, filepath, compres
         f.create_dataset('minority_enrolids', data=minority_ids)
         
         # Metadata
-        f.attrs['n_majority'] = distances.shape[0]
-        f.attrs['n_minority'] = distances.shape[1]
-        f.attrs['dtype'] = str(distances.dtype)
+        f.attrs['n_majority'] = distances_f32.shape[0]
+        f.attrs['n_minority'] = distances_f32.shape[1]
+        f.attrs['dtype'] = str(distances_f32.dtype)
         f.attrs['compression'] = compression
     
     file_size = os.path.getsize(filepath) / 1e6
