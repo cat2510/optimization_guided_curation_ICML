@@ -127,9 +127,6 @@ def get_bin_flag_columns(df: pd.DataFrame):
 
         name_match = (
             col.startswith("has_")
-            or "thrcls" in col.upper()
-            or col.endswith("adherent")
-            or col.startswith("early_")
             or "is_" in col_l
             or "increasing" in col_l
             or "decreasing" in col_l

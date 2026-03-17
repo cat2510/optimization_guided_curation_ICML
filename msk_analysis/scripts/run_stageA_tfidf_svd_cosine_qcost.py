@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.abspath(os.path.join(script_dir, ".."))
@@ -54,8 +55,9 @@ from public.model_IAI import (
 
 # Use pd.read_parquet (not Spark) for deterministic row order; Spark may shuffle and change train/test split.
 TRAIN_TEST_SEED = 123
-DISTANCES_DIR = "./precomputed_distances_msk_za_tfidf_svd_cosine_qcost"
+DISTANCES_DIR = os.environ.get("SCRATCH_DISTANCES_DIR", "/Users/cat2510/scratch/precomputed_distances_msk_za_tfidf_svd_cosine_qcost")
 SEED = 0
+M_POOL = 3000
 
 
 def parse_args():
@@ -66,7 +68,17 @@ def parse_args():
     p.add_argument(
         "--resume",
         action="store_true",
-        help="Skip precompute; use existing tfidf DNN + Gower P-N if present. Fails if DNN missing.",
+        help="Skip precompute; use existing tfidf DNN + Gower P-N if present. Fails if DNN missing or enrolids mismatch.",
+    )
+    p.add_argument(
+        "--force-recompute",
+        action="store_true",
+        help="Delete existing tfidf DNN (and Gower P-N) and recompute when enrolids mismatch current data load.",
+    )
+    p.add_argument(
+        "--use-precomputed-split",
+        action="store_true",
+        help="When DNN/P-N exist, use their enrolids to define train set (avoids recompute when current split differs).",
     )
     return p.parse_args()
 
@@ -90,6 +102,7 @@ def run_stageA_sampling(
     pn_h5_path: str,
     k: int,
     seed: int,
+    use_tqdm: bool = False,
 ) -> pd.DataFrame:
     ids, _ = sample_stageA_dispersed_controls(
         leaf_controls_enrolids=control_enrolids,
@@ -100,10 +113,11 @@ def run_stageA_sampling(
         k=k,
         seed_method="random",
         seed=seed,
-        M_pool=len(control_enrolids),
+        M_pool=M_POOL,
         use_kmeanspp=False,
         X_majority_leaf=None,
         verbose=False,
+        use_tqdm=use_tqdm,
     )
     return controls[controls["ENROLID"].isin(ids)].copy()
 
@@ -123,11 +137,11 @@ def main():
     print(f"  Distances: {args.distances_dir}")
     print()
 
-    df = pd.read_parquet(args.parquet_path)
-
-    if target_col not in df.columns and cost_col in df.columns:
-        thresh = df[cost_col].quantile(0.98)
-        df[target_col] = (df[cost_col] >= thresh).astype(int)
+    for _ in tqdm([1], desc="Load parquet + train split", unit="step"):
+        df = pd.read_parquet(args.parquet_path)
+        if target_col not in df.columns and cost_col in df.columns:
+            thresh = df[cost_col].quantile(0.98)
+            df[target_col] = (df[cost_col] >= thresh).astype(int)
 
     BIN_FLAG_COLUMNS = get_bin_flag_columns(df)
     CAT_COLUMNS = get_cat_columns(df)
@@ -135,12 +149,24 @@ def main():
     exclude_cols = ["ENROLID", target_col] + [c for c in df.columns if "2018" in c]
     feature_cols = [c for c in df.columns if c not in exclude_cols]
 
-    train_ids, test_ids, train_pd, test_pd = train_test_split_enrol(
-        df, target_col=target_col, test_size=0.3, verbose=False, random_state=TRAIN_TEST_SEED
-    )
-    val_ids, test_ids, val_pd, test_pd = train_test_split_enrol(
-        test_pd, target_col=target_col, test_size=0.5, verbose=False, random_state=TRAIN_TEST_SEED
-    )
+    dnn_dir = os.path.join(args.distances_dir, f"global_dnn_seed_{TRAIN_TEST_SEED}_tfidf_svd_cosine_qcost")
+    dnn_enrolids_path_pre = os.path.join(dnn_dir, "leaf_global_dnn_enrolids.npy")
+    pn_h5_pre = os.path.join(args.distances_dir, "distances_majority_minority_gower.h5")
+    if args.use_precomputed_split and os.path.exists(dnn_enrolids_path_pre) and os.path.exists(pn_h5_pre):
+        import h5py
+        ctrl_ids = np.load(dnn_enrolids_path_pre)
+        with h5py.File(pn_h5_pre, "r") as f:
+            case_ids = f["minority_enrolids"][:]
+        train_ids_set = set(int(e) for e in ctrl_ids) | set(int(e) for e in case_ids)
+        train_pd = df[df["ENROLID"].isin(train_ids_set)].copy()
+        print("Using train set from precomputed DNN + Gower P-N enrolids")
+    else:
+        train_ids, test_ids, train_pd, test_pd = train_test_split_enrol(
+            df, target_col=target_col, test_size=0.3, verbose=False, random_state=TRAIN_TEST_SEED
+        )
+        val_ids, test_ids, val_pd, test_pd = train_test_split_enrol(
+            test_pd, target_col=target_col, test_size=0.5, verbose=False, random_state=TRAIN_TEST_SEED
+        )
 
     cases = train_pd[train_pd[target_col] == 1]
     controls = train_pd[train_pd[target_col] == 0]
@@ -153,14 +179,38 @@ def main():
 
     # Precompute: Gower P-N + tfidf_svd_cosine_qcost DNN (or resume if --resume and DNN exists)
     dnn_dir = os.path.join(args.distances_dir, f"global_dnn_seed_{TRAIN_TEST_SEED}_tfidf_svd_cosine_qcost")
-    dnn_matrix_path = os.path.join(dnn_dir, "leaf_global_dnn_matrix.h5")
+    dnn_matrix_path = os.path.join(dnn_dir, "leaf_global_dnn_matrix.npy")
     dnn_enrolids_path = os.path.join(dnn_dir, "leaf_global_dnn_enrolids.npy")
     pn_h5 = os.path.join(args.distances_dir, "distances_majority_minority_gower.h5")
+    ctrl_set = set(int(e) for e in control_enrolids)
 
-    if args.resume and os.path.exists(dnn_matrix_path) and os.path.exists(dnn_enrolids_path) and os.path.exists(pn_h5):
+    def _enrolids_match() -> bool:
+        if not os.path.exists(dnn_enrolids_path):
+            return False
+        saved = np.load(dnn_enrolids_path)
+        return set(int(e) for e in saved) == ctrl_set
+
+    need_recompute = args.force_recompute
+    if os.path.exists(dnn_matrix_path) and not _enrolids_match():
+        need_recompute = True
+        if args.force_recompute:
+            for p in [dnn_matrix_path, dnn_enrolids_path, pn_h5]:
+                if os.path.exists(p):
+                    os.remove(p)
+                    print(f"  Removed {p} (--force-recompute)")
+        else:
+            for p in [dnn_matrix_path, dnn_enrolids_path]:
+                if os.path.exists(p):
+                    os.remove(p)
+                    print(f"  Removed {p} (enrolids mismatch, will recompute)")
+            if os.path.exists(pn_h5):
+                os.remove(pn_h5)
+                print(f"  Removed {pn_h5} (enrolids mismatch)")
+
+    if not need_recompute and args.resume and os.path.exists(dnn_matrix_path) and os.path.exists(dnn_enrolids_path) and os.path.exists(pn_h5):
         print("Resume: using existing Gower P-N + tfidf_svd_cosine_qcost DNN")
         dnn_mat, dnn_ids = dnn_matrix_path, dnn_enrolids_path
-    else:
+    elif need_recompute or not os.path.exists(dnn_matrix_path) or not _enrolids_match():
         print("Precomputing distances: tfidf_svd_cosine_qcost")
         pn_h5, dnn_mat, dnn_ids = ensure_distances_for_metric(
             "tfidf_svd_cosine_qcost",
@@ -171,68 +221,81 @@ def main():
             TRUE_NUM_COLUMNS,
             BIN_FLAG_COLUMNS,
             args.distances_dir,
-            use_hdf5_dnn=True,
+            use_hdf5_dnn=False,
         )
     print()
 
     # Build undersampled sets and collect cost data (top_2_pct_cost_2018 == 0 for controls)
     plot_data: List[pd.DataFrame] = []
 
-    full_maj = controls[[cost_col]].copy()
-    full_maj["Method"] = "Full majority"
-    plot_data.append(full_maj)
-
-    rnd_1n = run_random_sampling(control_enrolids, controls, N, SEED)
-    rnd_1n = rnd_1n[[cost_col]].copy()
-    rnd_1n["Method"] = "Random 1N"
-    plot_data.append(rnd_1n)
+    for _ in tqdm([1], desc="Full majority", unit="step"):
+        full_maj = controls[[cost_col]].copy()
+        full_maj["Method"] = "Full majority"
+        plot_data.append(full_maj)
+    """
+    for _ in tqdm([1], desc="Random 1N", unit="step"):
+        rnd_1n = run_random_sampling(control_enrolids, controls, N, SEED)
+        rnd_1n = rnd_1n[[cost_col]].copy()
+        rnd_1n["Method"] = "Random 1N"
+        plot_data.append(rnd_1n)
 
     k10 = min(10 * N, n_controls)
-    rnd_10n = run_random_sampling(control_enrolids, controls, k10, SEED)
-    rnd_10n = rnd_10n[[cost_col]].copy()
-    rnd_10n["Method"] = "Random 10N"
-    plot_data.append(rnd_10n)
-
-    stage_1n = run_stageA_sampling(
-        control_enrolids, controls, cases, dnn_mat, dnn_ids, pn_h5, k=N, seed=SEED
-    )
-    stage_1n = stage_1n[[cost_col]].copy()
-    stage_1n["Method"] = "Stage A 1N (ZA_tfidf_svd_cosine_qcost)"
-    plot_data.append(stage_1n)
-
-    stage_10n = run_stageA_sampling(
-        control_enrolids, controls, cases, dnn_mat, dnn_ids, pn_h5, k=k10, seed=SEED
-    )
-    stage_10n = stage_10n[[cost_col]].copy()
-    stage_10n["Method"] = "Stage A 10N (ZA_tfidf_svd_cosine_qcost)"
-    plot_data.append(stage_10n)
-
-    full_df = pd.concat(plot_data, ignore_index=True)
-    method_order = [
-        "Full majority",
-        "Random 1N",
-        "Random 10N",
-        "Stage A 1N (ZA_tfidf_svd_cosine_qcost)",
-        "Stage A 10N (ZA_tfidf_svd_cosine_qcost)",
-    ]
-    full_df["Method"] = pd.Categorical(full_df["Method"], categories=method_order, ordered=True)
-    full_df = full_df.sort_values("Method")
-
-    plt.figure(figsize=(12, 6))
-    sns.set_style("whitegrid")
-    ax = sns.boxplot(data=full_df, x="Method", y=cost_col)
-    plt.yscale("log")
-    plt.title(
-        "Stage A TF-IDF+SVD+QCost: Majority Cost Distribution\n(top_2_pct_cost_2018 == 0)",
-        fontsize=14,
-    )
-    plt.ylabel("Annual Cost 2018 (Log Scale $)")
-    plt.xlabel("Sampling Method")
-    plt.xticks(rotation=30, ha="right")
-    plt.tight_layout()
-    out_path = os.path.join(args.outdir, "stageA_tfidf_svd_cosine_qcost_cost_boxplot.png")
-    plt.savefig(out_path, dpi=300)
-    plt.close()
+    for _ in tqdm([1], desc="Random 10N", unit="step"):
+        rnd_10n = run_random_sampling(control_enrolids, controls, k10, SEED)
+        rnd_10n = rnd_10n[[cost_col]].copy()
+        rnd_10n["Method"] = "Random 10N"
+        plot_data.append(rnd_10n)
+    """
+    for _ in tqdm([1], desc="Stage A 1N (load DNN + k-center)", unit="step"):
+        stage_1n = run_stageA_sampling(
+            control_enrolids, controls, cases, dnn_mat, dnn_ids, pn_h5, k=N, seed=SEED, use_tqdm=True
+        )
+        stage_1n = stage_1n[[cost_col]].copy()
+        stage_1n["Method"] = "Stage A 1N (ZA_tfidf_svd_cosine_qcost)"
+        plot_data.append(stage_1n)
+    # TODO: save the sampled ENROLIDs
+    sampled_enrolids = stage_1n["ENROLID"].values.astype(np.int64)
+    np.save(os.path.join(args.distances_dir, "sampled_enrolids_stageA_1N.npy"), sampled_enrolids)
+    print(f"Saved sampled enrolids: {os.path.join(args.distances_dir, 'sampled_enrolids_stageA_1N.npy')}")
+    """
+    for _ in tqdm([1], desc="Stage A 10N (load DNN + k-center)", unit="step"):
+        stage_10n = run_stageA_sampling(
+            control_enrolids, controls, cases, dnn_mat, dnn_ids, pn_h5, k=k10, seed=SEED, use_tqdm=True
+        )
+        stage_10n = stage_10n[[cost_col]].copy()
+        stage_10n["Method"] = "Stage A 10N (ZA_tfidf_svd_cosine_qcost)"
+        plot_data.append(stage_10n)
+    # TODO: save the sampled ENROLIDs
+    sampled_enrolids = stage_10n["ENROLID"].values.astype(np.int64)
+    np.save(os.path.join(args.distances_dir, "sampled_enrolids_stageA_10N.npy"), sampled_enrolids)
+    print(f"Saved sampled enrolids: {os.path.join(args.distances_dir, 'sampled_enrolids_stageA_10N.npy')}")
+    """
+    for _ in tqdm([1], desc="Plotting", unit="step"):
+        full_df = pd.concat(plot_data, ignore_index=True)
+        method_order = [
+            "Full majority",
+            #"Random 1N",
+            #"Random 10N",
+            "Stage A 1N (ZA_tfidf_svd_cosine_qcost)",
+            #"Stage A 10N (ZA_tfidf_svd_cosine_qcost)",
+        ]
+        full_df["Method"] = pd.Categorical(full_df["Method"], categories=method_order, ordered=True)
+        full_df = full_df.sort_values("Method")
+        plt.figure(figsize=(12, 6))
+        sns.set_style("whitegrid")
+        ax = sns.boxplot(data=full_df, x="Method", y=cost_col)
+        plt.yscale("log")
+        plt.title(
+            "Stage A TF-IDF+SVD+QCost: Majority Cost Distribution\n(top_2_pct_cost_2018 == 0)",
+            fontsize=14,
+        )
+        plt.ylabel("Annual Cost 2018 (Log Scale $)")
+        plt.xlabel("Sampling Method")
+        plt.xticks(rotation=30, ha="right")
+        plt.tight_layout()
+        out_path = os.path.join(args.outdir, "stageA_tfidf_svd_cosine_qcost_cost_boxplot.png")
+        plt.savefig(out_path, dpi=300)
+        plt.close()
     print(f"Box plot saved: {out_path}")
 
     print("\nDone.")

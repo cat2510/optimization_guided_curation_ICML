@@ -66,7 +66,7 @@ except Exception:
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--codes", type=str,
-                   default="I25", #"C50,C61,E10,E11,E66,E78,"" ## F32, E78 and E66 are GIANT!!
+                   default= "F32, E78, E66, E11",
                    help="Comma-separated cohort codes")
     p.add_argument("--features_dir", type=str,
                    default="/Users/cat2510/my_projects/misc_conditions/misc_conditions_features_with_meds",
@@ -74,7 +74,7 @@ def parse_args():
     p.add_argument("--baseline_year", type=int, default=2017)
     p.add_argument("--outcome_year", type=int, default=2018)
     p.add_argument("--train_test_seed", type=int, default=123)
-    p.add_argument("--output_root", type=str, default="/Users/cat2510/scratch/oct_vanilla_multi_cohort")
+    p.add_argument("--output_root", type=str, default="/Users/cat2510/scratch/oct_vanilla_big_cohorts")
 
     # OCT grid (small, as requested)
     p.add_argument("--depths", nargs="+", type=int, default=[7])
@@ -123,12 +123,15 @@ def run_one_cohort(code: str, args) -> dict:
     outcome_years = [2018, 2019] if code in ("I25", "I50") else args.outcome_year
     target_col, feature_cols = pick_target_and_features(df, args.baseline_year, outcome_years)
 
-    if len(df) > 1_000_000:
+    if len(df) > 500_000:
         from sklearn.model_selection import train_test_split
+        # keep only 250,000 rows stratified on target_col
         df, _ = train_test_split(
-            df, train_size=0.5, stratify=df[target_col], random_state=args.train_test_seed
+            df, train_size=250_000, stratify=df[target_col], random_state=args.train_test_seed
         )
         print(f"  Sampled to {len(df):,} rows (stratified on {target_col})")
+    else:
+        print(f"  Using {len(df):,} rows")
 
     BIN_FLAG_COLUMNS = get_bin_flag_columns(df)
     CAT_COLUMNS = get_cat_columns(df)

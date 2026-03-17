@@ -30,6 +30,11 @@ from typing import List, Optional, Tuple
 
 import h5py
 import numpy as np
+
+try:
+    import numexpr
+except ImportError:
+    numexpr = None  # type: ignore[assignment]
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -114,9 +119,48 @@ def parse_args():
     return p.parse_args()
 
 
+# Gower: tolerance for treating binary/categorical values as equal (avoids float == / !=)
+_GOWER_BINARY_ATOL = 1e-6
+_GOWER_BINARY_RTOL = 1e-5
+
+
+def _validate_gower_binary_columns(
+    X_A: np.ndarray,
+    X_B: np.ndarray,
+    binary_col_indices: np.ndarray,
+    atol: float = 1e-6,
+    rtol: float = 1e-5,
+) -> None:
+    """Raise ValueError if any column marked as binary contains values not in {0, 1} (within tolerance)."""
+    for c in binary_col_indices:
+        for name, X in [("A", X_A), ("B", X_B)]:
+            col = np.asarray(X[:, c], dtype=np.float64).ravel()
+            # Consider NaN as invalid for binary
+            if np.any(np.isnan(col)):
+                uniq = np.unique(col[~np.isnan(col)])
+                raise ValueError(
+                    f"Gower binary column #{c} in X_{name} contains NaN. "
+                    f"Unique non-NaN values (sample): {uniq[:20].tolist()}"
+                )
+            # Must be close to 0 or 1 only
+            close_to_0 = np.abs(col) <= atol + rtol * np.maximum(np.abs(col), 1e-12)
+            close_to_1 = np.abs(col - 1.0) <= atol + rtol * np.maximum(np.abs(col), 1e-12)
+            if not np.all(close_to_0 | close_to_1):
+                uniq = np.unique(col)
+                if len(uniq) > 10:
+                    uniq_repr = f"{uniq[:5].tolist()} ... {uniq[-3:].tolist()} (n_unique={len(uniq)})"
+                else:
+                    uniq_repr = uniq.tolist()
+                raise ValueError(
+                    f"Gower binary column #{c} in X_{name} is not binary (values must be 0 or 1). "
+                    f"Unique values: {uniq_repr}"
+                )
+
+
 # ---------------------------------------------------------------------------
-# Gower mixed-type distance: binary uses δ=1[a≠b], continuous uses δ=|a-b|/range_j
+# Gower mixed-type distance: binary uses δ=1[a≠b] (tolerance-based), continuous uses δ=|a-b|/range_j
 # range_j = max-min from train; if range_j=0 set to 1 (constant feature contributes 0)
+# All arrays and outputs use float32.
 # ---------------------------------------------------------------------------
 def _compute_gower_distances(
     X_A: np.ndarray,
@@ -125,12 +169,24 @@ def _compute_gower_distances(
     continuous_col_indices: np.ndarray,
     ranges: np.ndarray,
     batch_size: int = 1000,
+    binary_atol: float = _GOWER_BINARY_ATOL,
+    binary_rtol: float = _GOWER_BINARY_RTOL,
 ) -> np.ndarray:
-    """Compute Gower distances between X_A (n_A x p) and X_B (n_B x p). Returns (n_A, n_B)."""
+    """Compute Gower distances between X_A (n_A x p) and X_B (n_B x p). Returns (n_A, n_B) float32."""
+    _validate_gower_binary_columns(X_A, X_B, binary_col_indices, atol=binary_atol, rtol=binary_rtol)
+    if numexpr is None:
+        raise ImportError("Gower distance requires 'numexpr'. Install with: pip install numexpr")
+
+    # Work in float32 throughout
+    X_A = np.asarray(X_A, dtype=np.float32)
+    X_B = np.asarray(X_B, dtype=np.float32)
+    ranges = np.asarray(ranges, dtype=np.float32)
+
     n_A, n_B = X_A.shape[0], X_B.shape[0]
     p = X_A.shape[1]
     distances = np.zeros((n_A, n_B), dtype=np.float32)
 
+    binary_set = set(binary_col_indices.ravel().tolist())
     n_batches = (n_A + batch_size - 1) // batch_size
     for b in range(n_batches):
         s, e = b * batch_size, min((b + 1) * batch_size, n_A)
@@ -138,14 +194,18 @@ def _compute_gower_distances(
         for j in range(p):
             a_vals = X_A[s:e, j]
             b_vals = X_B[:, j]
-            if j in set(binary_col_indices):
-                # δ = 1[a≠b]
-                diff = (a_vals[:, None] != b_vals[None, :]).astype(np.float32)
+            a = a_vals[:, None]
+            b = b_vals[None, :]
+            if j in binary_set:
+                # δ = 1[a≠b] using tolerance to avoid float equality issues
+                diff = numexpr.evaluate(
+                    "where(abs(a - b) <= atol + rtol * abs(b), 0.0, 1.0)",
+                    local_dict={"a": a, "b": b, "atol": binary_atol, "rtol": binary_rtol},
+                ).astype(np.float32)
             else:
                 # continuous: δ = |a-b|/range_j
-                rj = ranges[j]
-                diff = np.abs(a_vals[:, None].astype(np.float64) - b_vals[None, :].astype(np.float64)) / rj
-                diff = diff.astype(np.float32)
+                rj = float(ranges[j])
+                diff = numexpr.evaluate("abs(a - b) / rj", local_dict={"a": a, "b": b, "rj": rj}).astype(np.float32)
             block += diff
         distances[s:e, :] = block / p
     return distances
@@ -259,8 +319,10 @@ def ensure_distances_for_metric(
     dnn_matrix_path = os.path.join(dnn_dir, f"leaf_global_dnn_matrix{dnn_suffix}")
     dnn_enrolids_path = os.path.join(dnn_dir, "leaf_global_dnn_enrolids.npy")
 
-    # tfidf_svd_cosine_qcost: Stage A DNN only; use Gower P-N for seed selection
+    # tfidf_svd_cosine_qcost: Stage A DNN only; use Gower P-N for seed selection.
+    # Always use .npy memmap (faster random access) regardless of use_hdf5_dnn.
     if distance_metric == "tfidf_svd_cosine_qcost":
+        dnn_matrix_path = os.path.join(dnn_dir, "leaf_global_dnn_matrix.npy")
         gower_pn_h5 = os.path.join(distances_dir, "distances_majority_minority_gower.h5")
         if not os.path.exists(gower_pn_h5):
             ensure_distances_for_metric(
@@ -285,7 +347,8 @@ def ensure_distances_for_metric(
         )
         print(f"  Sanity: n_codes={meta['n_codes']}, svd_dim={meta['svd_dim']}, d_cost={meta['d_cost']}, alpha={meta['alpha']}")
         run_cosine_distance_diagnostics(Z)
-        dnn_matrix_path, dnn_enrolids_path = precompute_leaf_dnn_hdf5(
+        # Use .npy memmap for faster random access during k-center (no HDF5 decompression)
+        dnn_matrix_path, dnn_enrolids_path = precompute_leaf_dnn_memmap(
             X_majority_leaf=Z,
             majority_enrolids_leaf=enrolids,
             out_dir=dnn_dir,
@@ -306,26 +369,26 @@ def ensure_distances_for_metric(
         parts_min, parts_maj = [], []
         n_bin = 0
         if bin_in_feature:
-            parts_min.append(cases[bin_in_feature].values.astype(np.float64))
-            parts_maj.append(controls[bin_in_feature].values.astype(np.float64))
+            parts_min.append(cases[bin_in_feature].values.astype(np.float32))
+            parts_maj.append(controls[bin_in_feature].values.astype(np.float32))
             n_bin += len(bin_in_feature)
         if cat_in_feature:
             all_cat = pd.concat([cases[cat_in_feature], controls[cat_in_feature]], ignore_index=True)
             ohe = OneHotEncoder(drop="first", sparse_output=False, handle_unknown="ignore")
             ohe_mat = ohe.fit_transform(all_cat)
-            parts_min.append(ohe_mat[: len(cases)].astype(np.float64))
-            parts_maj.append(ohe_mat[len(cases) :].astype(np.float64))
+            parts_min.append(ohe_mat[: len(cases)].astype(np.float32))
+            parts_maj.append(ohe_mat[len(cases) :].astype(np.float32))
             n_bin += ohe_mat.shape[1]
         if num_in_feature:
-            parts_min.append(cases[num_in_feature].values.astype(np.float64))
-            parts_maj.append(controls[num_in_feature].values.astype(np.float64))
-        X_minority = np.hstack(parts_min) if parts_min else np.zeros((len(cases), 0))
-        X_majority = np.hstack(parts_maj) if parts_maj else np.zeros((len(controls), 0))
-        ranges = np.ones(X_minority.shape[1])
+            parts_min.append(cases[num_in_feature].values.astype(np.float32))
+            parts_maj.append(controls[num_in_feature].values.astype(np.float32))
+        X_minority = np.hstack(parts_min) if parts_min else np.zeros((len(cases), 0), dtype=np.float32)
+        X_majority = np.hstack(parts_maj) if parts_maj else np.zeros((len(controls), 0), dtype=np.float32)
+        ranges = np.ones(X_minority.shape[1], dtype=np.float32)
         for j in range(n_bin, X_minority.shape[1]):
             col = np.concatenate([X_minority[:, j], X_majority[:, j]])
             r = float(np.nanmax(col) - np.nanmin(col))
-            ranges[j] = r if r > 0 else 1.0
+            ranges[j] = np.float32(r if r > 0 else 1.0)
         bin_col_indices = list(range(n_bin))
         print(f"  Precomputing P-N distances (metric=gower)...")
         dist_pn = compute_gower_distances_batched(X_majority, X_minority, bin_col_indices, ranges)

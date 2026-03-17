@@ -28,8 +28,8 @@ def get_cost_columns_2017(df: pd.DataFrame) -> List[str]:
         if (
             "cost" in col.lower()
             or "quarterly" in col.lower()
-            or "increasing" in col.lower()
-            or "decreasing" in col.lower()
+            or "total_increasing" in col.lower()
+            or "total_decreasing" in col.lower()
             or "skewness" in col.lower()
             or "kurtosis" in col.lower()
             or "cv" in col.lower()
@@ -46,7 +46,6 @@ def build_tfidf_svd_qcost_embedding(
     cost_columns: List[str],
     out_dir: str,
     svd_dim: int = SVD_DIM,
-    n_quantiles: int | None = None,
     subsample: int | None = SUBSAMPLE,
     random_state: int = TRAIN_TEST_SEED,
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
@@ -79,20 +78,19 @@ def build_tfidf_svd_qcost_embedding(
     Z_codes = svd.fit_transform(X_tfidf).astype(np.float64)
     Z_codes_norm = Z_codes / (np.linalg.norm(Z_codes, axis=1, keepdims=True) + 1e-10)
 
-    # 4. Quantile transform 2017 cost
-    X_cost = controls[cost_columns].fillna(0).values.astype(np.float64)
-    d_cost = X_cost.shape[1]
-    n_q = min(1000, n_controls) if n_quantiles is None else min(n_quantiles, n_controls)
-    subsample_eff = subsample if n_controls > (subsample or 0) else None
+    # 4. Quantile transform 2017 cost (sklearn expects 2D: n_samples x n_features)
+    X_cost = controls[cost_columns].fillna(0).values.astype(np.float64)  # (n_controls, d_cost)
+    n_quantiles = min(1000, max(1, X_cost.shape[0]))
     qt = QuantileTransformer(
         output_distribution="normal",
-        n_quantiles=n_q,
-        subsample=subsample_eff,
+        n_quantiles=n_quantiles,
+        subsample=subsample,
         random_state=random_state,
     )
-    Z_cost = qt.fit_transform(X_cost).astype(np.float64)
+    Z_cost = qt.fit_transform(X_cost).astype(np.float64)  # (n_controls, d_cost)
     Z_cost_norm = Z_cost / (np.linalg.norm(Z_cost, axis=1, keepdims=True) + 1e-10)
 
+    d_cost = X_cost.shape[1]
     # 5. Combine with alpha = sqrt(svd_dim_eff / d_cost) for scale matching
     alpha = np.sqrt(float(svd_dim_eff) / d_cost) if d_cost > 0 else 1.0
     Z = np.hstack([Z_codes_norm, alpha * Z_cost_norm])

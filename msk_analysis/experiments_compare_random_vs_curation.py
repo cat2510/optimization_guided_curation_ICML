@@ -106,7 +106,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score, matthews_cor
 TRAIN_TEST_SEED = 123
 OCT_DEPTHS = [7]
 OCT_MINBUCKETS = [150]
-OCT_CPS = [0.0001, 0.001, 0.01]
+OCT_CPS = [0.0001]
 
 
 # =============================================================================
@@ -140,20 +140,33 @@ def sample_stageA_dispersed_controls(
     use_kmeanspp: bool = True,
     X_majority_leaf: Optional[np.ndarray] = None,
     verbose: bool = True,
+    use_tqdm: bool = False,
 ) -> Tuple[np.ndarray, Optional[float]]:
     """
     Stage A only: farthest-first k-center to select k dispersed controls.
     Returns (selected_control_enrolids, mean_min_dist_to_case or None).
     """
+    from tqdm import tqdm
+    if use_tqdm:
+        pbar = tqdm(total=3, desc="Stage A", unit="step", leave=False)
     d_nn, dnn_ids = load_nn(leaf_nn_matrix_npy, leaf_nn_enrolids_npy)
+    if use_tqdm:
+        pbar.set_description("Stage A: DNN loaded")
+        pbar.update(1)
 
     if d_nn.shape[0] != len(dnn_ids):
         raise ValueError("d_nn and enrolids length mismatch")
 
     # Align controls to d_nn order
     id2pos = {int(e): i for i, e in enumerate(leaf_controls_enrolids)}
-    if not all(int(e) in id2pos for e in dnn_ids):
-        raise ValueError("dnn_ids must be subset of leaf_controls_enrolids")
+    dnn_ids_missing = [int(e) for e in dnn_ids if int(e) not in id2pos]
+    if dnn_ids_missing:
+        raise ValueError(
+            "dnn_ids must be subset of leaf_controls_enrolids. "
+            f"Found {len(dnn_ids_missing)} dnn_ids not in current controls (e.g. {dnn_ids_missing[:3]}). "
+            "This usually means the DNN was precomputed with different data loading (e.g. Spark vs pd.read_parquet) "
+            "or a different train split. Recompute the DNN (run without --resume) to fix."
+        )
     # d_nn rows/cols correspond to dnn_ids; leaf_controls may differ
     n_avail = d_nn.shape[0]
     k_eff = min(k, M_pool, n_avail)
@@ -177,6 +190,9 @@ def sample_stageA_dispersed_controls(
         d_pn_leaf = d_pn_sorted[rows_unsort, :][:, cols_unsort]
     finally:
         f_pn.close()
+    if use_tqdm:
+        pbar.set_description("Stage A: P-N loaded")
+        pbar.update(1)
 
     # Choose seed
     if seed_method == "random":
@@ -197,10 +213,13 @@ def sample_stageA_dispersed_controls(
     # Run k-center
     if use_kmeanspp:
         rng = np.random.RandomState(seed + 1337)  # offset avoids coupling to other random uses
-        cand_idx = kmeanspp_metric_indices(d_nn, k_eff, seed_idx, rng)
+        cand_idx = kmeanspp_metric_indices(d_nn, k_eff, seed_idx, rng, use_tqdm=use_tqdm)
     else:
-        cand_idx = farthest_first_kcenter_indices(d_nn, k_eff, seed_idx)
+        cand_idx = farthest_first_kcenter_indices(d_nn, k_eff, seed_idx, use_tqdm=use_tqdm)
     selected_enrolids = dnn_ids[cand_idx]
+    if use_tqdm:
+        pbar.update(1)
+        pbar.close()
 
     # Mean min distance from selected controls to their nearest case (for logging)
     mean_min = float(d_pn_leaf[cand_idx, :].min(axis=1).mean()) if len(cand_idx) else None
@@ -447,13 +466,15 @@ def train_and_evaluate_oct(
     results_dir: str,
     save_suffix: str,
     random_seed: int = TRAIN_TEST_SEED,
+    save_predictions: bool = True,
 ) -> dict:
     """Train OCT, evaluate on test, return metrics dict."""
     X_train = train_df[feature_cols]
     y_train = train_df[target_col]
     X_val = val_df[feature_cols]
     y_val = val_df[target_col]
-    X_test = test_df[feature_cols]
+    # Include ENROLID in X_test so evaluate_binary_oct saves it for cross-experiment comparability
+    X_test = test_df[feature_cols + (["ENROLID"] if "ENROLID" in test_df.columns else [])]
     y_test = test_df[target_col]
 
     model, params, _, preprocessor, feat_names = finetune_oct(
@@ -475,7 +496,8 @@ def train_and_evaluate_oct(
     metrics = evaluate_binary_oct(
         model, X_test, y_test, preprocessor, feat_names,
         X_val_df=X_val, y_val=y_val,
-        results_dir=results_dir, save_suffix=save_suffix,
+        results_dir=results_dir if save_predictions else None,
+        save_suffix=save_suffix if save_predictions else None,
     )
 
     # IAI model.apply() expects a DataFrame, not a Matrix
