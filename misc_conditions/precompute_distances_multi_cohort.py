@@ -21,11 +21,7 @@ import h5py
 import sys
 parent_dir = os.path.abspath(os.path.join(os.getcwd(), ".."))
 sys.path.insert(0, parent_dir)
-
-# When metric=gower, import from msk_analysis (same repo parent)
-_msk_scripts = os.path.abspath(os.path.join(parent_dir, "msk_analysis", "scripts"))
-if os.path.isdir(_msk_scripts) and _msk_scripts not in sys.path:
-    sys.path.insert(0, _msk_scripts)
+# Gower kernel: public.precompute_gower_distances (my_projects/public); parent_dir must be on path.
 
 from sklearn.metrics import pairwise_distances
 import importlib
@@ -113,7 +109,7 @@ from curated_vs_random_1to1_multi_cohort_oct import pick_target_and_features
 def maybe_compute_pn_gower(pn_h5_path, X_maj, X_min, maj_ids, min_ids, bin_col_indices, ranges, args, col_names=None):
     if pn_h5_path.exists() and not args.overwrite:
         return
-    import precompute_gower_distances as gower_module
+    import public.precompute_gower_distances as gower_module
     print(f"  Computing P-N (gower v2): {X_maj.shape[0]:,} x {X_min.shape[0]:,}")
     gdt = gower_module._as_gower_dtype(getattr(args, "gower_dtype", "float16"))
     dist_pn = gower_module.compute_gower_pn_v2(
@@ -132,7 +128,7 @@ def maybe_compute_dnn_gower(dnn_out_dir, X_maj, maj_ids, bin_col_indices, ranges
     dnn_matrix = dnn_out_dir / f"leaf_global_dnn_matrix{suffix}"
     if dnn_matrix.exists() and not args.overwrite:
         return
-    import precompute_gower_distances as gower_module
+    import public.precompute_gower_distances as gower_module
     print(f"  Computing D-N-N (gower v2, batched)...")
     gdt = gower_module._as_gower_dtype(getattr(args, "gower_dtype", "float16"))
     gower_module.precompute_gower_dnn_v2(
@@ -192,7 +188,7 @@ def run_one(code: str, args):
 
     if args.metric == "gower":
         # Gower: use msk_analysis precompute_gower_distances (v2 kernel)
-        import precompute_gower_distances as gower_module
+        import public.precompute_gower_distances as gower_module
         cases_pd = train_pd.loc[cases_mask]
         controls_pd = train_pd.loc[controls_mask]
         X_train_raw = train_pd[feat_cols]

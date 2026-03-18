@@ -59,8 +59,8 @@ from public.model_IAI import (
 )
 
 TRAIN_TEST_SEED = 123
-DISTANCES_DIR = "/Users/cat2510/scratch/precomputed_distances_exp6_ablation/"
-SCRATCH_OUTDIR = "/Users/cat2510/scratch/exp_0_to_4_gower"
+DISTANCES_DIR = "/Users/cat2510/scratch/"
+SCRATCH_OUTDIR = "/Users/cat2510/scratch/exp_0_to_4_gower_v2"
 
 
 def _parse_seeds(seeds_str: str) -> List[int]:

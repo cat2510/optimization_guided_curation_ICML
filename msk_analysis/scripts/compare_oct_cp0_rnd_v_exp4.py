@@ -158,7 +158,7 @@ def parse_args():
     p.add_argument("--train_root", type=str, default="compare_oct_cp0_rnd_v_exp4_train_sets")
     p.add_argument("--outdir", type=str, default="compare_oct_cp0_rnd_v_exp4_train_sets")
     p.add_argument("--seeds", type=str, default="1,2,3,4,5")
-    p.add_argument("--distances_dir", type=str, default="/Users/cat2510/scratch/precomputed_distances_exp6_ablation/")
+    p.add_argument("--distances_dir", type=str, default="/Users/cat2510/scratch/")
     p.add_argument("--stageA_seed_method", type=str, default="random")
     p.add_argument("--M_pool", type=int, default=None)
     p.add_argument("--use_kmeanspp", action="store_true")

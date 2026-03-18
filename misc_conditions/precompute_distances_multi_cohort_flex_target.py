@@ -31,10 +31,7 @@ import sys
 parent_dir = os.path.abspath(os.path.join(os.getcwd(), ".."))
 sys.path.insert(0, parent_dir)
 
-# When metric=gower, import from msk_analysis (same repo parent)
-_msk_scripts = os.path.abspath(os.path.join(parent_dir, "msk_analysis", "scripts"))
-if os.path.isdir(_msk_scripts) and _msk_scripts not in sys.path:
-    sys.path.insert(0, _msk_scripts)
+# Gower kernel: public.precompute_gower_distances (my_projects/public); parent_dir must be on path.
 
 from sklearn.metrics import pairwise_distances
 import importlib
@@ -92,7 +89,7 @@ def parse_args():
     p.add_argument("--pn_batch_size", type=int, default=1000)
     p.add_argument("--dnn_batch_size", type=int, default=750)
     p.add_argument("--metric", type=str, default="gower",
-                   help="Distance metric. Gower uses msk_analysis precompute_gower_distances v2 kernel.")
+                   help="Distance metric. Gower uses public.precompute_gower_distances v2 kernel.")
 
     p.add_argument("--use_hdf5_dnn", action="store_true",
                    help="save as HDF5 (compressed) instead of .npy memmap.")
@@ -136,7 +133,7 @@ def resolve_feature_path(features_dir: Path, code: str, baseline_year: int, outc
 def maybe_compute_pn_gower(pn_h5_path, X_maj, X_min, maj_ids, min_ids, bin_col_indices, ranges, args, col_names=None):
     if pn_h5_path.exists() and not args.overwrite:
         return
-    import precompute_gower_distances as gower_module
+    import public.precompute_gower_distances as gower_module
     print(f"  Computing P-N (gower v2): {X_maj.shape[0]:,} x {X_min.shape[0]:,}")
     gdt = gower_module._as_gower_dtype(getattr(args, "gower_dtype", "float16"))
     dist_pn = gower_module.compute_gower_pn_v2(
@@ -159,7 +156,7 @@ def maybe_compute_dnn_gower(dnn_out_dir, X_maj, maj_ids, bin_col_indices, ranges
             np.save(dnn_enrolids_path, maj_ids)
             print(f"  Saved missing enrolids: {dnn_enrolids_path}")
         return
-    import precompute_gower_distances as gower_module
+    import public.precompute_gower_distances as gower_module
     print(f"  Computing D-N-N (gower v2, batched)...")
     gdt = gower_module._as_gower_dtype(getattr(args, "gower_dtype", "float16"))
     gower_module.precompute_gower_dnn_v2(
@@ -224,7 +221,7 @@ def run_one(code: str, args):
     dnn_out_dir = dist_dir / f"global_dnn_seed_{args.train_test_seed}"
 
     if args.metric == "gower":
-        import precompute_gower_distances as gower_module
+        import public.precompute_gower_distances as gower_module
         cases_pd = train_pd.loc[cases_mask]
         controls_pd = train_pd.loc[controls_mask]
         X_train_raw = train_pd[feat_cols]
@@ -254,7 +251,7 @@ def main():
     --train_test_seed 123
 
   Use --target_pct 1 for top 1% cost, --target_pct 0.5 for top 0.5%.
-  Requires msk_analysis at ../msk_analysis (for precompute_gower_distances) and numexpr.
+  Requires my_projects on path (../ from misc_conditions) for public.* and numexpr for Gower.
   """
     args = parse_args()
     codes = [c.strip().upper() for c in args.codes.split(",") if c.strip()]
