@@ -392,7 +392,12 @@ def main():
     df_out = pd.DataFrame(rows)
     out_csv = out_root / "summary_vanilla_multi_cohort.csv"
     file_exists = os.path.isfile(out_csv)
-    df_out.to_csv(out_csv, mode='a', index=False, header=not file_exists)
+    if file_exists and out_csv.stat().st_size > 0:
+        with open(out_csv, "rb+") as f:
+            f.seek(-1, 2)
+            if f.read(1) != b"\n":
+                f.write(b"\n")
+    df_out.to_csv(out_csv, mode="a", index=False, header=not file_exists)
     print(f"\nSaved summary: {out_csv} (rows={len(df_out)})")
 
     # quick view

@@ -104,6 +104,9 @@ def parse_args():
     p.add_argument("--overwrite", action="store_true",
                    help="Force recomputation even if files exist and ENROLIDs match")
 
+    p.add_argument("--gower_dtype", type=str, default="float16", choices=["float32", "float16"],
+                   help="Gower feature + distance dtype (default float16). Use float32 for max precision.")
+
     return p.parse_args()
 
 
@@ -135,25 +138,38 @@ def maybe_compute_pn_gower(pn_h5_path, X_maj, X_min, maj_ids, min_ids, bin_col_i
         return
     import precompute_gower_distances as gower_module
     print(f"  Computing P-N (gower v2): {X_maj.shape[0]:,} x {X_min.shape[0]:,}")
-    dist_pn = gower_module.compute_gower_pn_v2(X_maj, X_min, bin_col_indices, ranges, col_names=col_names)
-    save_distances_hdf5(dist_pn, maj_ids, min_ids, str(pn_h5_path))
+    gdt = gower_module._as_gower_dtype(getattr(args, "gower_dtype", "float16"))
+    dist_pn = gower_module.compute_gower_pn_v2(
+        X_maj, X_min, bin_col_indices, ranges, col_names=col_names, out_dtype=gdt,
+    )
+    if gdt == np.dtype(np.float32):
+        save_distances_hdf5(dist_pn, maj_ids, min_ids, str(pn_h5_path))
+    else:
+        gower_module._save_distances_hdf5_inline(
+            dist_pn, maj_ids, min_ids, str(pn_h5_path), distances_dtype=gdt,
+        )
 
 
 def maybe_compute_dnn_gower(dnn_out_dir, X_maj, maj_ids, bin_col_indices, ranges, args, col_names=None):
     suffix = ".h5" if getattr(args, "use_hdf5_dnn", False) else ".npy"
-    dnn_matrix = dnn_out_dir / f"leaf_global_dnn_matrix{suffix}"
-    if dnn_matrix.exists() and not args.overwrite:
+    dnn_matrix_path = dnn_out_dir / f"leaf_global_dnn_matrix{suffix}"
+    dnn_enrolids_path = dnn_out_dir / "leaf_global_dnn_enrolids.npy"
+    if dnn_matrix_path.exists() and not args.overwrite:
+        if not dnn_enrolids_path.exists():
+            np.save(dnn_enrolids_path, maj_ids)
+            print(f"  Saved missing enrolids: {dnn_enrolids_path}")
         return
     import precompute_gower_distances as gower_module
     print(f"  Computing D-N-N (gower v2, batched)...")
+    gdt = gower_module._as_gower_dtype(getattr(args, "gower_dtype", "float16"))
     gower_module.precompute_gower_dnn_v2(
         X_maj, bin_col_indices, ranges,
         out_dir=str(dnn_out_dir),
         batch_size=args.dnn_batch_size,
         use_hdf5=getattr(args, "use_hdf5_dnn", False),
         col_names=col_names,
+        out_dtype=gdt,
     )
-    dnn_enrolids_path = dnn_out_dir / "leaf_global_dnn_enrolids.npy"
     np.save(dnn_enrolids_path, maj_ids)
 
 
@@ -215,8 +231,10 @@ def run_one(code: str, args):
         BIN_FLAG_COLUMNS = get_bin_flag_columns(X_train_raw)
         CAT_COLUMNS = get_cat_columns(X_train_raw)
         TRUE_NUM_COLUMNS = get_true_num_columns(X_train_raw, CAT_COLUMNS, BIN_FLAG_COLUMNS)
+        gdt = gower_module._as_gower_dtype(getattr(args, "gower_dtype", "float16"))
         X_majority, X_minority, ranges, bin_col_indices, col_names = gower_module.build_gower_feature_matrices(
-            cases_pd, controls_pd, feat_cols, CAT_COLUMNS, TRUE_NUM_COLUMNS, BIN_FLAG_COLUMNS
+            cases_pd, controls_pd, feat_cols, CAT_COLUMNS, TRUE_NUM_COLUMNS, BIN_FLAG_COLUMNS,
+            feature_dtype=gdt,
         )
         maybe_compute_pn_gower(pn_h5_path, X_majority, X_minority, maj_ids, min_ids, bin_col_indices, ranges, args, col_names=col_names)
         maybe_compute_dnn_gower(dnn_out_dir, X_majority, maj_ids, bin_col_indices, ranges, args, col_names=col_names)

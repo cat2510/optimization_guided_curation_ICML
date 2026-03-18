@@ -96,7 +96,7 @@ def parse_args():
                    help="Override: explicit target column. If set, ignores --target_pct.")
 
     p.add_argument("--distances_dir_template", type=str,
-                   default="/Users/cat2510/scratch/precomputed_distances_{code}_top{target_suffix}pct", #TODO: default="/Users/cat2510/scratch/precomputed_distances_{code}_top{target_suffix}pct",
+                   default="/Users/cat2510/scratch/precomputed_distances_{code}_top{target_suffix}pct", 
                    #default="/Users/cat2510/scratch/precomputed_distances_{code}_with_cost_features",
                    help="Template for distance dir. Use {code} and {target_suffix}. Must match precompute_distances_multi_cohort_flex_target.")
 
@@ -115,7 +115,7 @@ def parse_args():
                    help="Optional regex to filter feature columns (applied after leakage exclusion).")
 
     p.add_argument("--depths", nargs="+", type=int, default=[7])
-    p.add_argument("--minbuckets", nargs="+", type=int, default=[100])
+    p.add_argument("--minbuckets", nargs="+", type=int, default=[50, 100])
     p.add_argument("--cps", nargs="+", type=float, default=[0.0001, 0.01, 0.001])
 
     p.add_argument("--spec_floor", type=float, default=0.60,
@@ -514,7 +514,12 @@ def main():
         df_res = pd.DataFrame(all_rows)
         out_csv = output_root / "summary_curated_vs_random_flex_target.csv"
         file_exists = os.path.isfile(out_csv)
-        df_res.to_csv(out_csv, mode='a', index=False, header=not file_exists)
+        if file_exists and out_csv.stat().st_size > 0:
+            with open(out_csv, "rb+") as f:
+                f.seek(-1, 2)
+                if f.read(1) != b"\n":
+                    f.write(b"\n")
+        df_res.to_csv(out_csv, mode="a", index=False, header=not file_exists)
         print(f"\nSaved summary: {out_csv} (added rows={len(df_res)})")
 
         if "method" in df_res.columns:
