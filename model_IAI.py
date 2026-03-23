@@ -93,48 +93,70 @@ def get_cat_columns(df):
     return [col for col in cols if col != "ENROLID"]
 
 
-import pandas as pd
-import numpy as np
+# Tolerance for Gower v2 binary columns (must match public.precompute_gower_distances validation)
+GOWER_BINARY_ATOL = 1e-6
+GOWER_BINARY_RTOL = 1e-5
 
-def is_binary_01_series(s: pd.Series) -> bool:
+
+def is_binary_01_series(
+    s: pd.Series,
+    *,
+    atol: float = 0.0,
+    rtol: float = 0.0,
+) -> bool:
     """
-    Return True if the non-missing values of s are only in {0, 1},
-    allowing int/float/bool representations like 0, 1, 0.0, 1.0, True, False.
+    True if non-missing values are in {0, 1} (or within atol/rtol of 0 or 1).
+
+    Default atol=rtol=0: strict — used by get_bin_flag_columns for value-based detection
+    (exact 0/1 after coercion; bool OK).
+
+    Use atol=GOWER_BINARY_ATOL, rtol=GOWER_BINARY_RTOL to match the Gower distance kernel
+    (e.g. validating has_* columns on the cases∪controls matrix in preprocessing).
     """
     non_null = s.dropna()
     if non_null.empty:
         return False
 
-    # Convert bools to ints; leave numerics as numerics
-    if pd.api.types.is_bool_dtype(non_null):
-        vals = set(non_null.astype(int).unique())
+    if atol == 0.0 and rtol == 0.0:
+        if pd.api.types.is_bool_dtype(non_null):
+            vals = set(non_null.astype(int).unique())
+            return vals.issubset({0, 1})
+        coerced = pd.to_numeric(non_null, errors="coerce")
+        if coerced.isna().any():
+            return False
+        vals = set(coerced.unique())
         return vals.issubset({0, 1})
 
-    # Try numeric coercion; if strings like "0"/"1" appear, this still works
-    coerced = pd.to_numeric(non_null, errors="coerce")
-    if coerced.isna().any():
+    arr = np.asarray(pd.to_numeric(non_null, errors="coerce"), dtype=np.float64)
+    if np.any(np.isnan(arr)):
         return False
+    close_0 = np.abs(arr) <= atol + rtol * np.maximum(np.abs(arr), 1e-12)
+    close_1 = np.abs(arr - 1.0) <= atol + rtol * np.maximum(np.abs(arr), 1e-12)
+    return bool(np.all(close_0 | close_1))
 
-    vals = set(coerced.unique())
-    return vals.issubset({0, 1})
+
+def get_bin_flag_columns_with_provenance(df: pd.DataFrame):
+    """
+    Same bin columns as get_bin_flag_columns, plus which ones were confirmed by strict
+    is_binary_01_series on df (not only by has_* naming).
+
+    Columns in the second return value need no second pass in Gower matrix build; others
+    (has_* with non–0/1 values on df) are checked with Gower tolerance on cases∪controls.
+    """
+    bin_cols = []
+    verified_strict: set = set()
+    for col in df.columns:
+        name_match = col.startswith("has_")
+        value_match = is_binary_01_series(df[col])
+        if name_match or value_match:
+            bin_cols.append(col)
+            if value_match:
+                verified_strict.add(col)
+    return bin_cols, frozenset(verified_strict)
 
 
 def get_bin_flag_columns(df: pd.DataFrame):
-    bin_cols = []
-
-    for col in df.columns:
-        col_l = col.lower()
-
-        name_match = (
-            col.startswith("has_")
-        )
-
-        value_match = is_binary_01_series(df[col])
-
-        if name_match or value_match:
-            bin_cols.append(col)
-
-    return bin_cols
+    return get_bin_flag_columns_with_provenance(df)[0]
     
 def get_true_num_columns(df, CAT_COLUMNS,BIN_FLAG_COLUMNS):
     return [

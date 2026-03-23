@@ -18,7 +18,7 @@ def load_nn_memmap(nn_matrix_npy: str, nn_enrolids_npy: str):
 
 def load_nn(nn_matrix_path: str, nn_enrolids_path: str):
     """
-    Load majority-majority distances from .npy (memmap) or .h5 (HDF5 compressed).
+    Load majority-majority distances from .npy (memmap), .npz, or .h5 (HDF5 compressed).
     Use HDF5 for large matrices to save disk (~3-5x smaller with gzip).
     Returns (d_nn, maj_ids) where d_nn supports d_nn[i,:] slicing.
     """
@@ -35,6 +35,10 @@ def load_nn(nn_matrix_path: str, nn_enrolids_path: str):
                 return d_dset.shape
         d_nn = _H5DnnView()
         d_nn._h5_file = f  # keep file open
+        return d_nn, maj_ids
+    elif nn_matrix_path.endswith('.npz'):
+        data = np.load(nn_matrix_path, mmap_mode="r")
+        d_nn = data["distances"]
         return d_nn, maj_ids
     else:
         d_nn = np.load(nn_matrix_path, mmap_mode="r")

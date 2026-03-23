@@ -8,19 +8,17 @@ binary comparison. (see Omid's test.py sent 2026-03-16, v2 kernel)
 
 Outputs (compatible with exp6 / two_stage / experiments_compare_random_vs_curation):
   - P-N: distances_majority_minority_gower.h5 (controls x cases)
-  - D-N-N: leaf_global_dnn_matrix.npy (or .h5) + leaf_global_dnn_enrolids.npy
+  - D-N-N: leaf_global_dnn_matrix.npy or .npz + leaf_global_dnn_enrolids.npy
 
-Usage:
-  cd msk_analysis
-  python scripts/precompute_gower_distances.py --parquet msk_2017_18_full.parquet --outdir ./precomputed_distances_gower
-  python scripts/precompute_gower_distances.py --feature_set all_cost --use_hdf5_dnn --dnn_batch_size 750
+Library API: ``precompute_gower_pn_and_dnn`` — MSK (or other) drivers live outside
+``public/`` (e.g. ``msk_analysis/scripts/precompute_msk_gower_distances.py``).
 """
 from __future__ import annotations
 
-import argparse
 import os
 import sys
-from typing import List, Optional, Tuple
+import time
+from typing import Collection, List, Optional, Tuple
 
 import h5py
 import numpy as np
@@ -37,21 +35,39 @@ except ImportError:
     ne = None  # type: ignore[assignment]
 
 try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None  # type: ignore[assignment]
+
+try:
     from public.model_IAI import (
+        GOWER_BINARY_ATOL,
+        GOWER_BINARY_RTOL,
         get_bin_flag_columns,
+        get_bin_flag_columns_with_provenance,
         get_cat_columns,
         get_true_num_columns,
+        is_binary_01_series,
         train_test_split_enrol,
     )
     from public.precompute_distances import save_distances_hdf5
 except ImportError:
-    # Fallback: define minimal save and use local feature helpers if needed
     save_distances_hdf5 = None
-    get_bin_flag_columns = get_cat_columns = get_true_num_columns = train_test_split_enrol = None
+    get_bin_flag_columns = get_bin_flag_columns_with_provenance = None
+    get_cat_columns = get_true_num_columns = train_test_split_enrol = None
+    is_binary_01_series = None  # type: ignore[assignment]
+    GOWER_BINARY_ATOL = 1e-6
+    GOWER_BINARY_RTOL = 1e-5
 
 TRAIN_TEST_SEED = 123
-_GOWER_BINARY_ATOL = 1e-6
-_GOWER_BINARY_RTOL = 1e-5
+
+from public.dnn_matrix_storage import (
+    dnn_enrolids_npy_path,
+    dnn_matrix_npy_path,
+    dnn_matrix_path,
+    dnn_matrix_storage_exists,
+    ensure_dnn_matrix_npy,
+)
 
 # NumPy has no float8. Supported storage/compute dtypes for distances & features:
 GOWER_DISTANCE_DTYPES = (np.float32, np.float16)
@@ -81,11 +97,12 @@ def _validate_gower_binary_columns(
     X_A: np.ndarray,
     X_B: np.ndarray,
     binary_col_indices: np.ndarray,
-    atol: float = _GOWER_BINARY_ATOL,
-    rtol: float = _GOWER_BINARY_RTOL,
+    atol: float = GOWER_BINARY_ATOL,
+    rtol: float = GOWER_BINARY_RTOL,
     col_names: Optional[List[str]] = None,
 ) -> None:
-    """Raise ValueError if any column marked as binary contains values not in {0, 1} (within tolerance)."""
+    """Raise ValueError if any column marked as binary contains values not in {0, 1} (within tolerance).
+    Important difference from binary_01 check, this checks for after OHE of categorical columns."""
     for c in binary_col_indices:
         for mat_name, X in [("A", X_A), ("B", X_B)]:
             col = np.asarray(X[:, c], dtype=np.float64).ravel()
@@ -119,8 +136,8 @@ def _compute_gower_distances_v2(
     binary_col_indices: np.ndarray,
     continuous_col_indices: np.ndarray,
     ranges: np.ndarray,
-    binary_atol: float = _GOWER_BINARY_ATOL,
-    binary_rtol: float = _GOWER_BINARY_RTOL,
+    binary_atol: float = GOWER_BINARY_ATOL,
+    binary_rtol: float = GOWER_BINARY_RTOL,
     use_tolerance_binary: bool = True,
     col_names: Optional[List[str]] = None,
     out_dtype: np.dtype | type = np.float16,
@@ -195,19 +212,6 @@ def _save_distances_hdf5_inline(
         f.create_dataset("minority_enrolids", data=np.asarray(minority_enrolids, dtype=np.int64))
 
 
-# -------------------------------------------------------------------------------
-# Feature matrix construction (same logic as exp6 Gower block)
-# -------------------------------------------------------------------------------
-def _is_truly_binary(col: np.ndarray, atol: float = 1e-6, rtol: float = 1e-5) -> bool:
-    """True if all values are in {0, 1} (within tolerance)."""
-    col = np.asarray(col, dtype=np.float64).ravel()
-    if np.any(np.isnan(col)):
-        return False
-    close_0 = np.abs(col) <= atol + rtol * np.maximum(np.abs(col), 1e-12)
-    close_1 = np.abs(col - 1.0) <= atol + rtol * np.maximum(np.abs(col), 1e-12)
-    return bool(np.all(close_0 | close_1))
-
-
 def build_gower_feature_matrices(
     cases: pd.DataFrame,
     controls: pd.DataFrame,
@@ -216,22 +220,37 @@ def build_gower_feature_matrices(
     num_cols: List[str],
     bin_cols: List[str],
     feature_dtype: np.dtype | type = np.float16,
+    bin_cols_verified_by_values: Optional[Collection[str]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int], List[str]]:
     """
     Build X_minority (cases), X_majority (controls), ranges, bin_col_indices, col_names.
     All in feature_dtype (default float16). Order: binary | OHE(cat) | numeric.
-    Columns in bin_cols that have values outside {0,1} are demoted to continuous (δ=|a-b|/range).
-    col_names[i] is the feature name for column index i.
+    Numeric columns are min–max scaled in float32 (avoids float16 overflow on costs, etc.),
+    then stored; their Gower range is 1 (kernel sees normalized [0,1]-ish values).
+    Columns in bin_cols that are not 0/1 (Gower-tolerant) on cases∪controls are demoted to continuous.
+
+    Pass bin_cols_verified_by_values from get_bin_flag_columns_with_provenance(train_features_df)[1]
+    to skip re-scanning columns already confirmed strict-binary on that frame (same pipeline as OCT).
     """
     bin_in_feature = [c for c in bin_cols if c in feature_cols]
     num_in_feature = [c for c in num_cols if c in feature_cols]
     cat_in_feature = [c for c in cat_cols if c in feature_cols]
-    # Demote "binary" columns that actually have >2 values (e.g. 0,1,2,3) to continuous
+    verified = bin_cols_verified_by_values
     real_binary: List[str] = []
     demoted_to_num: List[str] = []
     for c in bin_in_feature:
-        combined = np.concatenate([cases[c].values.ravel(), controls[c].values.ravel()])
-        if _is_truly_binary(combined):
+        if verified is not None and c in verified:
+            real_binary.append(c)
+            continue
+        comb = pd.Series(
+            np.concatenate([cases[c].values.ravel(), controls[c].values.ravel()])
+        )
+        gower_ok = bool(
+            is_binary_01_series(
+                comb, atol=GOWER_BINARY_ATOL, rtol=GOWER_BINARY_RTOL
+            )
+        )
+        if gower_ok:
             real_binary.append(c)
         else:
             demoted_to_num.append(c)
@@ -259,15 +278,34 @@ def build_gower_feature_matrices(
         n_bin += ohe_mat.shape[1]
     if num_in_feature:
         col_names.extend(num_in_feature)
-        parts_min.append(cases[num_in_feature].values.astype(fd))
-        parts_maj.append(controls[num_in_feature].values.astype(fd))
+        num_parts_min, num_parts_maj = [], []
+        for c in num_in_feature:
+            v_case = np.asarray(cases[c].values, dtype=np.float32).ravel()
+            v_ctrl = np.asarray(controls[c].values, dtype=np.float32).ravel()
+            col = np.concatenate([v_case, v_ctrl])
+            cmin = np.nanmin(col)
+            cmax = np.nanmax(col)
+            if not (np.isfinite(cmin) and np.isfinite(cmax)):
+                nc = np.zeros_like(v_case)
+                nm = np.zeros_like(v_ctrl)
+            else:
+                r = float(cmax - cmin)
+                if r <= 0.0 or not np.isfinite(r):
+                    r = 1.0
+                nc = (v_case - cmin) / r
+                nm = (v_ctrl - cmin) / r
+                nc = np.where(np.isfinite(nc), nc, 0.0)
+                nm = np.where(np.isfinite(nm), nm, 0.0)
+            num_parts_min.append(nc.astype(fd, copy=False))
+            num_parts_maj.append(nm.astype(fd, copy=False))
+        parts_min.append(np.column_stack(num_parts_min))
+        parts_maj.append(np.column_stack(num_parts_maj))
     X_minority = np.hstack(parts_min) if parts_min else np.zeros((len(cases), 0), dtype=fd)
     X_majority = np.hstack(parts_maj) if parts_maj else np.zeros((len(controls), 0), dtype=fd)
     ranges = np.ones(X_minority.shape[1], dtype=fd)
+    # Continuous block is already range-normalized; Gower uses |Δ|/r with r=1.
     for j in range(n_bin, X_minority.shape[1]):
-        col = np.concatenate([X_minority[:, j], X_majority[:, j]])
-        r = float(np.nanmax(col) - np.nanmin(col))
-        ranges[j] = np.asarray(r if r > 0 else 1.0, dtype=fd)
+        ranges[j] = np.asarray(1.0, dtype=fd)
     bin_col_indices = list(range(n_bin))
     return X_majority, X_minority, ranges, bin_col_indices, col_names
 
@@ -299,14 +337,19 @@ def precompute_gower_dnn_v2(
     ranges: np.ndarray,
     out_dir: str,
     batch_size: int = 750,
-    use_hdf5: bool = False,
-    compression: str = "gzip",
-    compression_opts: int = 9,
     col_names: Optional[List[str]] = None,
     out_dtype: np.dtype | type = np.float16,
+    verbose: bool = True,
+    dnn_full_matrix: bool = False,
+    dnn_save_format: str = "npy",
 ) -> Tuple[str, str]:
     """
-    D-N-N (control-control) Gower with v2 kernel, batched to avoid huge allocation.
+    D-N-N (control-control) Gower with v2 kernel.
+
+    When dnn_full_matrix=False: batched memmap to limit memory. Always writes .npy.
+    When dnn_full_matrix=True: compute full (n,n) in memory, then save via np.save or
+    np.savez. Use dnn_save_format="npy" or "npz". Requires O(n²) RAM.
+
     Returns (dnn_matrix_path, dnn_enrolids_path).
     """
     os.makedirs(out_dir, exist_ok=True)
@@ -315,47 +358,71 @@ def precompute_gower_dnn_v2(
     n_p = X_majority.shape[1]
     cont_col_indices = np.array([j for j in range(n_p) if j not in bin_col_indices])
     bin_arr = np.array(bin_col_indices)
+    dnn_enrolids_path = dnn_enrolids_npy_path(out_dir)
 
-    dnn_matrix_path = os.path.join(out_dir, "leaf_global_dnn_matrix.npy")
-    dnn_enrolids_path = os.path.join(out_dir, "leaf_global_dnn_enrolids.npy")
-
-    if use_hdf5:
-        dnn_matrix_path = os.path.join(out_dir, "leaf_global_dnn_matrix.h5")
-        chunk_rows = min(batch_size, n)
-        with h5py.File(dnn_matrix_path, "w") as f:
-            dset = f.create_dataset(
-                "distances",
-                shape=(n, n),
-                dtype=dt,
-                chunks=(chunk_rows, n),
-                compression=compression,
-                compression_opts=compression_opts,
-            )
-            for s in range(0, n, batch_size):
-                e = min(s + batch_size, n)
-                block = _compute_gower_distances_v2(
-                    X_majority[s:e], X_majority, bin_arr, cont_col_indices, ranges,
-                    col_names=col_names, out_dtype=dt,
-                )
-                dset[s:e, :] = block
-        return dnn_matrix_path, dnn_enrolids_path
-
-    dnn_mm = np.lib.format.open_memmap(
-        dnn_matrix_path, mode="w+", dtype=dt, shape=(n, n)
-    )
-    for s in range(0, n, batch_size):
-        e = min(s + batch_size, n)
-        block = _compute_gower_distances_v2(
-            X_majority[s:e], X_majority, bin_arr, cont_col_indices, ranges,
-            col_names=col_names, out_dtype=dt,
+    if dnn_full_matrix:
+        # Full matrix in memory, then save
+        fmt = "npz" if dnn_save_format == "npz" else "npy"
+        out_path = dnn_matrix_path(out_dir, fmt=fmt)
+        t0 = time.perf_counter()
+        distances = _compute_gower_distances_v2(
+            X_majority,
+            X_majority,
+            bin_arr,
+            cont_col_indices,
+            ranges,
+            col_names=col_names,
+            out_dtype=dt,
         )
+        t_compute = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        if fmt == "npz":
+            np.savez(out_path, distances=distances)
+        else:
+            np.save(out_path, distances)
+        t_save = time.perf_counter() - t1
+        if verbose:
+            print(f"D-N-N Gower: compute {t_compute:.1f}s, save {t_save:.1f}s (full matrix, {fmt})")
+        return out_path, dnn_enrolids_path
+
+    # Batched memmap path
+    dnn_matrix_out = dnn_matrix_npy_path(out_dir)
+    dnn_mm = np.lib.format.open_memmap(
+        dnn_matrix_out, mode="w+", dtype=dt, shape=(n, n)
+    )
+    batch_starts = range(0, n, batch_size)
+    n_batches = (n + batch_size - 1) // batch_size
+    iterator = (
+        tqdm(batch_starts, total=n_batches, desc="D-N-N Gower", unit="batch")
+        if (verbose and tqdm is not None)
+        else batch_starts
+    )
+    t_compute_total = 0.0
+    t_write_total = 0.0
+    for s in iterator:
+        e = min(s + batch_size, n)
+        t0 = time.perf_counter()
+        block = _compute_gower_distances_v2(
+            X_majority[s:e],
+            X_majority,
+            bin_arr,
+            cont_col_indices,
+            ranges,
+            col_names=col_names,
+            out_dtype=dt,
+        )
+        t_compute_total += time.perf_counter() - t0
+        t1 = time.perf_counter()
         dnn_mm[s:e, :] = block
+        t_write_total += time.perf_counter() - t1
     del dnn_mm
-    return dnn_matrix_path, dnn_enrolids_path
+    if verbose:
+        print(f"D-N-N Gower: compute {t_compute_total:.1f}s, save {t_write_total:.1f}s (batched)")
+    return dnn_matrix_out, dnn_enrolids_path
 
 
 # -------------------------------------------------------------------------------
-# Feature set (match exp6)
+# Feature set 
 # -------------------------------------------------------------------------------
 def get_feature_columns(df: pd.DataFrame, feature_set: str, target_col: str) -> List[str]:
     """Return feature column list for medical_only | all_cost | less_cost."""
@@ -378,101 +445,115 @@ def get_feature_columns(df: pd.DataFrame, feature_set: str, target_col: str) -> 
     return [c for c in df.columns if c not in exclude_cols]
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description="Precompute Gower P-N and D-N-N distances (v2 kernel)")
-    p.add_argument("--parquet_path", type=str, default="msk_2017_18_full.parquet")
-    p.add_argument("--outdir", type=str, default="./precomputed_distances_gower")
-    p.add_argument("--feature_set", type=str, default="all_cost", choices=["medical_only", "all_cost", "less_cost"])
-    p.add_argument("--seed", type=int, default=TRAIN_TEST_SEED)
-    p.add_argument("--dnn_batch_size", type=int, default=750)
-    p.add_argument("--use_hdf5_dnn", action="store_true", help="Save D-N-N as HDF5 (compressed)")
-    p.add_argument("--skip_pn", action="store_true", help="Skip P-N computation")
-    p.add_argument("--skip_dnn", action="store_true", help="Skip D-N-N computation")
-    p.add_argument("--resume", action="store_true", help="Skip if output files already exist")
-    p.add_argument(
-        "--gower_dtype",
-        type=str,
-        default="float16",
-        choices=["float32", "float16"],
-        help="Feature + distance dtype (default float16). Use --gower_dtype float32 for max precision.",
-    )
-    args = p.parse_args()
-    gdt = _as_gower_dtype(args.gower_dtype)
+def precompute_gower_pn_and_dnn(
+    cases: pd.DataFrame,
+    controls: pd.DataFrame,
+    feature_cols: List[str],
+    cat_cols: List[str],
+    num_cols: List[str],
+    bin_cols: List[str],
+    *,
+    bin_cols_verified_by_values: Optional[Collection[str]] = None,
+    outdir: str,
+    dnn_subdir_seed: int,
+    gower_dtype=np.float16,
+    dnn_batch_size: int = 750,
+    skip_pn: bool = False,
+    skip_dnn: bool = False,
+    resume: bool = False,
+    verbose: bool = True,
+    dnn_full_matrix: bool = False,
+    dnn_save_format: str = "npy",
+) -> Tuple[str, str, str]:
+    """
+    Write Gower P-N HDF5 and D-N-N memmap under ``outdir`` (cohort-specific layout).
 
-    if get_bin_flag_columns is None or train_test_split_enrol is None:
-        raise ImportError("Run from msk_analysis with public on PYTHONPATH (public.model_IAI, public.precompute_distances)")
+    Returns ``(pn_h5_path, dnn_matrix_npy_path, dnn_enrolids_npy_path)``.
+    """
+    if get_bin_flag_columns_with_provenance is None:
+        raise ImportError("public.model_IAI required on PYTHONPATH")
 
-    outdir = args.outdir
-    dnn_dir = os.path.join(outdir, f"global_dnn_seed_{args.seed}_gower")
-    pn_h5 = os.path.join(outdir, "distances_majority_minority_gower.h5")
-    dnn_matrix_path = os.path.join(dnn_dir, "leaf_global_dnn_matrix.h5" if args.use_hdf5_dnn else "leaf_global_dnn_matrix.npy")
-    dnn_enrolids_path = os.path.join(dnn_dir, "leaf_global_dnn_enrolids.npy")
-
+    gdt = _as_gower_dtype(gower_dtype)
     os.makedirs(outdir, exist_ok=True)
+    dnn_dir = os.path.join(outdir, f"global_dnn_seed_{dnn_subdir_seed}_gower")
+    pn_h5 = os.path.join(outdir, "distances_majority_minority_gower.h5")
+    dnn_enrolids_path = dnn_enrolids_npy_path(dnn_dir)
     os.makedirs(dnn_dir, exist_ok=True)
 
-    target_col = "top_2_pct_cost_2018"
-    df = pd.read_parquet(args.parquet_path)
-    if target_col not in df.columns and "annual_cost_2018_deflated" in df.columns:
-        thresh = df["annual_cost_2018_deflated"].quantile(0.98)
-        df[target_col] = (df["annual_cost_2018_deflated"] >= thresh).astype(int)
+    verified = bin_cols_verified_by_values
+    if verified is None:
+        train_feat = pd.concat(
+            [cases[feature_cols], controls[feature_cols]], ignore_index=True
+        )
+        _, verified = get_bin_flag_columns_with_provenance(train_feat)
 
-    train_ids, _, train_pd, _ = train_test_split_enrol(
-        df, target_col=target_col, test_size=0.3, verbose=False, random_state=args.seed
-    )
-    cases = train_pd[train_pd[target_col] == 1]
-    controls = train_pd[train_pd[target_col] == 0]
-    BIN = get_bin_flag_columns(df)
-    CAT = get_cat_columns(df)
-    NUM = get_true_num_columns(df, CAT, BIN)
-    feature_cols = get_feature_columns(df, args.feature_set, target_col)
-
+    if verbose:
+        print("Building Gower feature matrices...")
     X_majority, X_minority, ranges, bin_col_indices, col_names = build_gower_feature_matrices(
-        cases, controls, feature_cols, CAT, NUM, BIN, feature_dtype=gdt
+        cases,
+        controls,
+        feature_cols,
+        cat_cols,
+        num_cols,
+        bin_cols,
+        feature_dtype=gdt,
+        bin_cols_verified_by_values=verified,
     )
-    n_controls, n_cases = X_majority.shape[0], X_minority.shape[0]
-    print(f"Gower dtype: {gdt}  Features: {X_majority.shape[1]} (binary: {len(bin_col_indices)})")
-    print(f"Controls: {n_controls:,}  Cases: {n_cases:,}")
+    maj_ids = controls["ENROLID"].values.astype(np.int64)
+    min_ids = cases["ENROLID"].values.astype(np.int64)
 
-    majority_enrolids = controls["ENROLID"].values.astype(np.int64)
-    minority_enrolids = cases["ENROLID"].values.astype(np.int64)
-
-    # P-N
-    if not args.skip_pn:
-        if args.resume and os.path.exists(pn_h5):
-            print(f"  P-N already exists: {pn_h5}")
+    if not skip_pn:
+        if resume and os.path.isfile(pn_h5):
+            if verbose:
+                print("P-N: skipping (resume, file exists).")
         else:
-            print("  Computing P-N (Gower v2)...")
+            if verbose:
+                print("Computing P-N Gower distances (controls x cases)...")
             dist_pn = compute_gower_pn_v2(
-                X_majority, X_minority, bin_col_indices, ranges,
-                col_names=col_names, out_dtype=gdt,
-            )
-            if gdt == np.dtype(np.float32) and save_distances_hdf5 is not None:
-                save_distances_hdf5(dist_pn, majority_enrolids, minority_enrolids, pn_h5)
-            else:
-                _save_distances_hdf5_inline(
-                    dist_pn, majority_enrolids, minority_enrolids, pn_h5, distances_dtype=gdt
-                )
-            print(f"  Saved P-N: {pn_h5}")
-
-    # D-N-N
-    if not args.skip_dnn:
-        if args.resume and os.path.exists(dnn_matrix_path) and os.path.exists(dnn_enrolids_path):
-            print(f"  D-N-N already exists: {dnn_matrix_path}")
-        else:
-            print("  Computing D-N-N (Gower v2, batched)...")
-            precompute_gower_dnn_v2(
-                X_majority, bin_col_indices, ranges, dnn_dir,
-                batch_size=args.dnn_batch_size,
-                use_hdf5=args.use_hdf5_dnn,
+                X_majority,
+                X_minority,
+                bin_col_indices,
+                ranges,
                 col_names=col_names,
                 out_dtype=gdt,
             )
-            np.save(dnn_enrolids_path, majority_enrolids)
-            print(f"  Saved D-N-N: {dnn_matrix_path}")
+            if gdt == np.dtype(np.float32) and save_distances_hdf5 is not None:
+                save_distances_hdf5(dist_pn, maj_ids, min_ids, pn_h5)
+            else:
+                _save_distances_hdf5_inline(
+                    dist_pn, maj_ids, min_ids, pn_h5, distances_dtype=gdt
+                )
+            if verbose:
+                print("P-N done.")
 
-    print("Done.")
+    if not skip_dnn:
+        if resume and dnn_matrix_storage_exists(dnn_dir) and os.path.isfile(dnn_enrolids_path):
+            if verbose:
+                print("D-N-N: skipping (resume, files exist).")
+        else:
+            if verbose:
+                mode = "full matrix" if dnn_full_matrix else "batched"
+                print(f"Computing D-N-N Gower ({mode})...")
+            precompute_gower_dnn_v2(
+                X_majority,
+                bin_col_indices,
+                ranges,
+                dnn_dir,
+                batch_size=dnn_batch_size,
+                col_names=col_names,
+                out_dtype=gdt,
+                verbose=verbose,
+                dnn_full_matrix=dnn_full_matrix,
+                dnn_save_format=dnn_save_format,
+            )
+            np.save(dnn_enrolids_path, maj_ids)
+            if verbose:
+                print("D-N-N done.")
+
+    return pn_h5, ensure_dnn_matrix_npy(dnn_dir), dnn_enrolids_path
 
 
 if __name__ == "__main__":
-    main()
+    print(
+        "Use your cohort driver to precompute; this module is library-only."
+    )
