@@ -13,12 +13,11 @@ from sklearn.model_selection import train_test_split
 
 # repo imports
 script_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.abspath(os.path.join(script_dir, ".."))
+parent_dir = os.path.abspath(os.path.join(script_dir, "../../"))
 sys.path.insert(0, parent_dir)
 sys.path.insert(0, script_dir)
 
-import experiments_compare_random_vs_curation
-from experiments_compare_random_vs_curation import (
+from msk_analysis.experiments_compare_random_vs_curation import (
     sample_random_controls,
     sample_stageA_on_restricted_pool,
     sample_stageB_matched_controls,
@@ -30,6 +29,7 @@ from public.model_IAI import (
     get_true_num_columns,
     finetune_oct,
     evaluate_binary_oct,
+    train_test_split_enrol,
 )
 
 TRAIN_TEST_SEED = 123
@@ -154,12 +154,12 @@ def train_oct_fixed(
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--parquet_path", type=str, default="msk_2017_18_no_meds.parquet")
-    p.add_argument("--train_root", type=str, default="compare_oct_cp0_rnd_v_exp4_train_sets")
-    p.add_argument("--outdir", type=str, default="compare_oct_cp0_rnd_v_exp4_train_sets")
+    p.add_argument("--parquet_path", type=str, default="/Users/cat2510/my_projects/msk_analysis/msk_2017_18_full.parquet")
+    p.add_argument("--train_root", type=str, default="/Users/cat2510/scratch/msk_analysis/exp_0_to_4_gower_v2/results")
+    p.add_argument("--outdir", type=str, default="compare_oct_cp0_gower_v2")
     p.add_argument("--seeds", type=str, default="1,2,3,4,5")
-    p.add_argument("--distances_dir", type=str, default="/Users/cat2510/scratch/")
-    p.add_argument("--stageA_seed_method", type=str, default="random")
+    p.add_argument("--distances_dir", type=str, default="/Users/cat2510/scratch/msk_analysis/precomputed_distances_gower")
+    p.add_argument("--stageA_seed_method", type=str, default="density")
     p.add_argument("--M_pool", type=int, default=None)
     p.add_argument("--use_kmeanspp", action="store_true")
     p.add_argument("--generate_trains", action="store_true", help="Generate and save exp3/exp4 train sets using get_matched_1N")
@@ -263,27 +263,32 @@ def main():
 
     exclude_cols = ["ENROLID", TARGET_COL] + [c for c in df.columns if "2018" in c]
     feature_cols = [c for c in df.columns if c not in exclude_cols]
+    _, _, train_pd, test_pd = train_test_split_enrol(
+            df, target_col=TARGET_COL, test_size=0.3, verbose=False,
+            random_state=TRAIN_TEST_SEED,
+        )
+    _, _, val_pd, test_pd = train_test_split_enrol(
+        test_pd, target_col=TARGET_COL, test_size=0.5, verbose=False,
+        random_state=TRAIN_TEST_SEED,
+    )
 
-    # ----------------------------
-    # Train pool (D-N-N + P-N): exclude from holdout to avoid leakage
-    # ----------------------------
-    import h5py
-    pn_h5 = os.path.join(args.distances_dir, "distances_majority_minority_gower.h5")
-    dnn_dir = os.path.join(args.distances_dir, f"global_dnn_seed_{TRAIN_TEST_SEED}_gower")
-    dnn_matrix = os.path.join(dnn_dir, "leaf_global_dnn_matrix.npy")
-    dnn_enrolids_path = os.path.join(dnn_dir, "leaf_global_dnn_enrolids.npy")
-    for p in [pn_h5, dnn_enrolids_path]:
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"Train pool / holdout split require distances: {p}")
-    ctrl_ids = np.load(dnn_enrolids_path)
-    with h5py.File(pn_h5, "r") as f:
-        case_ids = f["minority_enrolids"][:]
-    train_ids_set = set(int(e) for e in ctrl_ids) | set(int(e) for e in case_ids)
-    remainder = df[~df["ENROLID"].isin(train_ids_set)].copy()
-    print(f"Holdout drawn from {len(remainder):,} rows (train pool {len(train_ids_set):,} excluded)")
 
     if args.generate_trains:
-        train_pd = df[df["ENROLID"].isin(train_ids_set)].copy()
+        import h5py
+        from public.dnn_matrix_storage import dnn_matrix_storage_exists, ensure_dnn_matrix_npy,dnn_enrolids_npy_path
+        pn_h5 = os.path.join(args.distances_dir, "distances_majority_minority_gower.h5")
+        dnn_dir = os.path.join(args.distances_dir, f"global_dnn_seed_{TRAIN_TEST_SEED}_gower")
+        dnn_enrolids_path = dnn_enrolids_npy_path(dnn_dir)
+        for p in [pn_h5, dnn_enrolids_path]:
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"Train pool / holdout split require distances: {p}")
+        ctrl_ids = np.load(dnn_enrolids_path)
+        with h5py.File(pn_h5, "r") as f:
+            case_ids = f["minority_enrolids"][:]
+    
+        if not dnn_matrix_storage_exists(dnn_dir):
+            raise FileNotFoundError(f"Missing D-N-N matrix: {dnn_dir}/leaf_global_dnn_matrix.npy")
+        dnn_matrix = ensure_dnn_matrix_npy(dnn_dir)
         cases = train_pd[train_pd[TARGET_COL] == 1]
         controls = train_pd[train_pd[TARGET_COL] == 0]
         N, K = len(cases), 2 * len(cases)
@@ -293,21 +298,9 @@ def main():
         id_to_pos = {int(e): i for i, e in enumerate(dnn_ids)}
         M_pool = args.M_pool if args.M_pool is not None else len(controls) // 2
         print("Generating exp3/exp4 train sets (shared get_matched_1N)...")
-        generate_exp3_exp4_trains(df, cases, controls, control_enrolids, case_enrolids, N, K,
+        generate_exp3_exp4_trains(train_pd, cases, controls, control_enrolids, case_enrolids, N, K,
             pn_h5, dnn_matrix, dnn_enrolids_path, dnn_ids, id_to_pos,
             args.stageA_seed_method, M_pool, args.use_kmeanspp, None, args.train_root, seeds)
-
-    # ----------------------------
-    # Build val/test from remainder only (no train-pool IDs)
-    # ----------------------------
-    val_ids, test_ids = train_test_split(
-        remainder["ENROLID"],
-        test_size=0.3,
-        random_state=TRAIN_TEST_SEED,
-        stratify=remainder[TARGET_COL],
-    )
-    val_pd = remainder[remainder["ENROLID"].isin(val_ids)].reset_index(drop=True)
-    test_pd = remainder[remainder["ENROLID"].isin(test_ids)].reset_index(drop=True)
 
     all_rows = []
 
@@ -329,7 +322,7 @@ def main():
         met_un = evaluate_binary_oct(
             m_un,
             X_test_df=X_test_df,
-            y_test=test_pd[feature_cols],
+            y_test=test_pd[TARGET_COL],
             preprocessor=prep_un,
             feature_names=fn_un,
             results_dir=out_base,
@@ -355,7 +348,7 @@ def main():
         met_pr = evaluate_binary_oct(
             m_pr,
             X_test_df=X_test_df,
-            y_test=test_pd[feature_cols],
+            y_test=test_pd[TARGET_COL],
             preprocessor=prep_pr,
             feature_names=fn_pr,
             results_dir=out_base,

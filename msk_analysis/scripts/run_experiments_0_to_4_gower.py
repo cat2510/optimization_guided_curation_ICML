@@ -57,10 +57,15 @@ from public.model_IAI import (
     get_cat_columns,
     get_true_num_columns,
 )
+from public.dnn_matrix_storage import (
+    dnn_enrolids_npy_path,
+    dnn_matrix_storage_exists,
+    ensure_dnn_matrix_npy,
+)
 
 TRAIN_TEST_SEED = 123
-DISTANCES_DIR = "/Users/cat2510/scratch/"
-SCRATCH_OUTDIR = "/Users/cat2510/scratch/exp_0_to_4_gower_v2"
+DISTANCES_DIR = "/Users/cat2510/scratch/msk_analysis/precomputed_distances_gower"
+SCRATCH_OUTDIR = "/Users/cat2510/scratch/msk_analysis/exp_0_to_4_gower_v2"
 
 
 def _parse_seeds(seeds_str: str) -> List[int]:
@@ -83,7 +88,7 @@ def parse_args():
     p.add_argument("--experiments", type=str, default="0,1,2,3,4", help="Comma-separated experiment indices to run (e.g. 3,4 for exp3 and exp4 only)")
     p.add_argument("--outdir", type=str, default=SCRATCH_OUTDIR)
     p.add_argument("--distances_dir", type=str, default=DISTANCES_DIR)
-    p.add_argument("--parquet_path", type=str, default="msk_2017_18_no_meds.parquet")
+    p.add_argument("--parquet_path", type=str, default="msk_2017_18_full.parquet")
     p.add_argument("--stageA_seed_method", choices=["centroid", "density", "random", "smart"], default="random")
     p.add_argument("--M_pool", type=int, default=None)
     p.add_argument("--resume", action="store_true", help="Skip runs already in summary; load predictions/train CSV")
@@ -106,15 +111,16 @@ def main():
     target_col = "top_2_pct_cost_2018"
     cost_col = "annual_cost_2018_deflated"
 
-    # Gower paths
+    # Gower paths (D-N-N: uncompressed .npy memmap; see public.dnn_matrix_storage)
     pn_h5 = os.path.join(args.distances_dir, "distances_majority_minority_gower.h5")
     dnn_dir = os.path.join(args.distances_dir, f"global_dnn_seed_{TRAIN_TEST_SEED}_gower")
-    dnn_matrix = os.path.join(dnn_dir, "leaf_global_dnn_matrix.npy")
-    dnn_enrolids_path = os.path.join(dnn_dir, "leaf_global_dnn_enrolids.npy")
-
-    for p in [pn_h5, dnn_matrix, dnn_enrolids_path]:
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"Missing: {p}")
+    dnn_enrolids_path = dnn_enrolids_npy_path(dnn_dir)
+    if not os.path.isfile(pn_h5) or not dnn_matrix_storage_exists(dnn_dir) or not os.path.isfile(dnn_enrolids_path):
+        raise FileNotFoundError(
+            f"Missing Gower distances under {args.distances_dir!r}: "
+            f"need P-N h5, {dnn_dir}/leaf_global_dnn_matrix.npy, enrolids npy"
+        )
+    dnn_matrix = ensure_dnn_matrix_npy(dnn_dir)
 
     # Load parquet and define train from precomputed enrolids (no recompute)
     df = pd.read_parquet(args.parquet_path)

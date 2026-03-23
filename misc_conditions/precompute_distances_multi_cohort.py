@@ -36,7 +36,7 @@ from public.precompute_distances import (
 
 from public.model_IAI import (
     train_test_split_enrol,
-    get_bin_flag_columns,
+    get_bin_flag_columns_with_provenance,
     get_cat_columns,
     get_true_num_columns,
 )
@@ -69,9 +69,6 @@ def parse_args():
     p.add_argument("--metric", type=str, default="gower",
                    help="Distance metric. Gower uses msk_analysis precompute_gower_distances v2 kernel.")
 
-    p.add_argument("--use_hdf5_dnn", action="store_true",
-                   help="save as HDF5 (compressed) instead of .npy memmap.")
-
     # Feature selection knobs
     p.add_argument("--feature_regex", type=str, default="",
                    help="Optional regex to keep only matching feature columns (applied after leakage exclusion). "
@@ -82,6 +79,11 @@ def parse_args():
 
     p.add_argument("--gower_dtype", type=str, default="float16", choices=["float32", "float16"],
                    help="Gower feature + distance dtype (default float16). Use float32 for max precision.")
+
+    p.add_argument("--dnn_full_matrix", action="store_true",
+                   help="Compute full D-N-N in memory (O(n²) RAM), then save. Default: batched memmap.")
+    p.add_argument("--dnn_save_format", type=str, default="npy", choices=["npy", "npz"],
+                   help="Format when --dnn_full_matrix. Default: npy")
 
     return p.parse_args()
 
@@ -124,22 +126,27 @@ def maybe_compute_pn_gower(pn_h5_path, X_maj, X_min, maj_ids, min_ids, bin_col_i
 
 
 def maybe_compute_dnn_gower(dnn_out_dir, X_maj, maj_ids, bin_col_indices, ranges, args, col_names=None):
-    suffix = ".h5" if getattr(args, "use_hdf5_dnn", False) else ".npy"
-    dnn_matrix = dnn_out_dir / f"leaf_global_dnn_matrix{suffix}"
-    if dnn_matrix.exists() and not args.overwrite:
+    from public.dnn_matrix_storage import dnn_enrolids_npy_path, dnn_matrix_storage_exists
+
+    if dnn_matrix_storage_exists(str(dnn_out_dir)) and not args.overwrite:
         return
     import public.precompute_gower_distances as gower_module
-    print(f"  Computing D-N-N (gower v2, batched)...")
+
+    mode = "full matrix" if getattr(args, "dnn_full_matrix", False) else "batched"
+    print(f"  Computing D-N-N (gower v2, {mode})...")
     gdt = gower_module._as_gower_dtype(getattr(args, "gower_dtype", "float16"))
     gower_module.precompute_gower_dnn_v2(
-        X_maj, bin_col_indices, ranges,
+        X_maj,
+        bin_col_indices,
+        ranges,
         out_dir=str(dnn_out_dir),
         batch_size=args.dnn_batch_size,
-        use_hdf5=getattr(args, "use_hdf5_dnn", False),
         col_names=col_names,
         out_dtype=gdt,
+        dnn_full_matrix=getattr(args, "dnn_full_matrix", False),
+        dnn_save_format=getattr(args, "dnn_save_format", "npy"),
     )
-    dnn_enrolids_path = dnn_out_dir / "leaf_global_dnn_enrolids.npy"
+    dnn_enrolids_path = Path(dnn_enrolids_npy_path(str(dnn_out_dir)))
     np.save(dnn_enrolids_path, maj_ids)
 
 
@@ -192,13 +199,19 @@ def run_one(code: str, args):
         cases_pd = train_pd.loc[cases_mask]
         controls_pd = train_pd.loc[controls_mask]
         X_train_raw = train_pd[feat_cols]
-        BIN_FLAG_COLUMNS = get_bin_flag_columns(X_train_raw)
+        BIN_FLAG_COLUMNS, BIN_VERIFIED_STRICT = get_bin_flag_columns_with_provenance(X_train_raw)
         CAT_COLUMNS = get_cat_columns(X_train_raw)
         TRUE_NUM_COLUMNS = get_true_num_columns(X_train_raw, CAT_COLUMNS, BIN_FLAG_COLUMNS)
         gdt = gower_module._as_gower_dtype(getattr(args, "gower_dtype", "float16"))
         X_majority, X_minority, ranges, bin_col_indices, col_names = gower_module.build_gower_feature_matrices(
-            cases_pd, controls_pd, feat_cols, CAT_COLUMNS, TRUE_NUM_COLUMNS, BIN_FLAG_COLUMNS,
+            cases_pd,
+            controls_pd,
+            feat_cols,
+            CAT_COLUMNS,
+            TRUE_NUM_COLUMNS,
+            BIN_FLAG_COLUMNS,
             feature_dtype=gdt,
+            bin_cols_verified_by_values=BIN_VERIFIED_STRICT,
         )
         maybe_compute_pn_gower(pn_h5_path, X_majority, X_minority, maj_ids, min_ids, bin_col_indices, ranges, args, col_names=col_names)
         maybe_compute_dnn_gower(dnn_out_dir, X_majority, maj_ids, bin_col_indices, ranges, args, col_names=col_names)

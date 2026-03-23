@@ -57,12 +57,8 @@ from analyze_hard_negative_boundary_eval import (
     EPS,
     DEFAULT_K,
 )
-import exp6_distance_metric_ablation as exp6
-from exp6_distance_metric_ablation import (
-    ensure_distances_for_metric,
-    run_ours_1to1_sampling,
-    run_rnd_1to1_sampling,
-)
+from ensure_distances_for_metric import ensure_distances_for_metric
+from gower_1to1_sampling import run_ours_1to1_sampling, run_rnd_1to1_sampling
 
 # Gate percentile candidates (validation selects best)
 GATE_Q_CANDIDATES = [50, 40, 30, 20, 15, 10, 5, 2]
@@ -194,7 +190,7 @@ def main():
     rnd_path = sampled_dir / f"rnd_1to1_s{args.seed}.csv"
     if not ours_path.exists() or not rnd_path.exists():
         print("\n--- Running sampling (1:1 random and ours two-stage) ---")
-        ours_train = exp6.run_ours_1to1_sampling(
+        ours_train = run_ours_1to1_sampling(
             control_enrolids,
             case_enrolids,
             controls,
@@ -206,7 +202,7 @@ def main():
             M_pool,
             args.seed,
         )
-        rnd_train = exp6.run_rnd_1to1_sampling(
+        rnd_train = run_rnd_1to1_sampling(
             control_enrolids, cases, controls, N, args.seed
         )
         ours_train.to_csv(ours_path, index=False)

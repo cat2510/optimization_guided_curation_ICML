@@ -41,7 +41,7 @@ def get_context_columns(df, cat_cols: List[str]) -> List[str]:
     Context: demographics, region, plan, economic status, etc.
     One-hot encodable categoricals (AGEGRP, SEX, REGION, EESTATU, etc.).
     """
-    return [c for c in cat_cols if c in df.columns and not _exclude_2018(c)]
+    return [c for c in cat_cols if c in df.columns and not _exclude_2018(c) and "ENROLID" not in c]
 
 
 def get_utilization_columns(df) -> List[str]:

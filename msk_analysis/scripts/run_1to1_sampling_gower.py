@@ -1,621 +1,367 @@
 #!/usr/bin/env python
 """
-exp6_distance_metric_ablation.py
-================================
-Distance metric ablation for Exp 5 vs Exp 6 sampling.
+run_1to1_sampling_gower.py
+==========================
+Load **precomputed** Gower P-N and D-N-N from ``distances_dir`` (same layout as
+``public.precompute_gower_distances`` / misc_conditions precompute), then run:
 
-Exp 5: 1N matched + 2N random (random undersampling baseline)
-Exp 6: 1N matched + 2N max-dispersed (curated), per distance metric
+  * **RND 1-1**: N cases + N random controls
+  * **Ours 1-1**: N cases + N controls from two-stage k-center + match (Gower)
 
-Two-stage: k-center then match, random init, no k-means++, no adaptive pool.
-Metrics: Euclidean, Manhattan, Hamming, Jaccard, Cosine, Chebyshev.
-
-Then: plot cost distribution, train OCT on Exp 5 and on best Exp 6 (lowest cost).
+Does **not** compute distances; run ``precompute_gower_distances.py`` or
+``precompute_distances_multi_cohort*.py`` first.
 
 Usage
 -----
   cd msk_analysis
-  python exp6_distance_metric_ablation.py [--seeds 0] [--outdir ./exp6_distance_ablation]
-  python exp6_distance_metric_ablation.py --metrics euclidean,manhattan --seeds 0,1
+  python scripts/run_1to1_sampling_gower.py \\
+    --distances_dir /path/to/precomputed_distances_gower \\
+    --parquet_path msk_2017_18_full.parquet \\
+    --outdir ./1to1_gower_results
 """
 
 from __future__ import annotations
 
-import sys
-import os
 import argparse
-from pathlib import Path
+import os
+import sys
 import traceback
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Tuple
 
-import h5py
 import numpy as np
-
-try:
-    import numexpr
-except ImportError:
-    numexpr = None  # type: ignore[assignment]
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-# Path setup
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
 sys.path.insert(0, parent_dir)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import importlib
-import public.precompute_distances
-importlib.reload(public.precompute_distances)
-from public.precompute_distances import (
-    get_preprocessor,
-    compute_distances_batched,
-    save_distances_hdf5,
-    precompute_leaf_dnn_memmap,
-    precompute_leaf_dnn_hdf5,
+from public.dnn_matrix_storage import (
+    dnn_enrolids_npy_path,
+    dnn_matrix_storage_exists,
+    ensure_dnn_matrix_npy,
 )
-
-try:
-    import public.two_stage_kcenter_match
-    importlib.reload(public.two_stage_kcenter_match)
-    from public.two_stage_kcenter_match import (
-        load_pn_hdf5,
-        build_id_to_index,
-        farthest_first_kcenter_indices,
-        choose_seed_random,
-    )
-except ImportError:
-    from public.two_stage_kcenter_match import (
-        load_pn_hdf5,
-        build_id_to_index,
-        farthest_first_kcenter_indices,
-        choose_seed_random,
-    )
-
 from public.model_IAI import (
     train_test_split_enrol,
     get_bin_flag_columns,
     get_cat_columns,
     get_true_num_columns,
-    finetune_oct,
-    evaluate_binary_oct,
 )
-# Use pd.read_parquet (not Spark) for deterministic row order; Spark may shuffle and change train/test split.
-from experiments_compare_random_vs_curation import (
-    sample_random_controls,
-    sample_stageA_dispersed_controls,
-    sample_stageB_matched_controls,
-    sample_stageA_on_restricted_pool,
-    train_and_evaluate_oct,
-)
-### March 16: TODO missing precomputation of gower distance 
-from precompute_gower_distances import * 
-TRAIN_TEST_SEED = 123
-OCT_DEPTHS = [7]
-OCT_MINBUCKETS = [150]
-OCT_CPS = [0.00001,  0.0001]
+from msk_analysis.experiments_compare_random_vs_curation import train_and_evaluate_oct
+from msk_analysis.scripts.gower_1to1_sampling import run_ours_1to1_sampling, run_rnd_1to1_sampling
 
-DEFAULT_METRICS = ["euclidean", "manhattan","chebyshev", "gower"]
+# Must match the seed used when precomputing (global_dnn_seed_{seed}_gower)
+DEFAULT_TRAIN_TEST_SEED = 123
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Exp 6 distance metric ablation")
-    p.add_argument("--seeds", type=str, default="0", help="Comma-separated seeds (default: 0)")
-    p.add_argument("--outdir", type=str, default="./exp6_distance_ablation", help="Output directory")
-    p.add_argument(
-        "--metrics",
-        type=str,
-        default=",".join(DEFAULT_METRICS),
-        help=f"Comma-separated distance metrics (default: {','.join(DEFAULT_METRICS)})",
-    )
-    p.add_argument("--parquet_path", type=str, default="msk_2017_18_full.parquet")
-    p.add_argument("--distances_dir", type=str, default="./precomputed_distances_exp6_ablation")
-    p.add_argument("--feature_set", type=str, default="all_cost", choices=["medical_only", "all_cost", "less_cost"])
-    p.add_argument("--M_pool", type=int, default=None, help="Candidate pool size (default: n_controls//2)")
-    p.add_argument("--skip_plot", action="store_true", help="Skip cost distribution plot")
-    p.add_argument("--skip_oct", action="store_true", help="Skip OCT training")
-    p.add_argument("--resume", action="store_true", help="Reuse existing CSVs/predictions")
-    return p.parse_args()
-
-def ensure_distances_for_metric(
-    distance_metric: str,
-    cases: pd.DataFrame,
-    controls: pd.DataFrame,
-    feature_cols: List[str],
-    cat_cols: List[str],
-    num_cols: List[str],
-    bin_cols: List[str],
-    distances_dir: str,
-    use_hdf5_dnn: bool = False,
-) -> Tuple[str, str, str]:
+def load_precomputed_gower_paths(distances_dir: str, train_test_seed: int) -> Tuple[str, str, str]:
     """
-    Ensure P-N and D-N-N distance matrices exist for the given metric.
-    Returns (pn_h5_path, dnn_matrix_path, dnn_enrolids_path).
-
-    use_hdf5_dnn: if True, save D-N-N as HDF5 compressed (~3-5x smaller than .npy).
-    load_nn() in two_stage supports both .npy and .h5.
+    Resolve P-N HDF5, D-N-N .npy (memmap), and enrolids .npy under distances_dir.
+    Raises FileNotFoundError if anything is missing.
     """
-    os.makedirs(distances_dir, exist_ok=True)
-    pn_h5 = os.path.join(distances_dir, f"distances_majority_minority_{distance_metric}.h5")
-    dnn_dir = os.path.join(distances_dir, f"global_dnn_seed_{TRAIN_TEST_SEED}_{distance_metric}")
-    dnn_suffix = ".h5" if use_hdf5_dnn else ".npy"
-    dnn_matrix_path = os.path.join(dnn_dir, f"leaf_global_dnn_matrix{dnn_suffix}")
-    dnn_enrolids_path = os.path.join(dnn_dir, "leaf_global_dnn_enrolids.npy")
+    d = os.path.abspath(distances_dir)
+    pn_h5 = os.path.join(d, "distances_majority_minority_gower.h5")
+    dnn_dir = os.path.join(d, f"global_dnn_seed_{train_test_seed}_gower")
+    enrol = dnn_enrolids_npy_path(dnn_dir)
 
-    # tfidf_svd_cosine_qcost: Stage A DNN only; use Gower P-N for seed selection.
-    # Always use .npy memmap (faster random access) regardless of use_hdf5_dnn.
-    if distance_metric == "tfidf_svd_cosine_qcost":
-        dnn_matrix_path = os.path.join(dnn_dir, "leaf_global_dnn_matrix.npy")
-        gower_pn_h5 = os.path.join(distances_dir, "distances_majority_minority_gower.h5")
-        if not os.path.exists(gower_pn_h5):
-            ensure_distances_for_metric(
-                "gower", cases, controls, feature_cols, cat_cols, num_cols, bin_cols,
-                distances_dir, use_hdf5_dnn=use_hdf5_dnn,
-            )
-        pn_h5 = gower_pn_h5
-        if os.path.exists(dnn_matrix_path) and os.path.exists(dnn_enrolids_path):
-            return pn_h5, dnn_matrix_path, dnn_enrolids_path
-        # Build TF-IDF+SVD+QuantileTransformer embedding and precompute D-N-N (cosine)
-        import tfidf_svd_qcost_embedding
-        importlib.reload(tfidf_svd_qcost_embedding)
-        from tfidf_svd_qcost_embedding import (
-            build_tfidf_svd_qcost_embedding,
-            get_cost_columns_2017,
-            run_cosine_distance_diagnostics,
+    missing = []
+    if not os.path.isfile(pn_h5):
+        missing.append(pn_h5)
+    if not dnn_matrix_storage_exists(dnn_dir):
+        missing.append(os.path.join(dnn_dir, "leaf_global_dnn_matrix.npy"))
+    if not os.path.isfile(enrol):
+        missing.append(enrol)
+    if missing:
+        raise FileNotFoundError(
+            "Precomputed Gower distances not found. Expected:\n"
+            f"  - {pn_h5}\n"
+            f"  - {dnn_dir}/leaf_global_dnn_matrix.npy\n"
+            f"  - {enrol}\n"
+            f"Missing: {missing}\n"
+            "Run public.precompute_gower_distances or misc_conditions precompute first."
         )
-        code_cols = [c for c in bin_cols if c in feature_cols]
-        cost_cols_2017 = get_cost_columns_2017(controls)
-        Z, enrolids, meta = build_tfidf_svd_qcost_embedding(
-            controls, code_cols, cost_cols_2017, dnn_dir,
-        )
-        print(f"  Sanity: n_codes={meta['n_codes']}, svd_dim={meta['svd_dim']}, d_cost={meta['d_cost']}, alpha={meta['alpha']}")
-        run_cosine_distance_diagnostics(Z)
-        # Use .npy memmap for faster random access during k-center (no HDF5 decompression)
-        dnn_matrix_path, dnn_enrolids_path = precompute_leaf_dnn_memmap(
-            X_majority_leaf=Z,
-            majority_enrolids_leaf=enrolids,
-            out_dir=dnn_dir,
-            leaf_id="global",
-            batch_size=750,
-            metric="cosine",
-        )
-        return pn_h5, dnn_matrix_path, dnn_enrolids_path
-
-    if os.path.exists(dnn_matrix_path) and os.path.exists(dnn_enrolids_path):
-        return pn_h5, dnn_matrix_path, dnn_enrolids_path
-    if distance_metric == "gower" and (not os.path.exists(pn_h5) or not os.path.exists(dnn_matrix_path) or not os.path.exists(dnn_enrolids_path)):
-        # Gower: binary δ=1[a≠b], continuous δ=|a-b|/range_j (range from train, 1 if 0)
-        from sklearn.preprocessing import OneHotEncoder
-        bin_in_feature = [c for c in bin_cols if c in feature_cols]
-        num_in_feature = [c for c in num_cols if c in feature_cols]
-        cat_in_feature = [c for c in cat_cols if c in feature_cols]
-        parts_min, parts_maj = [], []
-        n_bin = 0
-        if bin_in_feature:
-            parts_min.append(cases[bin_in_feature].values.astype(np.float32))
-            parts_maj.append(controls[bin_in_feature].values.astype(np.float32))
-            n_bin += len(bin_in_feature)
-        if cat_in_feature:
-            all_cat = pd.concat([cases[cat_in_feature], controls[cat_in_feature]], ignore_index=True)
-            ohe = OneHotEncoder(drop="first", sparse_output=False, handle_unknown="ignore")
-            ohe_mat = ohe.fit_transform(all_cat)
-            parts_min.append(ohe_mat[: len(cases)].astype(np.float32))
-            parts_maj.append(ohe_mat[len(cases) :].astype(np.float32))
-            n_bin += ohe_mat.shape[1]
-        if num_in_feature:
-            parts_min.append(cases[num_in_feature].values.astype(np.float32))
-            parts_maj.append(controls[num_in_feature].values.astype(np.float32))
-        X_minority = np.hstack(parts_min) if parts_min else np.zeros((len(cases), 0), dtype=np.float32)
-        X_majority = np.hstack(parts_maj) if parts_maj else np.zeros((len(controls), 0), dtype=np.float32)
-        ranges = np.ones(X_minority.shape[1], dtype=np.float32)
-        for j in range(n_bin, X_minority.shape[1]):
-            col = np.concatenate([X_minority[:, j], X_majority[:, j]])
-            r = float(np.nanmax(col) - np.nanmin(col))
-            ranges[j] = np.float32(r if r > 0 else 1.0)
-        bin_col_indices = list(range(n_bin))
-        print(f"  Precomputing P-N distances (metric=gower)...")
-        dist_pn = compute_gower_distances_batched(X_majority, X_minority, bin_col_indices, ranges)
-        save_distances_hdf5(
-            dist_pn,
-            controls["ENROLID"].values.astype(np.int64),
-            cases["ENROLID"].values.astype(np.int64),
-            pn_h5,
-        )
-        if not os.path.exists(dnn_matrix_path) or not os.path.exists(dnn_enrolids_path):
-            print(f"  Precomputing D-N-N distances (metric=gower)...")
-            if use_hdf5_dnn:
-                dnn_matrix_path, dnn_enrolids_path = precompute_gower_dnn_hdf5(
-                    X_majority, bin_col_indices, ranges, dnn_dir
-                )
-            else:
-                dnn_matrix_path, dnn_enrolids_path = precompute_gower_dnn_memmap(
-                    X_majority, bin_col_indices, ranges, dnn_dir
-                )
-            np.save(dnn_enrolids_path, controls["ENROLID"].values.astype(np.int64))
-        return pn_h5, dnn_matrix_path, dnn_enrolids_path
-
-    elif distance_metric in ("jaccard", "hamming"):
-        # Use only binary features (0/1) - appropriate for Jaccard and Hamming
-        bin_in_feature = [c for c in bin_cols if c in feature_cols]
-        if not bin_in_feature:
-            raise ValueError(
-                f"metric={distance_metric} requires binary features, but none of {bin_cols} are in feature_cols"
-            )
-        X_minority = cases[bin_in_feature].values.astype(np.float64)
-        X_majority = controls[bin_in_feature].values.astype(np.float64)
-    else:
-        preprocessor = get_preprocessor(
-            X=pd.concat([cases[feature_cols], controls[feature_cols]], ignore_index=True),
-            cat_cols=cat_cols,
-            num_cols=num_cols,
-            binary_cols=bin_cols,
-            verbose=False,
-        )
-        X_minority = preprocessor.fit_transform(cases[feature_cols])
-        X_majority = preprocessor.transform(controls[feature_cols])
-
-    if not os.path.exists(pn_h5):
-        print(f"  Precomputing P-N distances (metric={distance_metric})...")
-        distances_pn = compute_distances_batched(
-            X_majority, X_minority, batch_size=1000, dtype=np.float32, metric=distance_metric
-        )
-        save_distances_hdf5(
-            distances_pn,
-            controls["ENROLID"].values.astype(np.int64),
-            cases["ENROLID"].values.astype(np.int64),
-            pn_h5,
-        )
-    if not os.path.exists(dnn_matrix_path) or not os.path.exists(dnn_enrolids_path):
-        print(f"  Precomputing D-N-N distances (metric={distance_metric})...")
-        if use_hdf5_dnn:
-            dnn_matrix_path, dnn_enrolids_path = precompute_leaf_dnn_hdf5(
-                X_majority_leaf=X_majority,
-                majority_enrolids_leaf=controls["ENROLID"].values.astype(np.int64),
-                out_dir=dnn_dir,
-                leaf_id="global",
-                batch_size=750,
-                metric=distance_metric,
-            )
-        else:
-            precompute_leaf_dnn_memmap(
-                X_majority_leaf=X_majority,
-                majority_enrolids_leaf=controls["ENROLID"].values.astype(np.int64),
-                out_dir=dnn_dir,
-                leaf_id="global",
-                batch_size=750,
-                metric=distance_metric,
-            )
-    return pn_h5, dnn_matrix_path, dnn_enrolids_path
-
-def run_rnd_1to1_sampling(
-    control_enrolids: np.ndarray,
-    cases: pd.DataFrame,
-    controls: pd.DataFrame,
-    N: int,
-    seed: int,
-) -> pd.DataFrame:
-    """RND 1-1: N cases + N random controls. Returns train_df."""
-    rnd_ids = sample_random_controls(control_enrolids, N, seed)
-    return pd.concat([cases, controls[controls["ENROLID"].isin(rnd_ids)]], ignore_index=True)
+    dnn_npy = ensure_dnn_matrix_npy(dnn_dir)
+    return pn_h5, dnn_npy, enrol
 
 
-def run_ours_1to1_sampling(
-    control_enrolids: np.ndarray,
-    case_enrolids: np.ndarray,
-    controls: pd.DataFrame,
-    cases: pd.DataFrame,
-    dnn_matrix_path: str,
-    dnn_enrolids_path: str,
-    pn_h5_path: str,
-    N: int,
-    M_pool: int,
-    seed: int,
-) -> pd.DataFrame:
-    """Ours 1-1: 1:1 k-center then match (matching_ratio=1). Returns train_df."""
-    match_ids = sample_stageB_matched_controls(
-        control_enrolids, case_enrolids, dnn_matrix_path, dnn_enrolids_path, pn_h5_path,
-        target_count=N, matching_ratio=1, M_pool=M_pool, seed_method="random", seed=seed,
-        X_majority_leaf=None, verbose=False, use_kmeanspp=False,
-    )
-    return pd.concat([cases, controls[controls["ENROLID"].isin(match_ids)]], ignore_index=True)
-
-def plot_majority_cost_by_metric(
+def plot_rnd_vs_ours(
     results_dir: str,
-    csv_pattern: str = "exp*_*_s*.csv",
     target_col: str = "annual_cost_2018_deflated",
     filter_col: str = "top_2_pct_cost_2018",
 ) -> str:
-    """
-    Plot cost distribution (majority class) across methods.
-    Exp 5 = 1N matched + 2N random; Exp 6 = 1N matched + 2N max-dispersed per metric.
-    Returns path to saved plot.
-    """
-    base_path = Path(results_dir)
-    all_files = list(base_path.glob("rnd_1to1_s*.csv")) + list(base_path.glob("ours_1to1_s*.csv")) + list(base_path.glob("exp5_s*.csv")) + list(base_path.glob("exp6_*_s*.csv"))
-    if not all_files:
-        print(f"No sampling CSVs in {results_dir}")
+    files = list(Path(results_dir).glob("rnd_1to1_s*.csv")) + list(
+        Path(results_dir).glob("ours_1to1_s*.csv")
+    )
+    if not files:
+        print(f"No rnd_1to1 / ours_1to1 CSVs in {results_dir}")
         return ""
-
-    data_list = []
-    for f_path in all_files:
-        fname = f_path.name.lower()
-        if "rnd_1to1_" in fname:
-            method = "RND 1-1"
-        elif "ours_1to1_" in fname:
-            method = "Ours 1-1"
-        elif "exp5_" in fname:
-            method = "Exp 5 (1N matched + 2N random)"
-        elif "exp6_" in fname:
-            # Extract metric: exp6_euclidean_s0 -> Euclidean
-            parts = fname.replace(".csv", "").split("_")
-            if len(parts) >= 3:
-                metric = parts[1]
-                method = f"Exp 6 ({metric.capitalize()})"
-            else:
-                method = "Exp 6 (Unknown)"
-        else:
-            continue
-
+    rows = []
+    for f in files:
+        name = f.name.lower()
+        method = "RND 1-1" if "rnd_1to1" in name else "Ours 1-1 (Gower curated)"
         try:
-            df = pd.read_csv(f_path, usecols=[target_col, filter_col])
-            majority_df = df[df[filter_col] == 0].copy()
-            majority_df["Method"] = method
-            data_list.append(majority_df)
+            df = pd.read_csv(f, usecols=[target_col, filter_col])
+            maj = df[df[filter_col] == 0].copy()
+            maj["Method"] = method
+            rows.append(maj)
         except Exception as e:
-            print(f"Skipping {fname}: {e}")
-
-    if not data_list:
-        print("No data for plotting.")
+            print(f"Skip {f.name}: {e}")
+    if not rows:
         return ""
-
-    full_df = pd.concat(data_list, ignore_index=True)
-    # Order: Exp 5 first (baseline), then Exp 6 metrics alphabetically
-    base_order = ["RND 1-1", "Ours 1-1", "Exp 5 (1N matched + 2N random)"]
-    rest = sorted([m for m in full_df["Method"].unique() if m not in base_order])
-    method_order = [m for m in base_order if m in full_df["Method"].unique()] + rest
-    full_df["Method"] = pd.Categorical(full_df["Method"], categories=method_order, ordered=True)
-    full_df = full_df.sort_values("Method")
-
-    plt.figure(figsize=(12, 7))
+    full = pd.concat(rows, ignore_index=True)
+    order = ["RND 1-1", "Ours 1-1 (Gower curated)"]
+    full["Method"] = pd.Categorical(full["Method"], categories=order, ordered=True)
+    plt.figure(figsize=(8, 6))
     sns.set_style("whitegrid")
-    palette = sns.color_palette("husl", n_colors=len(method_order))
-    ax = sns.boxplot(data=full_df, x="Method", y=target_col, hue="Method", palette=dict(zip(method_order, palette)))
+    sns.boxplot(data=full, x="Method", y=target_col, hue="Method", legend=False)
     plt.yscale("log")
-    plt.title("Majority Class Cost Distribution: Exp 5 vs Exp 6 by Distance Metric\n(top_2_pct_cost_2018 == 0)", fontsize=14)
-    plt.ylabel("Annual Cost 2018 (Log Scale $)")
-    plt.xlabel("Sampling Method")
-    plt.xticks(rotation=45, ha="right")
-    plt.legend().set_visible(False)
+    plt.title("Majority class cost: random 1-1 vs Gower curated 1-1")
+    plt.ylabel(target_col)
+    plt.xticks(rotation=15, ha="right")
     plt.tight_layout()
-    out_path = os.path.join(results_dir, "exp6_cost_distribution_by_metric.png")
-    plt.savefig(out_path, dpi=300)
+    out = os.path.join(results_dir, "rnd_vs_ours_1to1_cost.png")
+    plt.savefig(out, dpi=200)
     plt.close()
-    print(f"Cost plot saved: {out_path}")
-    return out_path
+    print(f"Plot: {out}")
+    return out
 
 
-def get_median_majority_cost(csv_path: str, target_col: str = "annual_cost_2018_deflated", filter_col: str = "top_2_pct_cost_2018") -> float:
-    """Return median annual cost for majority class (filter_col==0)."""
+def median_majority_cost(
+    csv_path: str,
+    target_col: str = "annual_cost_2018_deflated",
+    filter_col: str = "top_2_pct_cost_2018",
+) -> float:
     df = pd.read_csv(csv_path, usecols=[target_col, filter_col])
     maj = df[df[filter_col] == 0][target_col]
     return float(maj.median())
 
 
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="1:1 random vs Gower-curated sampling (precomputed distances only)"
+    )
+    p.add_argument("--seeds", type=str, default="0", help="Comma-separated seeds")
+    p.add_argument(
+        "--rnd_seeds",
+        type=str,
+        default=None,
+        help="Comma-separated seeds for random 1-1 sampling (defaults to --seeds)",
+    )
+    p.add_argument(
+        "--ours_seeds",
+        type=str,
+        default=None,
+        help="Comma-separated seeds for ours 1-1 sampling / seed_method randomness (defaults to --seeds)",
+    )
+    p.add_argument("--outdir", type=str, default="./1to1_gower_sampling")
+    p.add_argument("--parquet_path", type=str, default="msk_2017_18_full.parquet")
+    p.add_argument(
+        "--distances_dir",
+        type=str,
+        default="../../scratch/msk_analysis/precomputed_distances_gower",
+        help="Dir with distances_majority_minority_gower.h5 and global_dnn_seed_<train_test_seed>_gower/",
+    )
+    p.add_argument(
+        "--train_test_seed",
+        type=int,
+        default=DEFAULT_TRAIN_TEST_SEED,
+        help="Seed in folder name global_dnn_seed_{train_test_seed}_gower (must match precompute)",
+    )
+    p.add_argument("--oct_seed", type=int, default=DEFAULT_TRAIN_TEST_SEED)
+    p.add_argument("--feature_set", type=str, default="all_cost",
+                   choices=["medical_only", "all_cost", "less_cost"])
+    p.add_argument("--M_pool", type=int, default=None)
+    p.add_argument("--seed_method", type=str, default="random", choices=["random", "smart","centroid","density"])
+    p.add_argument("--skip_plot", action="store_true")
+    p.add_argument("--skip_oct", action="store_true")
+    p.add_argument("--resume", action="store_true")
+    return p.parse_args()
+
+
+def parse_seed_list(seed_str: str) -> List[int]:
+    return [int(s.strip()) for s in seed_str.split(",") if s.strip()]
+
+
+def summarize_results(all_rows: List[Dict], results_dir: str) -> None:
+    if not all_rows:
+        print("No OCT rows to summarize.")
+        return
+
+    summary_path = os.path.join(results_dir, "experiment_summary.csv")
+    df_out = pd.DataFrame(all_rows)
+    df_out = df_out.sort_values(["experiment", "seed"]).reset_index(drop=True)
+    df_out.to_csv(summary_path, index=False)
+    print(f"\nSaved {len(df_out)} rows to {summary_path}")
+
+    agg_cols = [
+        "pr_auc",
+        "auc",
+        "best_mcc",
+        "balanced_recall_gmean",
+        "balanced_specificity_gmean",
+        "optimal_f1",
+    ]
+    agg_cols = [c for c in agg_cols if c in df_out.columns]
+    if agg_cols:
+        agg = df_out.groupby(["experiment"]).agg(
+            {c: ["mean", "std"] for c in agg_cols}
+        ).round(4)
+        print("\nAggregated (mean ± std):")
+        print(agg)
+        agg.to_csv(os.path.join(results_dir, "experiment_summary_aggregated.csv"))
+
+
 def main():
     args = parse_args()
-    seeds = [int(s.strip()) for s in args.seeds.split(",")]
-    metrics = [m.strip().lower() for m in args.metrics.split(",")]
-    outdir = args.outdir
-    results_dir = os.path.join(outdir, "results")
+    base_seeds = parse_seed_list(args.seeds)
+    rnd_seeds = parse_seed_list(args.rnd_seeds) if args.rnd_seeds else base_seeds
+    ours_seeds = parse_seed_list(args.ours_seeds) if args.ours_seeds else base_seeds
+    results_dir = os.path.join(args.outdir, "results")
     os.makedirs(results_dir, exist_ok=True)
-    os.makedirs(args.distances_dir, exist_ok=True)
 
-    print("=" * 80)
-    print("EXP 6: Distance Metric Ablation")
-    print("=" * 80)
-    print(f"  Seeds: {seeds}")
-    print(f"  Metrics: {metrics}")
-    print(f"  Two-stage: k-center then match | random init | no k-means++ | no adaptive pool")
-    print()
+    print("=" * 72)
+    print("1:1 sampling — random vs Gower curated (precomputed distances)")
+    print("=" * 72)
+    print(f"  distances_dir: {args.distances_dir}")
+    print(f"  fixed train/test seed: {args.train_test_seed}")
+    print(f"  rnd_seeds: {rnd_seeds}")
+    print(f"  ours_seeds: {ours_seeds}")
+
+    pn_h5, dnn_mat, dnn_ids_path = load_precomputed_gower_paths(
+        args.distances_dir, args.train_test_seed
+    )
+    print(f"  P-N: {pn_h5}")
+    print(f"  D-N-N: {dnn_mat}")
+    print(f"  Enrolids: {dnn_ids_path}")
 
     df = pd.read_parquet(args.parquet_path)
-
     target_col = "top_2_pct_cost_2018"
     if target_col not in df.columns and "annual_cost_2018_deflated" in df.columns:
         thresh = df["annual_cost_2018_deflated"].quantile(0.98)
         df[target_col] = (df["annual_cost_2018_deflated"] >= thresh).astype(int)
 
-    BIN_FLAG_COLUMNS = get_bin_flag_columns(df)
-    CAT_COLUMNS = get_cat_columns(df)
-    TRUE_NUM_COLUMNS = get_true_num_columns(df, CAT_COLUMNS, BIN_FLAG_COLUMNS)
-    COST_COLUMNS = [
-        col for col in df.columns
-        if ("cost" in col.lower() or "quarterly" in col.lower() or "increasing" in col.lower()
-            or "decreasing" in col.lower() or "skewness" in col.lower() or "kurtosis" in col.lower()
-            or "cv" in col.lower() or "range" in col.lower())
-        and "2018" not in col
+    bin_cols = get_bin_flag_columns(df)
+    cat_cols = get_cat_columns(df)
+    num_cols = get_true_num_columns(df, cat_cols, bin_cols)
+    cost_cols = [
+        c for c in df.columns
+        if ("cost" in c.lower() or "quarterly" in c.lower() or "increasing" in c.lower()
+            or "decreasing" in c.lower() or "skewness" in c.lower() or "kurtosis" in c.lower()
+            or "cv" in c.lower() or "range" in c.lower())
+        and "2018" not in c
     ]
-    AUXILIARY_COST_COLUMNS = [col for col in df.columns if col.startswith("comorbidity_only") or col.startswith("msk_procedure")]
-    exclude_cols = ["ENROLID", target_col] + [c for c in df.columns if "2018" in c]
+    aux = [c for c in df.columns if c.startswith("comorbidity_only") or c.startswith("msk_procedure")]
+    exclude = ["ENROLID", target_col] + [c for c in df.columns if "2018" in c]
     if args.feature_set == "medical_only":
-        exclude_cols += COST_COLUMNS
-        feature_cols = [c for c in df.columns if c not in exclude_cols]
-    elif args.feature_set == "all_cost":
-        feature_cols = [c for c in df.columns if c not in exclude_cols]
-    else:
-        exclude_cols += AUXILIARY_COST_COLUMNS
-        feature_cols = [c for c in df.columns if c not in exclude_cols]
+        exclude = exclude + cost_cols
+    elif args.feature_set == "less_cost":
+        exclude = exclude + aux
+    feature_cols = [c for c in df.columns if c not in exclude]
 
-    train_ids, test_ids, train_pd, test_pd = train_test_split_enrol(
-        df, target_col=target_col, test_size=0.3, verbose=False, random_state=TRAIN_TEST_SEED
+    _, _, train_pd, test_pd = train_test_split_enrol(
+        df, target_col=target_col, test_size=0.3, verbose=False,
+        random_state=args.train_test_seed,
     )
-    val_ids, test_ids, val_pd, test_pd = train_test_split_enrol(
-        test_pd, target_col=target_col, test_size=0.5, verbose=False, random_state=TRAIN_TEST_SEED
+    _, _, val_pd, test_pd = train_test_split_enrol(
+        test_pd, target_col=target_col, test_size=0.5, verbose=False,
+        random_state=args.train_test_seed,
     )
 
     cases = train_pd[train_pd[target_col] == 1]
     controls = train_pd[train_pd[target_col] == 0]
-    N = len(cases)
-    n_controls = len(controls)
-    case_enrolids = cases["ENROLID"].values.astype(np.int64)
-    control_enrolids = controls["ENROLID"].values.astype(np.int64)
-    M_pool = args.M_pool if args.M_pool is not None else n_controls // 2
+    n_cases = len(cases)
+    n_ctrl = len(controls)
+    case_ids = cases["ENROLID"].values.astype(np.int64)
+    ctrl_ids = controls["ENROLID"].values.astype(np.int64)
+    m_pool = args.M_pool if args.M_pool is not None else n_ctrl // 2
 
-    print(f"Train: {len(train_pd):,}  Val: {len(val_pd):,}  Test: {len(test_pd):,}")
-    print(f"  N (cases): {N:,}  Controls: {n_controls:,}  M_pool: {M_pool:,}")
-    print()
+    print(f"  Train {len(train_pd):,} | N cases {n_cases:,} | controls {n_ctrl:,} | M_pool {m_pool:,}")
 
-    metric_median_costs = {}
-    K = EXP6_TOTAL_CONTROLS_MULT * N
+    medians = {}
 
-    # --- RND 1-1: N cases + N random controls ---
-    print("\n--- RND 1-1: 1:1 random undersampling ---")
-    for seed in seeds:
-        rnd_path = os.path.join(results_dir, f"rnd_1to1_s{seed}.csv")
-        if args.resume and os.path.exists(rnd_path):
-            print(f"  RND 1-1 s{seed}: using cached CSV")
+    print("\n--- RND 1-1 ---")
+    for seed in rnd_seeds:
+        path = os.path.join(results_dir, f"rnd_1to1_s{seed}.csv")
+        if args.resume and os.path.isfile(path):
+            print(f"  seed {seed}: cached")
         else:
-            rnd_train = run_rnd_1to1_sampling(control_enrolids, cases, controls, N, seed)
-            rnd_train.to_csv(rnd_path, index=False)
-            print(f"  RND 1-1 s{seed}: saved {rnd_path}")
-        metric_median_costs[f"rnd1to1_s{seed}"] = get_median_majority_cost(rnd_path)
+            run_rnd_1to1_sampling(ctrl_ids, cases, controls, n_cases, seed).to_csv(
+                path, index=False
+            )
+            print(f"  seed {seed}: wrote {path}")
+        medians[f"rnd_s{seed}"] = median_majority_cost(path)
 
-    # --- Ours 1-1 and Exp 5/6 use Gower ---
-    pn_h5_gower, dnn_mat_gower, dnn_ids_gower = ensure_distances_for_metric(
-        "gower", cases, controls, feature_cols,
-        CAT_COLUMNS, TRUE_NUM_COLUMNS, BIN_FLAG_COLUMNS,
-        args.distances_dir,
-    )
-
-    # --- Ours 1-1: 1:1 k-center then match (Gower) ---
-    print("\n--- Ours 1-1: 1:1 k-center then match (Gower) ---")
-    for seed in seeds:
-        ours_path = os.path.join(results_dir, f"ours_1to1_s{seed}.csv")
-        if args.resume and os.path.exists(ours_path):
-            print(f"  Ours 1-1 s{seed}: using cached CSV")
+    print("\n--- Ours 1-1 (Gower k-center + match) ---")
+    for seed in ours_seeds:
+        path = os.path.join(results_dir, f"ours_1to1_s{seed}.csv")
+        if args.resume and os.path.isfile(path):
+            print(f"  seed {seed}: cached")
         else:
-            ours_train = run_ours_1to1_sampling(
-                control_enrolids, case_enrolids, controls, cases,
-                dnn_mat_gower, dnn_ids_gower, pn_h5_gower, N, M_pool, seed,
-            )
-            ours_train.to_csv(ours_path, index=False)
-            print(f"  Ours 1-1 s{seed}: saved {ours_path}")
-        metric_median_costs[f"ours1to1_s{seed}"] = get_median_majority_cost(ours_path)
+            run_ours_1to1_sampling(
+                ctrl_ids, case_ids, controls, cases,
+                dnn_mat, dnn_ids_path, pn_h5, n_cases, m_pool, seed, seed_method=args.seed_method,
+            ).to_csv(path, index=False)
+            print(f"  seed {seed}: wrote {path}")
+        medians[f"ours_s{seed}"] = median_majority_cost(path)
 
-    # --- Exp 5 (1N matched + 2N random) - Gower ---
-    print("\n--- Exp 5: 1N matched + 2N random (Gower) ---")
-    for seed in seeds:
-        exp5_path = os.path.join(results_dir, f"exp5_s{seed}.csv")
-        if args.resume and os.path.exists(exp5_path):
-            print(f"  Exp 5 s{seed}: using cached CSV")
-        else:
-            exp5_train = run_exp5_sampling(
-                control_enrolids, case_enrolids, controls, cases,
-                dnn_mat_gower, dnn_ids_gower, pn_h5_gower, N, M_pool, seed,
-            )
-            exp5_train.to_csv(exp5_path, index=False)
-            print(f"  Exp 5 s{seed}: saved {exp5_path}")
-        med = get_median_majority_cost(exp5_path)
-        metric_median_costs[f"exp5_s{seed}"] = med
+    print(f"\n  Majority-cost medians: {medians}")
 
-    # --- Per-metric Exp 6 sampling (1N matched + 2N max-dispersed) ---
-    for metric in metrics:
-        print(f"\n--- Metric: {metric} ---")
-        try:
-            pn_h5, dnn_mat, dnn_ids = ensure_distances_for_metric(
-                metric, cases, controls, feature_cols,
-                CAT_COLUMNS, TRUE_NUM_COLUMNS, BIN_FLAG_COLUMNS,
-                args.distances_dir,
-            )
-        except Exception as e:
-            print(f"  ERROR precomputing distances for {metric}: {e}")
-            traceback.print_exc()
-            continue
-
-        for seed in seeds:
-            csv_path = os.path.join(results_dir, f"exp6_{metric}_s{seed}.csv")
-            if args.resume and os.path.exists(csv_path):
-                print(f"  {metric} s{seed}: using cached CSV")
-            else:
-                try:
-                    train_df = run_exp6_sampling(
-                        control_enrolids, case_enrolids, controls, cases,
-                        dnn_mat, dnn_ids, pn_h5, N, M_pool, seed,
-                    )
-                    train_df.to_csv(csv_path, index=False)
-                    print(f"  {metric} s{seed}: saved {csv_path}")
-                except Exception as e:
-                    print(f"  ERROR {metric} s{seed}: {e}")
-                    traceback.print_exc()
-                    continue
-
-            med = get_median_majority_cost(csv_path)
-            metric_median_costs[f"{metric}_s{seed}"] = med
-
-    # Aggregate median per method (mean over seeds)
-    metric_medians = {}
-    for key in ["rnd1to1", "ours1to1", "exp5"]:
-        vals = [metric_median_costs.get(f"{key}_s{s}") for s in seeds]
-        vals = [v for v in vals if v is not None]
-        if vals:
-            metric_medians[key] = np.mean(vals)
-    for metric in metrics:
-        vals = [metric_median_costs.get(f"{metric}_s{s}") for s in seeds]
-        vals = [v for v in vals if v is not None]
-        if vals:
-            metric_medians[metric] = np.mean(vals)
-    if metric_medians:
-        print(f"\n--- Cost medians: {metric_medians} ---")
-
-    # --- Plot cost distribution ---
     if not args.skip_plot:
-        plot_majority_cost_by_metric(results_dir)
+        plot_rnd_vs_ours(results_dir)
 
-    # --- Train OCT on all methods (RND 1-1, Ours 1-1, Exp 5, Exp 6 per metric) ---
     if not args.skip_oct:
-        seed = seeds[0]
-        train_configs = [
-            ("rnd_1to1", "RND 1-1"),
-            ("ours_1to1", "Ours 1-1"),
-            ("exp5", "Exp 5"),
-        ]
-        for csv_base, label in train_configs:
-            csv_path = os.path.join(results_dir, f"{csv_base}_s{seed}.csv")
-            if os.path.exists(csv_path):
+        all_rows: List[Dict] = []
+        experiment_to_seeds = {
+            "rnd_1to1": rnd_seeds,
+            "ours_1to1": ours_seeds,
+        }
+        experiment_labels = {
+            "rnd_1to1": "RND 1-1",
+            "ours_1to1": "Ours 1-1 Gower",
+        }
+
+        for base, seed_list in experiment_to_seeds.items():
+            label = experiment_labels[base]
+            for seed in seed_list:
+                csv_path = os.path.join(results_dir, f"{base}_s{seed}.csv")
+                if not os.path.isfile(csv_path):
+                    print(f"  OCT skip: {csv_path} missing")
+                    continue
                 train_df = pd.read_csv(csv_path)
-                print(f"\nTraining OCT on {label}...")
+                print(f"\nOCT: {label} (seed={seed}) …")
                 try:
                     m = train_and_evaluate_oct(
-                        train_df, val_pd, test_pd, feature_cols, target_col,
-                        CAT_COLUMNS, TRUE_NUM_COLUMNS, BIN_FLAG_COLUMNS,
-                        results_dir, f"{csv_base}_s{seed}", TRAIN_TEST_SEED,
+                        train_df,
+                        val_pd,
+                        test_pd,
+                        feature_cols,
+                        target_col,
+                        cat_cols,
+                        num_cols,
+                        bin_cols,
+                        results_dir,
+                        f"{base}_s{seed}",
+                        args.oct_seed,
                     )
-                    print(f"  PR-AUC: {m.get('pr_auc', 0):.4f}  AUC: {m.get('auc', 0):.4f}")
+                    print(f"  PR-AUC {m.get('pr_auc', 0):.4f}  AUC {m.get('auc', 0):.4f}")
+                    row = {"experiment": base, "seed": seed}
+                    row.update(m)
+                    all_rows.append(row)
                 except Exception as e:
-                    print(f"  OCT ERROR ({label}): {e}")
+                    print(f"  OCT error: {e}")
                     traceback.print_exc()
-            else:
-                print(f"  {label} train CSV not found: {csv_path}")
-        for metric in metrics:
-            exp6_path = os.path.join(results_dir, f"exp6_{metric}_s{seed}.csv")
-            if os.path.exists(exp6_path):
-                train_df = pd.read_csv(exp6_path)
-                print(f"\nTraining OCT on Exp 6 ({metric})...")
-                try:
-                    m = train_and_evaluate_oct(
-                        train_df, val_pd, test_pd, feature_cols, target_col,
-                        CAT_COLUMNS, TRUE_NUM_COLUMNS, BIN_FLAG_COLUMNS,
-                        results_dir, f"exp6_{metric}_s{seed}", TRAIN_TEST_SEED,
-                    )
-                    print(f"  PR-AUC: {m.get('pr_auc', 0):.4f}  AUC: {m.get('auc', 0):.4f}")
-                except Exception as e:
-                    print(f"  OCT ERROR (Exp 6 {metric}): {e}")
-                    traceback.print_exc()
-            else:
-                print(f"  Exp 6 {metric} train CSV not found: {exp6_path}")
+
+        summarize_results(all_rows, results_dir)
 
     print("\nDone.")
 
 
 if __name__ == "__main__":
+    """python3 scripts/run_1to1_sampling_gower.py \
+  --outdir ./1to1_gower_sampling \
+  --train_test_seed 123 \
+  --rnd_seeds 0,1,2,3,4 \
+  --ours_seeds 0,1,2,3,4"""
     main()
-

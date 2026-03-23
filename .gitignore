@@ -13,6 +13,7 @@
 *.pkl
 *.npy
 *.h5
+*.html
 
 # Python cache / bytecode
 __pycache__/

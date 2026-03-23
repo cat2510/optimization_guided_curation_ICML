@@ -51,9 +51,10 @@ from experiments_compare_random_vs_curation import (
     sample_stageA_dispersed_controls,
 )
 
-import exp6_distance_metric_ablation
-importlib.reload(exp6_distance_metric_ablation)
-from exp6_distance_metric_ablation import ensure_distances_for_metric
+_scripts_dir = os.path.dirname(os.path.abspath(__file__))
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+from ensure_distances_for_metric import ensure_distances_for_metric
 
 from public.model_IAI import (
     train_test_split_enrol,

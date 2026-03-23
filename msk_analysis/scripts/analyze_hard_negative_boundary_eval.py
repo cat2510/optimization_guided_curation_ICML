@@ -65,15 +65,11 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import OneHotEncoder
 
-# Reuse Gower from exp6 (script runs from msk_analysis, exp6 in scripts/)
 _scripts_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _scripts_dir)
-import exp6_distance_metric_ablation as exp6
-from exp6_distance_metric_ablation import (
-    _compute_gower_distances,
-    ensure_distances_for_metric,
-    TRAIN_TEST_SEED,
-)
+from precompute_msk_distances_za_zb import _compute_gower_distances
+from ensure_distances_for_metric import TRAIN_TEST_SEED, ensure_distances_for_metric
+from gower_1to1_sampling import run_ours_1to1_sampling, run_rnd_1to1_sampling
 
 # OCT config matching exp6
 OCT_DEPTHS = [7]
@@ -395,7 +391,7 @@ def main():
             args.distances_dir,
         )
         if not ours_path.exists():
-            ours_train = exp6.run_ours_1to1_sampling(
+            ours_train = run_ours_1to1_sampling(
                 control_enrolids,
                 case_enrolids,
                 controls,
@@ -409,7 +405,7 @@ def main():
             )
             ours_train.to_csv(ours_path, index=False)
         if not rnd_path.exists():
-            rnd_train = exp6.run_rnd_1to1_sampling(
+            rnd_train = run_rnd_1to1_sampling(
                 control_enrolids, cases, controls, N, args.seed
             )
             rnd_train.to_csv(rnd_path, index=False)
