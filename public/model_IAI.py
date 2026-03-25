@@ -254,6 +254,7 @@ def finetune_oct(
     hyperplane_configs=None,  # list[dict] for OCT-H, e.g. [{"sparsity":"all"}]
     ls_num_hyper_restarts=5,  # hyperplane search restarts (optional speed/quality knob)
     missingdatamode_oct="always_left",
+    fit_sample_weight=None,
     verbose=True,
     random_seed=123,
 ):
@@ -266,6 +267,8 @@ def finetune_oct(
           default when OCT-H is used: [{"sparsity": "all"}]
       - ls_num_hyper_restarts: number of random restarts for hyperplane optimization
       - missingdatamode_oct: missing-data mode for vanilla OCT (OCT-H should not rely on missingdatamode)
+      - fit_sample_weight: forwarded to IAI fit(..., sample_weight=...)
+          Use "autobalance" for IAI built-in class balancing on imbalanced classification.
     """
     tree_kind = tree_kind.lower().strip()
     if tree_kind not in {"oct", "oct_h", "both"}:
@@ -292,6 +295,7 @@ def finetune_oct(
             f"depths={list(depths)}, minbuckets={list(minbuckets)}, cps={list(cps)} (best PR-AUC)"
         )
 
+    tuning_start_time = time.perf_counter()
     best_score = -np.inf
     best_params = None
     best_model = None
@@ -359,6 +363,7 @@ def finetune_oct(
     # :contentReference[oaicite:2]{index=2}
     # (If you want a softer behavior, you can skip OCT-H variants instead of raising.)
     for depth, minbucket, cp, variant in itertools.product(depths, minbuckets, cps, variant_grid):
+        config_fit_start_time = time.perf_counter()
         is_hyperplane = variant is not None
 
         if is_hyperplane and (train_has_nan or val_has_nan):
@@ -386,7 +391,11 @@ def finetune_oct(
             model_kwargs["missingdatamode"] = missingdatamode_oct
 
         model = iai.OptimalTreeClassifier(**model_kwargs)
-        model.fit(X_train_df, y_train)
+        fit_kwargs = {}
+        if fit_sample_weight is not None:
+            fit_kwargs["sample_weight"] = fit_sample_weight
+        model.fit(X_train_df, y_train, **fit_kwargs)
+        config_fit_time_seconds = float(time.perf_counter() - config_fit_start_time)
 
         y_pred = model.predict(X_val_df)
         y_val_proba = model.predict_proba(X_val_df).iloc[:, 1]
@@ -402,6 +411,7 @@ def finetune_oct(
             "cp": cp,
             "f1": f1,
             "pr_auc": pr_auc,
+            "fit_time_seconds": config_fit_time_seconds,
         })
 
         if pr_auc > best_score:
@@ -412,10 +422,14 @@ def finetune_oct(
                 "depth": depth,
                 "minbucket": minbucket,
                 "cp": cp,
+                "best_fit_time_seconds": config_fit_time_seconds,
             }
             best_model = model
 
     results_df = pd.DataFrame(results).sort_values("pr_auc", ascending=False).reset_index(drop=True)
+    tuning_time_seconds = float(time.perf_counter() - tuning_start_time)
+    if isinstance(best_params, dict):
+        best_params["tuning_time_seconds"] = tuning_time_seconds
     if verbose:
         print(f"Best params: {best_params} @ PR-AUC: {best_score:.4f}")
 
@@ -633,6 +647,7 @@ def evaluate_binary_oct(
       - recall_at_specificity_0.6: maximum recall achievable at specificity >= 0.6
         (and reports the selected threshold + achieved specificity).
     """
+    eval_start_time = time.perf_counter()
     print(f"Test dataset for OCT application: {len(X_test_df):,} samples")
 
     # ------------------------------------------------------------
@@ -802,6 +817,7 @@ def evaluate_binary_oct(
         balanced_recall_gmean = balanced["gmean_opt"]["recall"]
         balanced_specificity_gmean = balanced["gmean_opt"]["specificity"]
     
+    evaluation_time_seconds = float(time.perf_counter() - eval_start_time)
     return {
         "auc": auc,
         "pr_auc": pr_auc,
@@ -814,6 +830,7 @@ def evaluate_binary_oct(
         "recall_at_specificity_0.6": float(recall_at_spec_06),
         "achieved_specificity_0.6": float(achieved_spec_06),
         "threshold_specificity_0.6": float(threshold_spec_06),
+        "evaluation_time_seconds": evaluation_time_seconds,
     }
 
 def best_balanced_threshold(y_true, y_prob):

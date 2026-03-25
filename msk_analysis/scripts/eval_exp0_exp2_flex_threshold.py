@@ -2,8 +2,8 @@
 """
 eval_exp0_exp2_flex_threshold.py
 ================================
-Evaluate exp0 and exp2 models (from exp_0_to_4_gower_v2 results) across varying
-cost thresholds at evaluation time. Models are trained on top_2_pct_cost_2018;
+Evaluate exp0, exp2, exp3, and exp4 models (from exp_0_to_4_gower_v2 results) across
+varying cost thresholds at evaluation time. Models are trained on top_2_pct_cost_2018;
 we re-evaluate using top 2%, 5%, 10%, and 15% as the binary target.
 
 No sampling or training. Loads existing prediction CSVs only.
@@ -24,6 +24,7 @@ import sys
 from typing import List, Tuple
 
 import h5py
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -48,10 +49,19 @@ TRAIN_TEST_SEED = 123
 DISTANCES_DIR = "/Users/cat2510/scratch/msk_analysis/precomputed_distances_gower"
 DEFAULT_RESULTS_DIR = "/Users/cat2510/scratch/msk_analysis/exp_0_to_4_gower_v2/results"
 COST_COL = "annual_cost_2018_deflated"
+DEFAULT_AGGREGATED_CSV = "/Users/cat2510/my_projects/msk_analysis/eval_threshold_results/results/eval_threshold_aggregated.csv"
+
+# Short labels for experiments in plots
+EXP_LABELS = {
+    ("exp0_rnd", "random"): "Exp0 (random)",
+    ("exp2", "stageB"): "Exp2 (stageB)",
+    ("exp3", "mix"): "Exp3 (mix)",
+    ("exp4", "matched_1N_plus_1N_random"): "Exp4 (1N+1N rnd)",
+}
 
 
 def target_column_for_pct(pct: int | float) -> str:
-    """e.g. 2 -> top_2_pct_cost_2018, 15 -> top_15_pct_cost_2018."""
+    """e.g. 2 -> top_2_pct_cost_2018, 0.5 -> top_0_5_pct_cost_2018, 15 -> top_15_pct_cost_2018."""
     if pct == int(pct):
         return f"top_{int(pct)}_pct_cost_2018"
     return f"top_{str(pct).replace('.', '_')}_pct_cost_2018"
@@ -147,7 +157,7 @@ def get_test_pd(
     return test_pd
 
 
-def ensure_target_columns(df: pd.DataFrame, target_pcts: List[int], cost_col: str) -> None:
+def ensure_target_columns(df: pd.DataFrame, target_pcts: List[float], cost_col: str) -> None:
     """Ensure top_X_pct_cost_2018 columns exist. Derive from cost_col if missing."""
     for pct in target_pcts:
         col = target_column_for_pct(pct)
@@ -188,6 +198,60 @@ def discover_seeds_from_results(results_dir: str, experiments: List[Tuple[str, s
     return sorted(seeds)
 
 
+def plot_eval_threshold_results(
+    aggregated_path: str = DEFAULT_AGGREGATED_CSV,
+    out_path: str | None = None,
+) -> str:
+    """
+    Plot PR-AUC and AUC vs eval_target_pct from eval_threshold_aggregated.csv,
+    with mean ± std as confidence bands. One line per experiment.
+    """
+    df = pd.read_csv(aggregated_path, header=[0, 1], index_col=[0, 1, 2])
+    df = df.reset_index()
+    # Flatten MultiIndex columns for easier access
+    df.columns = [c[0] if c[1] == "" else f"{c[0]}_{c[1]}" for c in df.columns]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    metrics = [
+        ("pr_auc", "PR-AUC", axes[0]),
+        ("auc", "AUC", axes[1]),
+    ]
+
+    colors = plt.cm.tab10.colors
+    for idx, ((exp, variant), label) in enumerate(EXP_LABELS.items()):
+        sub = df[(df["experiment"] == exp) & (df["variant"] == variant)]
+        if sub.empty:
+            continue
+        sub = sub.sort_values("eval_target_pct")
+        x_sub = sub["eval_target_pct"].values
+        color = colors[idx % len(colors)]
+
+        for metric, title, ax in metrics:
+            mean_col, std_col = f"{metric}_mean", f"{metric}_std"
+            if mean_col not in sub.columns:
+                continue
+            y_mean = sub[mean_col].values
+            y_std = sub[std_col].values if std_col in sub.columns else np.zeros_like(y_mean)
+            ax.plot(x_sub, y_mean, "-o", label=label, color=color, markersize=4)
+            ax.fill_between(x_sub, y_mean - y_std, y_mean + y_std, alpha=0.2, color=color)
+
+    for metric, title, ax in metrics:
+        ax.set_xlabel("Eval target percentile (top X%)")
+        ax.set_ylabel(title)
+        ax.set_title(title + " vs cost threshold")
+        ax.legend(loc="best", fontsize=8)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(left=0)
+
+    plt.tight_layout()
+    if out_path is None:
+        out_path = os.path.join(os.path.dirname(aggregated_path), "eval_threshold_pr_auc_auc.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Plot saved: {out_path}")
+    return out_path
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="Evaluate exp0/exp2 predictions across cost thresholds (2%, 5%, 10%, 15%)"
@@ -203,7 +267,7 @@ def parse_args():
         "--parquet_path",
         type=str,
         default="msk_2017_18_full.parquet",
-        help="Path to parquet (relative to msk_analysis or absolute)",
+        help="Parquet path (must match run_experiments; default from exp_0_to_4_gower_v2 config)",
     )
     p.add_argument(
         "--seeds",
@@ -211,25 +275,41 @@ def parse_args():
         default="auto",
         help="Comma-separated seeds or 'auto' to discover from results",
     )
-    p.add_argument("--experiments", type=str, default="0,2")
-    p.add_argument("--target_pcts", type=str, default="2,5,10,15")
+    p.add_argument("--experiments", type=str, default="0,2,3,4",
+                   help="Comma-separated experiment indices (0=random, 2=stageB, 3=mix, 4=matched_1N+1N_random)")
+    p.add_argument("--target_pcts", type=str, default="2,5,10,15",
+                   help="Comma-separated percentiles, e.g. 0.5,2,5,10,15")
     p.add_argument("--outdir", type=str, default="./eval_threshold_results")
+    p.add_argument("--plot", action="store_true", help="Generate PR-AUC and AUC vs eval_target_pct plot after eval")
+    p.add_argument("--plot_only", action="store_true", help="Only generate plot from existing eval_threshold_aggregated.csv (skip eval)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
+    if args.plot_only:
+        agg_path = os.path.join(args.outdir, "results", "eval_threshold_aggregated.csv")
+        if not os.path.isfile(agg_path):
+            agg_path = DEFAULT_AGGREGATED_CSV
+        if os.path.isfile(agg_path):
+            plot_eval_threshold_results(aggregated_path=agg_path, out_path=os.path.join(os.path.dirname(agg_path), "eval_threshold_pr_auc_auc.png"))
+        else:
+            print(f"Not found: {agg_path}. Run eval first or set --outdir.")
+        return
+
     experiments_config = {
         0: ("exp0_rnd", "random"),
         2: ("exp2", "stageB"),
+        3: ("exp3", "mix"),
+        4: ("exp4", "matched_1N_plus_1N_random"),
     }
     experiments_to_run = [int(x.strip()) for x in args.experiments.split(",")]
     experiments = [experiments_config[e] for e in experiments_to_run if e in experiments_config]
     if not experiments:
-        raise ValueError(f"No valid experiments; use --experiments 0,2 (got {args.experiments})")
+        raise ValueError(f"No valid experiments; use --experiments 0,2,3,4 (got {args.experiments})")
 
-    target_pcts = [int(x.strip()) for x in args.target_pcts.split(",")]
+    target_pcts = [float(x.strip()) for x in args.target_pcts.split(",")]
     target_cols = [target_column_for_pct(p) for p in target_pcts]
 
     if args.seeds.strip().lower() == "auto":
@@ -246,7 +326,7 @@ def main():
     parquet_path = args.parquet_path
     if not os.path.isabs(parquet_path):
         parquet_path = os.path.join(parent_dir, parquet_path)
-    if not os.path.isfile(parquet_path):
+    if not (os.path.isfile(parquet_path) or os.path.isdir(parquet_path)):
         raise FileNotFoundError(f"Parquet not found: {parquet_path}")
 
     outdir = os.path.join(args.outdir, "results")
@@ -254,7 +334,7 @@ def main():
     preds_dir = os.path.join(args.results_dir, "predictions")
 
     print("=" * 72)
-    print("Eval exp0/exp2 across cost thresholds (no sampling, no training)")
+    print("Eval exp0/2/3/4 across cost thresholds (no sampling, no training)")
     print("=" * 72)
     print(f"  results_dir: {args.results_dir}")
     print(f"  seeds: {len(seeds)} seeds")
@@ -315,7 +395,7 @@ def main():
         drop=True
     )
     summary_path = os.path.join(outdir, "eval_threshold_summary.csv")
-    df_out.to_csv(summary_path, index=False)
+    df_out.to_csv(summary_path, mode="a", header=not os.path.isfile(summary_path), index=False)
     print(f"\nSaved {len(df_out)} rows to {summary_path}")
 
     agg_cols = [
@@ -338,6 +418,13 @@ def main():
         agg_path = os.path.join(outdir, "eval_threshold_aggregated.csv")
         agg.to_csv(agg_path)
         print(f"Saved aggregated to {agg_path}")
+
+    if args.plot:
+        agg_path = os.path.join(outdir, "eval_threshold_aggregated.csv")
+        if os.path.isfile(agg_path):
+            plot_eval_threshold_results(aggregated_path=agg_path, out_path=os.path.join(outdir, "eval_threshold_pr_auc_auc.png"))
+        else:
+            print("Skip plot: eval_threshold_aggregated.csv not found. Run eval first.")
 
     print("\nDone.")
 
