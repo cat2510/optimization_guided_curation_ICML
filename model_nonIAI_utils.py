@@ -17,18 +17,6 @@ import os
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.calibration import CalibratedClassifierCV
 
-def get_bin_flag_columns(df):
-    return [col for col in df.columns if col.startswith("has_") or "THRCLS" in col.upper()
-    or col.endswith("adherent") or col.startswith("early_")
-    or col.startswith("is_")]
-def get_true_num_columns(df, CAT_COLUMNS,BIN_FLAG_COLUMNS):
-    return [
-        col for col in df.columns
-        if (col not in ['ENROLID']
-            and col not in CAT_COLUMNS+BIN_FLAG_COLUMNS
-        )
-    ]
-
 
 def get_preprocessor_with_impute(X_train, categorical_cols, numeric_cols, binary_cols=None, verbose=True):
     """

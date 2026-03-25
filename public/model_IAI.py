@@ -234,8 +234,10 @@ def get_preprocessor_with_impute(X_train, categorical_cols, numeric_cols, binary
     
     # Binary columns: passthrough (no imputation, no scaling)
     if binary_cols_present:
-        # Use FunctionTransformer with identity function for passthrough
-        transformers.append(("binary", FunctionTransformer(), binary_cols_present))
+        # feature_names_out required for ColumnTransformer.get_feature_names_out() (sklearn >= 1.2)
+        transformers.append(
+            ("binary", FunctionTransformer(feature_names_out="one-to-one"), binary_cols_present)
+        )
 
     return ColumnTransformer(transformers=transformers, remainder="drop")
 
@@ -358,10 +360,6 @@ def finetune_oct(
     X_train_df = pd.DataFrame(X_train_transformed, columns=feature_names)
     X_val_df = pd.DataFrame(X_val_transformed, columns=feature_names)
 
-    # OCT-H should not see missing values at all (IAI notes missing not directly supported w/ hyperplanes)
-    # If any NaNs remain, we allow vanilla OCT to proceed with missingdatamode, but fail for OCT-H variants.
-    # :contentReference[oaicite:2]{index=2}
-    # (If you want a softer behavior, you can skip OCT-H variants instead of raising.)
     for depth, minbucket, cp, variant in itertools.product(depths, minbuckets, cps, variant_grid):
         config_fit_start_time = time.perf_counter()
         is_hyperplane = variant is not None
