@@ -488,16 +488,9 @@ def main():
     print(f"✓ Loaded original data: {df_og.shape}")
     
     # Setup columns (same as notebook)
-    BIN_FLAG_COLUMNS = get_bin_flag_columns(df_og) + [
-        'lab_monitoring_adherent', 'nephrology_consult_adherent', 'early_nephrology_referral'
-    ]
-    STAGE_COLUMNS = [col for col in df_og.columns if "stage" in col.lower()]
+    BIN_FLAG_COLUMNS = get_bin_flag_columns(df_og) 
     CAT_COLUMNS = df_og.select_dtypes(include=["object", "category"]).columns.tolist()
-    TRUE_NUM_COLUMNS = get_true_num_columns(df_og, CAT_COLUMNS) + [
-        'util_2017', 'total_increasing_quarters_2017', 'total_lab_tests', 
-        'ckd_visit_count', 'quarters_with_labs', 'nephrology_visit_count', 
-        'days_to_nephrology', 'MEDIAN_INCOME'
-    ]
+    TRUE_NUM_COLUMNS = get_true_num_columns(df_og, CAT_COLUMNS, BIN_FLAG_COLUMNS) 
     COST_COLUMNS = [
         col for col in df_og.columns 
         if "cost" in col.lower() or "quarterly" in col.lower() or "increasing" in col.lower()

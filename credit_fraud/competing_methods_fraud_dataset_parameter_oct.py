@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-CLI for the UCI credit-fraud competing-methods benchmark (adaptive OCT grid).
+CLI for the UCI credit-fraud competing-methods benchmark (fixed OCT grid).
 
 Equivalent intent to ``competing_methods_fraud_dataset_parameter_oct.ipynb``:
-Vanilla (optional cached preds), Ours (k-center), resampler baselines, leaf deltas, summary CSV.
+Vanilla (optional cached preds), resampler baselines, leaf deltas, summary CSV.
 
 Run from the directory that contains ``creditcard.csv``, or pass ``--workdir``.
+
+cd /Users/cat2510/my_projects/credit_fraud
+screen -S fraud_oct
+# activate your env if needed; use a persistent session (tmux/screen, remote shell, VNC desktop, etc.) for long runs
+python3 competing_methods_fraud_dataset_parameter_oct.py > uci_competing_methods_run_new.log &
 """
 
 from __future__ import annotations
@@ -29,10 +34,10 @@ TRAIN_TEST_SEED = 123
 TARGET_COL = "target"
 RESULTS_DIR = "./uci_competing_methods_results"
 
-REF_N_TRAIN_OCT = 199_364
-REF_OCT_DEPTHS = [5, 7]
-REF_OCT_MINBUCKETS = [50, 100, 150]
-REF_OCT_CPS = [1e-5, 1e-3]
+# Fixed OCT search for every method (depth × minbucket × cp; see ``finetune_oct``).
+OCT_DEPTHS = [5, 7, 9]
+OCT_MINBUCKETS = [25, 50, 100]
+OCT_CPS = [1e-5, 1e-4, 1e-3, 1e-2]
 
 VANILLA_PREDS_CANDIDATE = os.environ.get(
     "VANILLA_PREDS_CANDIDATE",
@@ -49,79 +54,13 @@ SKIP_VANILLA_TRAIN_IF_CACHE_VALID = os.environ.get("SKIP_VANILLA_TRAIN_IF_CACHE_
     "False",
 )
 
-OURS_MATCHING_RATIO = 1
-OURS_CASE_WEIGHTING = None
-OURS_USE_ADAPTIVE_POOL = True
-OURS_SEED_METHOD = "smart"
 
-
-def oct_hyperparameter_grid(n_train: int, _n_positive: int):
-    """OCT grids with an anchor + strong scaling for SMOTE-like blow-ups.
-
-    Small train (n_train < 4k, ~0.2%-of-majority scale): minbuckets [25,50,100,150].
-    For REF_N_TRAIN_OCT and below (but >= 4k): [50,100,150].
-    For n_train around 2x REF (~398k), we scale minbuckets more aggressively
-    (linear in n/REF) and increase cp regularization.
-    """
-    n_train = max(int(n_train), 2)
-
-    if n_train < 4000:
-        depths = [7]
-    elif n_train < 15_000:
-        depths = [7, 9]
-    else:
-        depths = list(REF_OCT_DEPTHS)
-
-    # ~0.2%-of-majority-scale train (n_train < 4k): allow smaller leaves than [50,100,150].
-    if n_train < 4000:
-        minbuckets = [25] + list(REF_OCT_MINBUCKETS)
-    elif n_train <= REF_N_TRAIN_OCT:
-        minbuckets = list(REF_OCT_MINBUCKETS)
-    elif n_train < 1.5 * REF_N_TRAIN_OCT:
-        scale = (n_train / REF_N_TRAIN_OCT) ** 0.5
-        minbuckets = [int(round(b * scale)) for b in REF_OCT_MINBUCKETS]
-    else:
-        scale = n_train / REF_N_TRAIN_OCT
-        minbuckets = [int(round(b * scale)) for b in REF_OCT_MINBUCKETS]
-
-    cap = n_train - 1
-    minbuckets = sorted({min(mb, cap) for mb in minbuckets})
-    minbuckets = [mb for mb in minbuckets if mb >= 25]
-    if not minbuckets:
-        minbuckets = [max(10, min(cap, n_train // 3 or 1))]
-
-    if n_train >= 2 * REF_N_TRAIN_OCT:
-        cps = [1e-4, 1e-3, 1e-2]
-    elif n_train > 150_000:
-        cps = [1e-2]
-    else:
-        cps = [1e-5]
-
-    return depths, minbuckets, cps
-
-
-def print_oct_grid_for_majority_scenarios(
-    n_majority: int = 199_020,
-) -> None:
-    """Print grids for the four illustrative n_train sizes (second arg to grid is unused)."""
-    scenarios = [
-        ("0.2% * n_majority", 0.002 * n_majority),
-        ("99.6% * n_majority", 0.996 * n_majority),
-        ("99.8% * n_majority", 0.998 * n_majority),
-        ("2 * n_majority", 2 * n_majority),
-    ]
-    print(f"n_majority = {n_majority:,}")
-    print(f"REF_N_TRAIN_OCT = {REF_N_TRAIN_OCT:,}  (2 * REF = {2 * REF_N_TRAIN_OCT:,})")
-    print()
-    for label, n_raw in scenarios:
-        n_int = int(round(n_raw))
-        d, m, c = oct_hyperparameter_grid(n_int, 1)
-        print(f"{label}")
-        print(f"  n_train = {n_int:,}  (raw = {n_raw:.6g})")
-        print(f"  depths    = {d}")
-        print(f"  minbuckets = {m}")
-        print(f"  cps       = {c}")
-        print()
+def print_fixed_oct_grid() -> None:
+    """Print the fixed OCT search used for all methods (same as ``finetune_oct`` inputs)."""
+    print("Fixed OCT hyperparameter search (all methods):")
+    print(f"  depths     = {OCT_DEPTHS}")
+    print(f"  minbuckets = {OCT_MINBUCKETS}")
+    print(f"  cps        = {OCT_CPS}")
 
 
 def _safe_slug(name: str) -> str:
@@ -185,7 +124,8 @@ def apply_sampler_return_train_features(
 
     X_res, y_res = sampler.fit_resample(X_np, y_np)
 
-    if isinstance(sampler, SMOTE):
+    # Avoid module-level SMOTE import (imblearn only loaded inside run_benchmark).
+    if type(sampler).__name__ == "SMOTE":
         n_syn = int(len(y_res) - len(y_np))
         print(f"    SMOTE added {n_syn:,} synthetic minority rows (not in train_pd index).")
         X_out = pd.DataFrame(X_res, columns=feature_cols)
@@ -228,13 +168,11 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
     import public.model_IAI
     import utils_fraud
-    import kcenter_hyperparameter_search_global
     import symmetric_excess_AUC
 
     if args.reload:
         importlib.reload(public.model_IAI)
         importlib.reload(utils_fraud)
-        importlib.reload(kcenter_hyperparameter_search_global)
         importlib.reload(symmetric_excess_AUC)
 
     from public.model_IAI import finetune_oct, evaluate_binary_oct, best_mcc_threshold
@@ -242,9 +180,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
         prepare_dataset_for_kcenter,
         setup_feature_columns,
         create_train_test_split,
-        precompute_case_control_distances,
     )
-    from kcenter_hyperparameter_search_global import run_global_kcenter_matching, build_undersampled_dataset
     from symmetric_excess_AUC import symmetric_leaf_evaluation_oct
 
     seed = args.seed
@@ -269,10 +205,9 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
         n_tr = len(X_tr)
         n_pos = int(np.asarray(y_tr).astype(int).sum())
-        depths, minbuckets, cps = oct_hyperparameter_grid(n_tr, n_pos)
         print(
             f"\n[OCT grid] {method_name}: n_train={n_tr:,}, n_pos={n_pos:,} -> "
-            f"depths={depths}, minbuckets={minbuckets}, cps={cps}"
+            f"depths={OCT_DEPTHS}, minbuckets={OCT_MINBUCKETS}, cps={OCT_CPS}"
         )
 
         model, best_params, _, preprocessor, feature_names = finetune_oct(
@@ -283,9 +218,9 @@ def run_benchmark(args: argparse.Namespace) -> None:
             categorical_cols=CAT_COLUMNS,
             numeric_cols=TRUE_NUM_COLUMNS,
             binary_cols=BIN_COLUMNS,
-            depths=depths,
-            minbuckets=minbuckets,
-            cps=cps,
+            depths=OCT_DEPTHS,
+            minbuckets=OCT_MINBUCKETS,
+            cps=OCT_CPS,
             random_seed=seed,
             verbose=True,
         )
@@ -364,42 +299,6 @@ def run_benchmark(args: argparse.Namespace) -> None:
         rows.append(train_eval_finetuned_oct("Vanilla", X_train, y_train, 100.0))
         vanilla_mv_pred_path = rows[-1]["pred_path"]
 
-    if not args.skip_ours:
-        print("\n=== Ours (M_c): two-stage k-center ===")
-        pn_h5_path, _, _ = precompute_case_control_distances(
-            train_df=train_pd,
-            target_col=target_col,
-            feature_cols=feature_cols,
-            cat_columns=CAT_COLUMNS,
-            true_num_columns=TRUE_NUM_COLUMNS,
-            dataset_name="creditcard_fraud",
-            seed=seed,
-        )
-        matching_result = run_global_kcenter_matching(
-            train_pd=train_pd,
-            target_col=target_col,
-            feature_cols=feature_cols,
-            pn_h5_path=pn_h5_path,
-            matching_ratio=OURS_MATCHING_RATIO,
-            case_weighting=OURS_CASE_WEIGHTING,
-            use_adaptive_pool=OURS_USE_ADAPTIVE_POOL,
-            seed_method=OURS_SEED_METHOD,
-            CAT_COLUMNS=CAT_COLUMNS,
-            TRUE_NUM_COLUMNS=TRUE_NUM_COLUMNS,
-            COST_COLUMNS=[],
-            dnn_out_dir=f"./precomputed_distances/global_dnn_uci_seed_{seed}",
-        )
-        ours_train = build_undersampled_dataset(
-            train_pd=train_pd,
-            matching_result=matching_result,
-            target_col=target_col,
-            matching_ratio=OURS_MATCHING_RATIO,
-        )
-        ours_keep = 100.0 * (ours_train[target_col].eq(0).sum() / n_majority_train)
-        rows.append(
-            train_eval_finetuned_oct("Ours (M_c)", ours_train[feature_cols], ours_train[target_col], ours_keep)
-        )
-
     resamplers = {
         "NearMiss-1": NearMiss(version=1, n_neighbors=3),
         "TomekLinks": TomekLinks(sampling_strategy="majority"),
@@ -432,7 +331,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
         r["delta_o_given_s"] = float(out["scores"]["excess_ROC_v|s"])
 
     df_out = pd.DataFrame(rows)
-    order = ["Ours (M_c)", "NearMiss-1", "NCL", "ENN", "TomekLinks", "SMOTE", "Vanilla"]
+    order = ["NearMiss-1", "NCL", "ENN", "TomekLinks", "SMOTE", "Vanilla"]
     df_out["_order"] = df_out["method"].map(lambda x: order.index(x) if x in order else 999)
     df_out = df_out.sort_values(["_order", "pr_auc"], ascending=[True, False]).drop(columns=["_order"])
 
@@ -461,16 +360,18 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="UCI fraud competing methods (adaptive OCT grid)")
+    p = argparse.ArgumentParser(description="UCI fraud competing methods (fixed OCT grid)")
     p.add_argument("--workdir", default=".", help="Directory containing creditcard.csv")
     p.add_argument("--data-csv", default="creditcard.csv", help="Filename of data CSV under workdir")
     p.add_argument("--results-dir", default=RESULTS_DIR, help="Where to write method folders + summary CSV")
     p.add_argument("--seed", type=int, default=TRAIN_TEST_SEED)
     p.add_argument("--target-col", default=TARGET_COL)
     p.add_argument("--reload", action="store_true", help="importlib.reload project modules")
-    p.add_argument("--print-oct-grid-only", action="store_true", help="Print oct_hyperparameter_grid for demo sizes and exit")
-    p.add_argument("--n-majority", type=int, default=199_020, help="For --print-oct-grid-only: majority count anchor")
-    p.add_argument("--skip-ours", action="store_true", help="Skip k-center Ours (M_c) block")
+    p.add_argument(
+        "--print-oct-grid-only",
+        action="store_true",
+        help="Print fixed OCT depths/minbuckets/cps and exit",
+    )
     p.add_argument("--no-vanilla-cache", action="store_true", help="Do not use cached vanilla CSV even if present")
     p.add_argument("--force-vanilla-train", action="store_true", help="Train Vanilla OCT even if cache is valid")
     return p
@@ -479,7 +380,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_arg_parser().parse_args()
     if args.print_oct_grid_only:
-        print_oct_grid_for_majority_scenarios(n_majority=args.n_majority)
+        print_fixed_oct_grid()
         return
     run_benchmark(args)
 

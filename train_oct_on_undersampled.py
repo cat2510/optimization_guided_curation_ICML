@@ -6,35 +6,110 @@ This script loads pre-generated undersampled datasets and trains OCT models,
 logging ALL metrics returned by evaluate_binary_oct().
 
 Much faster than the full hyperparameter search since k-center matching is skipped.
+
+Cohort data: set env OCT_TRAIN_PARQUET, or place 0917_2017_18_with_2017_cost.parquet next to
+this script or cwd. That path may be a single .parquet file or a Spark-style parquet *folder*.
 """
 
 import os
+import re
 import sys
 import glob
 import pandas as pd
-import numpy as np
 from datetime import datetime
 
-# Import custom modules
-import model_pipeline
-import model_IAI
-from model_IAI import finetune_oct, evaluate_binary_oct
+# Project root (so `import public.model_IAI` works when cwd is not my_projects)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from public.model_IAI import (
+    finetune_oct,
+    evaluate_binary_oct,
+    get_bin_flag_columns,
+    get_true_num_columns,
+    train_test_split_enrol,
+)
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-# Paths
-UNDERSAMPLED_DIR = "./kcenter_hyperparameter_search_results/undersampled_train_datasets"
-RESULTS_DIR = "./kcenter_hyperparameter_search_results/oct_training_results"
+# Paths (resolved relative to this script so runs work from any cwd)
+# Set to either: (1) a directory containing undersampled_*.csv, or (2) one undersampled .csv file
+UNDERSAMPLED_PATH = "/Users/cat2510/my_projects/kcenter_hyperparams_search/kcenter_hyperparameter_search_results_global_seed_123_matching_ratio_1/undersampled_cw_None_pool_False_seed_random.csv"
+RESULTS_DIR = os.path.join(
+    _SCRIPT_DIR, "kcenter_hyperparameter_search_results", "oct_training_results"
+)
+
+
+def resolve_undersampled_csvs(path):
+    """Return sorted list of CSV paths; single file or glob undersampled_*.csv in a directory."""
+    p = os.path.abspath(os.path.expanduser(path))
+    if os.path.isfile(p) and p.lower().endswith(".csv"):
+        return [p]
+    if os.path.isdir(p):
+        return sorted(glob.glob(os.path.join(p, "undersampled_*.csv")))
+    return []
+
+
+PARQUET_FILENAME = "0917_2017_18_with_2017_cost.parquet"
+
+
+def _path_is_readable_parquet_dataset(p):
+    """
+    True if pandas can read this path with read_parquet.
+
+    Spark exports are often a *directory* named something.parquet/ containing part-*.parquet;
+    os.path.isfile is False for those, but pd.read_parquet(path) works on the folder.
+    """
+    if not p or not os.path.exists(p):
+        return False
+    if os.path.isfile(p):
+        return p.lower().endswith(".parquet")
+    if os.path.isdir(p):
+        # Folder named like a single parquet file (common Spark layout)
+        if os.path.basename(p).lower().endswith(".parquet"):
+            return True
+        # Generic dataset folder with parquet fragments
+        try:
+            for name in os.listdir(p):
+                if name.endswith(".parquet") and os.path.isfile(os.path.join(p, name)):
+                    return True
+        except OSError:
+            return False
+    return False
+
+
+def resolve_parquet_path():
+    """
+    Find the main cohort parquet (same convention as competing_methods.ipynb: cwd-relative name).
+
+    Order: OCT_TRAIN_PARQUET env (absolute path) -> next to this script -> current working directory.
+
+    Accepts either a single .parquet file or a parquet *dataset directory* (e.g. Spark output).
+    """
+    env_path = os.environ.get("OCT_TRAIN_PARQUET", "").strip()
+    candidates = []
+    if env_path:
+        candidates.append(("OCT_TRAIN_PARQUET", os.path.abspath(os.path.expanduser(env_path))))
+    candidates.append(("script_dir", os.path.join(_SCRIPT_DIR, PARQUET_FILENAME)))
+    candidates.append(("cwd", os.path.join(os.getcwd(), PARQUET_FILENAME)))
+    for label, p in candidates:
+        if p and _path_is_readable_parquet_dataset(p):
+            return p, candidates, label
+    return None, candidates, None
 
 # OCT hyperparameters for model training
-OCT_DEPTHS = [7, 9]
-OCT_MINBUCKETS = [50, 100, 120, 150]
-OCT_CPS = [0.00001, 0.0001, 0.001, 0.01]
+OCT_DEPTHS = [7]
+OCT_MINBUCKETS = [25]
+OCT_CPS = [0.00005, 0.0001, 0.001,0.01]
 
 # Target column
 TARGET_COL = "highcost_gt_200000"
+
+# Same seed as competing_methods.ipynb (both splits must use it for reproducible val/test)
+TRAIN_TEST_SEED = 123
 
 # ============================================================================
 # MAIN EXECUTION
@@ -59,28 +134,31 @@ def main():
     print("LOADING DATA")
     print(f"{'='*80}\n")
     
-    # Load Spark data for test/val sets
-    from pyspark.sql import SparkSession
-    spark = SparkSession.builder.appName("OCTTraining").getOrCreate()
-    df_2018 = spark.read.format("parquet").load("0917_2017_18_with_2017_cost.parquet")
-    df_og = df_2018.toPandas()
-    print(f"✓ Loaded original data: {df_og.shape}")
+    parquet_path, _cand_list, source_label = resolve_parquet_path()
+    if not parquet_path:
+        print(f"ERROR: No readable parquet dataset at: {PARQUET_FILENAME}")
+        print("  (Expect a single .parquet file or a Spark-style directory named *.parquet/)")
+        print("  Tried (in order):")
+        for label, p in _cand_list:
+            exists = os.path.exists(p) if p else False
+            kind = (
+                "dir"
+                if exists and os.path.isdir(p)
+                else "file"
+                if exists and os.path.isfile(p)
+                else "missing"
+            )
+            print(f"    - [{label}] {p}  ({kind})")
+        print("  Set OCT_TRAIN_PARQUET to the full path of your cohort file or parquet folder.")
+        return
+    df_og = pd.read_parquet(parquet_path)
+    print(f"✓ Loaded original data ({source_label}): {parquet_path}")
+    print(f"  Shape: {df_og.shape}")
     
-    # Setup columns (same as notebook)
-    BIN_FLAG_COLUMNS = model_pipeline.get_bin_flag_columns(df_og) + [
-        'lab_monitoring_adherent', 'nephrology_consult_adherent', 'early_nephrology_referral'
-    ]
-    STAGE_COLUMNS = [col for col in df_og.columns if "stage" in col.lower()]
+    # Column groups (same as competing_methods.ipynb)
+    BIN_FLAG_COLUMNS = get_bin_flag_columns(df_og)
     CAT_COLUMNS = df_og.select_dtypes(include=["object", "category"]).columns.tolist()
-    TRUE_NUM_COLUMNS = model_pipeline.get_true_num_columns(df_og, CAT_COLUMNS) + [
-        'util_2017', 'total_increasing_quarters_2017', 'total_lab_tests', 
-        'ckd_visit_count', 'quarters_with_labs', 'nephrology_visit_count', 
-        'days_to_nephrology', 'MEDIAN_INCOME'
-    ]
-    COST_COLUMNS = [
-        col for col in df_og.columns 
-        if "cost" in col.lower() or "quarterly" in col.lower() or "increasing" in col.lower()
-    ]
+    TRUE_NUM_COLUMNS = get_true_num_columns(df_og, CAT_COLUMNS, BIN_FLAG_COLUMNS)
     
     # Create cost stratum
     def make_cost_stratum_3class(df):
@@ -109,11 +187,19 @@ def main():
     print(f"✓ Feature columns: {len(feature_cols)}")
     
     # Train/test split
-    train_ids, test_ids, train_pd, test_pd = model_pipeline.train_test_split_enrol(
-        df_og, target_col="cost_stratum_2018", test_size=0.3, verbose=False, random_state=123
+    train_ids, test_ids, train_pd, test_pd = train_test_split_enrol(
+        df_og,
+        target_col="cost_stratum_2018",
+        test_size=0.3,
+        verbose=False,
+        random_state=TRAIN_TEST_SEED,
     )
-    val_ids, test_ids, val_pd, test_pd = model_pipeline.train_test_split_enrol(
-        test_pd, target_col=TARGET_COL, test_size=0.5, verbose=False
+    val_ids, test_ids, val_pd, test_pd = train_test_split_enrol(
+        test_pd,
+        target_col=TARGET_COL,
+        test_size=0.5,
+        verbose=False,
+        random_state=TRAIN_TEST_SEED,
     )
     
     X_test = test_pd[feature_cols]
@@ -129,60 +215,54 @@ def main():
     print(f"\n{'='*80}")
     print("FINDING UNDERSAMPLED DATASETS")
     print(f"{'='*80}\n")
-    
-    # Find all undersampled_*.csv files
-    pattern = os.path.join(UNDERSAMPLED_DIR, "undersampled_*.csv")
-    undersampled_files = sorted(glob.glob(pattern))
-    
+
+    undersampled_files = resolve_undersampled_csvs(UNDERSAMPLED_PATH)
+
     if not undersampled_files:
-        print(f"ERROR: No undersampled datasets found in {UNDERSAMPLED_DIR}/")
-        print(f"Expected files matching pattern: undersampled_*.csv")
+        print(f"ERROR: No undersampled CSVs found for UNDERSAMPLED_PATH={UNDERSAMPLED_PATH!r}")
+        print("  Use a path to a .csv file, or a directory containing undersampled_*.csv")
         return
-    
-    print(f"Found {len(undersampled_files)} undersampled datasets:")
+
+    print(f"Found {len(undersampled_files)} undersampled dataset(s):")
     for f in undersampled_files:
-        basename = os.path.basename(f)
-        print(f"  - {basename}")
+        print(f"  - {os.path.basename(f)}")
     print()
-    
+
     # ========================================================================
     # TRAIN OCT ON EACH DATASET
     # ========================================================================
     print(f"\n{'='*80}")
     print("TRAINING OCT MODELS")
     print(f"{'='*80}\n")
-    
+
     all_results = []
     metrics_master_path = f"{RESULTS_DIR}/metrics_master.csv"
-    
+
     for idx, undersampled_path in enumerate(undersampled_files, 1):
-        # Extract config name from filename
         basename = os.path.basename(undersampled_path)
-        config_name = basename.replace('undersampled_', '').replace('.csv', '')
-        
-        # Parse config from filename
-        # Format: cw_{X}_pool_{Y}_seed_{Z}
-        parts = config_name.split('_')
+        config_name = basename.replace("undersampled_", "").replace(".csv", "")
+
+        # Parse config from filename: cw_{X}_pool_{Y}_seed_{Z}
+        parts = config_name.split("_")
         try:
-            cw_idx = parts.index('cw')
-            pool_idx = parts.index('pool')
-            seed_idx = parts.index('seed')
-            
-            case_weighting = '_'.join(parts[cw_idx+1:pool_idx])
-            use_adaptive_pool = parts[pool_idx+1]
-            seed_method = '_'.join(parts[seed_idx+1:])
-            
-            # Convert to proper types
-            if case_weighting.lower() == 'none':
+            cw_idx = parts.index("cw")
+            pool_idx = parts.index("pool")
+            seed_idx = parts.index("seed")
+
+            case_weighting = "_".join(parts[cw_idx + 1 : pool_idx])
+            use_adaptive_pool = parts[pool_idx + 1]
+            seed_method = "_".join(parts[seed_idx + 1 :])
+
+            if case_weighting.lower() == "none":
                 case_weighting = None
-            use_adaptive_pool = (use_adaptive_pool.lower() == 'true')
-            
+            use_adaptive_pool = use_adaptive_pool.lower() == "true"
+
         except (ValueError, IndexError):
             print(f"  ⚠️ WARNING: Could not parse config from filename: {basename}")
             case_weighting = None
             use_adaptive_pool = None
             seed_method = None
-        
+
         print(f"\n{'#'*80}")
         print(f"CONFIGURATION {idx}/{len(undersampled_files)}: {config_name}")
         print(f"{'#'*80}")
@@ -190,22 +270,33 @@ def main():
         print(f"  use_adaptive_pool: {use_adaptive_pool}")
         print(f"  seed_method: {seed_method}")
         print(f"  file: {basename}\n")
-        
+
         try:
-            # Load undersampled dataset
             print(f"  Loading undersampled dataset...")
             undersampled_training_data = pd.read_csv(undersampled_path)
-            
+
+            missing_for_train = [c for c in feature_cols if c not in undersampled_training_data.columns]
+            missing_target = TARGET_COL not in undersampled_training_data.columns
+            if missing_target:
+                raise KeyError(f"CSV missing target column {TARGET_COL!r}")
+            if missing_for_train:
+                raise KeyError(
+                    f"CSV missing {len(missing_for_train)} feature column(s) vs parquet feature set "
+                    f"(e.g. {missing_for_train[:5]})"
+                )
+
             n_samples = len(undersampled_training_data)
             n_minority = (undersampled_training_data[TARGET_COL] == 1).sum()
             n_majority = (undersampled_training_data[TARGET_COL] == 0).sum()
-            
+
             print(f"    ✓ Loaded {n_samples:,} samples")
             print(f"      Minority: {n_minority:,}")
             print(f"      Majority: {n_majority:,}")
-            print(f"      Ratio: {n_majority/n_minority:.2f}:1")
-            
-            # Train OCT
+            if n_minority > 0:
+                print(f"      Ratio: {n_majority/n_minority:.2f}:1")
+            else:
+                print("      Ratio: n/a (no positive class in training CSV)")
+
             print(f"\n  Training OCT model...")
             balanced_model, balanced_params, _, preprocessor, feature_names = finetune_oct(
                 X_train=undersampled_training_data[feature_cols],
@@ -214,57 +305,71 @@ def main():
                 y_val=y_val,
                 categorical_cols=CAT_COLUMNS,
                 numeric_cols=TRUE_NUM_COLUMNS,
+                binary_cols=BIN_FLAG_COLUMNS,
                 depths=OCT_DEPTHS,
                 minbuckets=OCT_MINBUCKETS,
                 cps=OCT_CPS,
             )
-            
-            # Evaluate
+
             print(f"  Evaluating on test set...")
+            safe_suffix = re.sub(r"[^a-zA-Z0-9_.-]+", "_", config_name)[:120]
             metrics = evaluate_binary_oct(
-                balanced_model, X_test, y_test, preprocessor, feature_names,
-                results_dir=RESULTS_DIR, ratio=1.0
+                balanced_model,
+                X_test,
+                y_test,
+                preprocessor,
+                feature_names,
+                results_dir=RESULTS_DIR,
+                save_suffix=safe_suffix,
+                X_val_df=X_val,
+                y_val=y_val,
             )
-            
-            # Handle balanced_params (tuple of depth, minbucket, cp)
-            if isinstance(balanced_params, tuple) and len(balanced_params) == 3:
+
+            if isinstance(balanced_params, dict):
+                hc = balanced_params.get("hyperplane_config")
                 params_dict = {
-                    'best_depth': balanced_params[0],
-                    'best_minbucket': balanced_params[1],
-                    'best_cp': balanced_params[2],
+                    "best_variant": balanced_params.get("variant"),
+                    "best_depth": balanced_params.get("depth"),
+                    "best_minbucket": balanced_params.get("minbucket"),
+                    "best_cp": balanced_params.get("cp"),
+                    "best_tuning_time_seconds": balanced_params.get("tuning_time_seconds"),
+                    "best_fit_time_seconds": balanced_params.get("best_fit_time_seconds"),
+                    "best_hyperplane_config": repr(hc) if hc is not None else None,
+                }
+            elif isinstance(balanced_params, tuple) and len(balanced_params) == 3:
+                params_dict = {
+                    "best_depth": balanced_params[0],
+                    "best_minbucket": balanced_params[1],
+                    "best_cp": balanced_params[2],
                 }
             else:
-                params_dict = {'best_params': str(balanced_params)}
-            
-            # Collect ALL metrics (no filtering)
+                params_dict = {"best_params": str(balanced_params)}
+
             row = {
-                'config_name': config_name,
-                'case_weighting': case_weighting,
-                'use_adaptive_pool': use_adaptive_pool,
-                'seed_method': seed_method,
-                'n_train_samples': n_samples,
-                'n_train_minority': n_minority,
-                'n_train_majority': n_majority,
+                "config_name": config_name,
+                "case_weighting": case_weighting,
+                "use_adaptive_pool": use_adaptive_pool,
+                "seed_method": seed_method,
+                "n_train_samples": n_samples,
+                "n_train_minority": n_minority,
+                "n_train_majority": n_majority,
                 **params_dict,
             }
-            
-            # Add ALL metrics from evaluate_binary_oct
+
             if isinstance(metrics, dict):
                 row.update(metrics)
             else:
-                row['metrics_error'] = str(metrics)
-            
+                row["metrics_error"] = str(metrics)
+
             all_results.append(row)
-            
-            # Save incrementally
+
             pd.DataFrame([row]).to_csv(
                 metrics_master_path,
-                mode='a',
+                mode="a",
                 header=not os.path.exists(metrics_master_path),
                 index=False,
             )
-            
-            # Print summary
+
             print(f"\n  ✓ Configuration {idx}/{len(undersampled_files)} complete")
             print(f"    Best params: {balanced_params}")
             if isinstance(metrics, dict):
@@ -274,24 +379,24 @@ def main():
                 print(f"    Best MCC: {metrics.get('best_mcc', 'N/A'):.4f}" if isinstance(metrics.get('best_mcc'), (int, float)) else f"    Best MCC: {metrics.get('best_mcc', 'N/A')}")
                 print(f"    Sensitivity (G-mean threshold): {metrics.get('balanced_recall_gmean', 'N/A'):.4f}" if isinstance(metrics.get('balanced_recall_gmean'), (int, float)) else f"    Sensitivity: {metrics.get('sensitivity_f1', 'N/A')}")
                 print(f"    Specificity (G-mean threshold): {metrics.get('balanced_specificity_gmean', 'N/A'):.4f}" if isinstance(metrics.get('balanced_specificity_gmean'), (int, float)) else f"    Specificity: {metrics.get('specificity_f1', 'N/A')}")
-            
+
         except Exception as e:
             print(f"\n  ✗ ERROR in configuration {config_name}:")
             print(f"    {e}")
             import traceback
+
             traceback.print_exc()
-            
-            # Log error
+
             row = {
-                'config_name': config_name,
-                'case_weighting': case_weighting,
-                'use_adaptive_pool': use_adaptive_pool,
-                'seed_method': seed_method,
-                'error': str(e),
+                "config_name": config_name,
+                "case_weighting": case_weighting,
+                "use_adaptive_pool": use_adaptive_pool,
+                "seed_method": seed_method,
+                "error": str(e),
             }
             all_results.append(row)
             continue
-    
+
     # ========================================================================
     # FINAL SUMMARY
     # ========================================================================
@@ -300,10 +405,6 @@ def main():
     
     print(f"\n{'='*80}")
     print("OCT TRAINING COMPLETE")
-    print(f"{'='*80}")
-    print(f"Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"End time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Duration: {duration}")
     print(f"\nTotal configurations: {len(all_results)}")
     print(f"Results saved to: {metrics_master_path}")
     
@@ -331,30 +432,7 @@ def main():
             
             print(results_df_sorted[display_cols].head(10).to_string(index=False))
             
-            # Also show by MCC if available
-            if 'best_mcc' in results_df.columns:
-                print(f"\n{'='*80}")
-                print("TOP 10 CONFIGURATIONS BY MCC (MATTHEWS CORRELATION COEFFICIENT)")
-                print(f"{'='*80}\n")
-                results_df_sorted_mcc = results_df.sort_values('best_mcc', ascending=False)
-                print(results_df_sorted_mcc[display_cols].head(10).to_string(index=False))
-            
-            # Also show by optimal F1 if available
-            if 'optimal_f1' in results_df.columns:
-                print(f"\n{'='*80}")
-                print("TOP 10 CONFIGURATIONS BY OPTIMAL F1")
-                print(f"{'='*80}\n")
-                results_df_sorted_f1 = results_df.sort_values('optimal_f1', ascending=False)
-                print(results_df_sorted_f1[display_cols].head(10).to_string(index=False))
-            
-            # Also show by balanced recall G-mean if available
-            if 'balanced_recall_gmean' in results_df.columns:
-                print(f"\n{'='*80}")
-                print("TOP 10 CONFIGURATIONS BY BALANCED RECALL G-MEAN")
-                print(f"{'='*80}\n")
-                results_df_sorted_gmean = results_df.sort_values('balanced_recall_gmean', ascending=False)
-                print(results_df_sorted_gmean[display_cols].head(10).to_string(index=False))
-            
+              
             # Save sorted results
             sorted_path = f"{RESULTS_DIR}/metrics_sorted_by_auc.csv"
             results_df_sorted.to_csv(sorted_path, index=False)

@@ -600,6 +600,110 @@ def best_mcc_threshold(y_true, y_proba):
 
     return best
 
+
+def _transform_for_iai(preprocessor, X_df, feature_names):
+    """
+    Apply fitted preprocessor and return dense DataFrame with feature names.
+    """
+    X_processed = preprocessor.transform(X_df)
+    if sparse is not None and sparse.issparse(X_processed):
+        X_processed = X_processed.toarray()
+    return pd.DataFrame(X_processed, columns=feature_names)
+
+
+def _safe_tree_counts(iai_model):
+    """
+    Best-effort tree size extraction for reporting.
+    Returns (n_leaves, n_splits) as ints or None when unavailable.
+    """
+    n_leaves = None
+    n_splits = None
+    try:
+        if hasattr(iai_model, "get_num_leaves"):
+            n_leaves = int(iai_model.get_num_leaves())
+    except Exception:
+        n_leaves = None
+    try:
+        if hasattr(iai_model, "get_num_nodes"):
+            n_nodes = int(iai_model.get_num_nodes())
+            if n_nodes >= 1:
+                if n_leaves is not None:
+                    n_splits = max(0, n_nodes - n_leaves)
+                else:
+                    n_splits = max(0, (n_nodes - 1) // 2)
+    except Exception:
+        n_splits = None
+    return n_leaves, n_splits
+
+
+def refit_leaf_probabilities_on_dataset(
+    iai_model,
+    X_refit,
+    y_refit,
+    preprocessor,
+    feature_names,
+    *,
+    fallback="global_rate",
+):
+    """
+    Recompute leaf probabilities from a refit dataset without retraining tree.
+
+    Parameters
+    ----------
+    fallback : str
+        Currently supports "global_rate" only.
+
+    Returns
+    -------
+    dict with keys:
+      - leaf_prob_map: dict[int, float]
+      - fallback_probability: float
+      - stats: dict with counts and coverage diagnostics
+    """
+    if fallback != "global_rate":
+        raise ValueError("Only fallback='global_rate' is currently supported.")
+
+    X_refit_processed = _transform_for_iai(preprocessor, X_refit, feature_names)
+    leaves = np.asarray(iai_model.apply(X_refit_processed), dtype=int)
+    y_arr = np.asarray(y_refit).astype(int)
+    if len(leaves) != len(y_arr):
+        raise ValueError("Length mismatch between routed leaves and y_refit.")
+
+    global_rate = float(np.mean(y_arr)) if len(y_arr) > 0 else 0.0
+    leaf_prob_map = {}
+    leaf_counts = {}
+    leaf_pos_counts = {}
+
+    for leaf_id in np.unique(leaves):
+        mask = leaves == leaf_id
+        n_leaf = int(np.sum(mask))
+        n_pos = int(np.sum(y_arr[mask]))
+        p_leaf = float(n_pos / n_leaf) if n_leaf > 0 else global_rate
+        leaf_prob_map[int(leaf_id)] = p_leaf
+        leaf_counts[int(leaf_id)] = n_leaf
+        leaf_pos_counts[int(leaf_id)] = n_pos
+
+    stats = {
+        "n_samples_refit": int(len(y_arr)),
+        "n_unique_leaves_refit": int(len(leaf_prob_map)),
+        "global_positive_rate_refit": global_rate,
+        "leaf_counts": leaf_counts,
+        "leaf_positive_counts": leaf_pos_counts,
+    }
+    return {
+        "leaf_prob_map": leaf_prob_map,
+        "fallback_probability": global_rate,
+        "stats": stats,
+    }
+
+
+def scores_from_leaf_probability_map(leaf_assignments, leaf_prob_map, fallback_p):
+    """
+    Build probability scores from leaf IDs and a leaf->probability map.
+    """
+    leaves = np.asarray(leaf_assignments, dtype=int)
+    return np.asarray([leaf_prob_map.get(int(l), float(fallback_p)) for l in leaves], dtype=float)
+
 def evaluate_binary_oct(
     iai_model,
     X_test_df,
@@ -609,7 +713,9 @@ def evaluate_binary_oct(
     results_dir=None,
     save_suffix=None,
     X_val_df=None,
-    y_val=None
+    y_val=None,
+    leaf_probability_map=None,
+    leaf_prob_fallback="global_rate",
 ):
     """
     Evaluate OCT model on test set.
@@ -647,22 +753,36 @@ def evaluate_binary_oct(
     """
     eval_start_time = time.perf_counter()
     print(f"Test dataset for OCT application: {len(X_test_df):,} samples")
+    if leaf_probability_map is not None and leaf_prob_fallback != "global_rate":
+        raise ValueError("Only leaf_prob_fallback='global_rate' is currently supported.")
 
     # ------------------------------------------------------------
     # Preprocessing + OCT Predictions
     # ------------------------------------------------------------
     try:
-        X_test_processed = preprocessor.transform(X_test_df)
-        X_test_processed = pd.DataFrame(X_test_processed, columns=feature_names)
+        X_test_processed = _transform_for_iai(preprocessor, X_test_df, feature_names)
 
         # Base predictions from OCT
         y_pred_default = iai_model.predict(X_test_processed)
-        y_proba = iai_model.predict_proba(X_test_processed).iloc[:, 1]
+        leaf_assignments = iai_model.apply(X_test_processed)
+        if leaf_probability_map is None:
+            y_proba = iai_model.predict_proba(X_test_processed).iloc[:, 1]
+            missing_leaf_count_test = 0
+            fallback_probability = None
+        else:
+            fallback_probability = float(np.mean(np.asarray(y_test).astype(int)))
+            y_proba = scores_from_leaf_probability_map(
+                leaf_assignments=leaf_assignments,
+                leaf_prob_map=leaf_probability_map,
+                fallback_p=fallback_probability,
+            )
+            missing_leaf_count_test = int(
+                np.sum(~np.isin(np.asarray(leaf_assignments, dtype=int), list(leaf_probability_map.keys())))
+            )
         out = X_test_processed.copy()
 
         out["predicted_proba"] = y_proba
         out["predicted_class_default"] = y_pred_default
-        leaf_assignments = iai_model.apply(X_test_processed)
 
         print("✓ Predictions completed")
 
@@ -678,7 +798,10 @@ def evaluate_binary_oct(
     # ------------------------------------------------------------
     # AUC metrics (threshold-free)
     # ------------------------------------------------------------
-    auc = iai_model.score(X_test_processed, y_test_series, criterion="auc")
+    if leaf_probability_map is None:
+        auc = iai_model.score(X_test_processed, y_test_series, criterion="auc")
+    else:
+        auc = roc_auc_score(y_test_series, y_proba)
     pr_auc = average_precision_score(y_test_series, y_proba)
 
     # ------------------------------------------------------------
@@ -687,9 +810,21 @@ def evaluate_binary_oct(
     if X_val_df is not None and y_val is not None:
         # Compute thresholds on validation set (proper evaluation)
         print(f"Computing optimal thresholds on validation set ({len(X_val_df):,} samples)")
-        X_val_processed = preprocessor.transform(X_val_df)
-        X_val_processed = pd.DataFrame(X_val_processed, columns=feature_names)
-        y_proba_val = iai_model.predict_proba(X_val_processed).iloc[:, 1]
+        X_val_processed = _transform_for_iai(preprocessor, X_val_df, feature_names)
+        leaf_assignments_val = iai_model.apply(X_val_processed)
+        if leaf_probability_map is None:
+            y_proba_val = iai_model.predict_proba(X_val_processed).iloc[:, 1]
+            missing_leaf_count_val = 0
+        else:
+            fallback_probability_val = float(np.mean(np.asarray(y_val).astype(int)))
+            y_proba_val = scores_from_leaf_probability_map(
+                leaf_assignments=leaf_assignments_val,
+                leaf_prob_map=leaf_probability_map,
+                fallback_p=fallback_probability_val,
+            )
+            missing_leaf_count_val = int(
+                np.sum(~np.isin(np.asarray(leaf_assignments_val, dtype=int), list(leaf_probability_map.keys())))
+            )
         y_val_series = pd.Series(y_val).reset_index(drop=True)
         
         # F1-optimal thresholding on validation set
@@ -803,6 +938,11 @@ def evaluate_binary_oct(
         print(f"Balanced (G-mean) specificity: {balanced['gmean_opt']['specificity']:.3f}")
     print(f"Recall @ specificity>=0.60: {recall_at_spec_06:.3f} (achieved spec={achieved_spec_06:.3f}, thr={threshold_spec_06:.6f})")
     print("Number of leaves:", len(pd.unique(leaf_assignments)))
+    if leaf_probability_map is not None:
+        print(f"Leaf override active: {len(leaf_probability_map)} mapped leaves")
+        print(f"Missing mapped leaves in test routing (fallback used): {missing_leaf_count_test}")
+        if X_val_df is not None and y_val is not None:
+            print(f"Missing mapped leaves in val routing (fallback used): {missing_leaf_count_val}")
 
     # ------------------------------------------------------------
     # Return dictionary for logging
@@ -816,6 +956,8 @@ def evaluate_binary_oct(
         balanced_specificity_gmean = balanced["gmean_opt"]["specificity"]
     
     evaluation_time_seconds = float(time.perf_counter() - eval_start_time)
+    n_leaves_tree, n_splits_tree = _safe_tree_counts(iai_model)
+    n_leaves_routed = int(len(pd.unique(leaf_assignments)))
     return {
         "auc": auc,
         "pr_auc": pr_auc,
@@ -828,6 +970,12 @@ def evaluate_binary_oct(
         "recall_at_specificity_0.6": float(recall_at_spec_06),
         "achieved_specificity_0.6": float(achieved_spec_06),
         "threshold_specificity_0.6": float(threshold_spec_06),
+        "number_of_leaves": int(n_leaves_tree) if n_leaves_tree is not None else n_leaves_routed,
+        "number_of_splits": int(n_splits_tree) if n_splits_tree is not None else None,
+        "n_routed_leaves_test": n_leaves_routed,
+        "leaf_probability_override": bool(leaf_probability_map is not None),
+        "missing_refit_map_leaves_test_count": int(missing_leaf_count_test) if leaf_probability_map is not None else 0,
+        "missing_refit_map_leaves_val_count": int(missing_leaf_count_val) if (leaf_probability_map is not None and X_val_df is not None and y_val is not None) else 0,
         "evaluation_time_seconds": evaluation_time_seconds,
     }
 
