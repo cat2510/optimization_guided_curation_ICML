@@ -79,6 +79,9 @@ OCT_DEPTHS = [5, 7, 9]
 OCT_MINBUCKETS = [50, 100, 150]
 OCT_CPS = [0.00001, 0.0001, 0.001]
 
+# Set NO_LEAF_REFIT=1 for legacy evaluate_binary_oct (no refit on full train / no suffix).
+NO_LEAF_REFIT = os.environ.get("NO_LEAF_REFIT", "").strip().lower() in ("1", "true", "yes")
+
 # Paths for outputs
 BASE_OUTPUT_DIR = "./kcenter_hyperparameter_search_results"
 RESULTS_DIR = f"{BASE_OUTPUT_DIR}/seed_{TRAIN_TEST_SEED}_matching_ratio_{MATCHING_RATIO}"
@@ -446,6 +449,9 @@ def train_and_evaluate_oct(
     BIN_FLAG_COLUMNS,
     config_name,
     results_dir,
+    *,
+    full_train_for_refit,
+    no_leaf_refit: bool,
 ):
     """Train OCT model and evaluate on test set."""
     print(f"\n{'='*80}")
@@ -474,11 +480,26 @@ def train_and_evaluate_oct(
     resources_after = get_resource_usage()
     
     # Evaluate (use validation set for threshold tuning)
-    metrics = evaluate_binary_oct(
-        balanced_model, X_test, y_test, preprocessor, feature_names,
-        results_dir=results_dir, save_suffix=config_name,
-        X_val_df=X_val, y_val=y_val
-    )
+    if no_leaf_refit:
+        metrics = evaluate_binary_oct(
+            balanced_model, X_test, y_test, preprocessor, feature_names,
+            results_dir=results_dir, save_suffix=config_name,
+            X_val_df=X_val, y_val=y_val
+        )
+    else:
+        metrics = evaluate_binary_oct_with_leaf_refit_on_train(
+            balanced_model,
+            full_train_for_refit[feature_cols],
+            full_train_for_refit[target_col],
+            X_test,
+            y_test,
+            preprocessor,
+            feature_names,
+            results_dir=results_dir,
+            save_suffix=config_name,
+            X_val_df=X_val,
+            y_val=y_val,
+        )
     
     print(f"\n✓ Model training complete:")
     print(f"   Best params: {balanced_params}")
@@ -506,6 +527,7 @@ def train_and_evaluate_oct(
 
 def main():
     """Main execution function."""
+    no_leaf_refit = NO_LEAF_REFIT
     start_time = datetime.now()
     print(f"\n{'='*80}")
     print("K-CENTER HYPERPARAMETER SEARCH (GENERIC DATASET)")
@@ -645,6 +667,8 @@ def main():
                 BIN_FLAG_COLUMNS=BIN_FLAG_COLUMNS,
                 config_name=config_name,
                 results_dir=RESULTS_DIR,
+                full_train_for_refit=train_pd,
+                no_leaf_refit=no_leaf_refit,
             )
             
             config_end_time = time.perf_counter()

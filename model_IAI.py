@@ -704,6 +704,103 @@ def scores_from_leaf_probability_map(leaf_assignments, leaf_prob_map, fallback_p
     leaves = np.asarray(leaf_assignments, dtype=int)
     return np.asarray([leaf_prob_map.get(int(l), float(fallback_p)) for l in leaves], dtype=float)
 
+
+# Appended to ``save_suffix`` when saving leaf-refit evaluation artifacts (predictions, tree HTML).
+LEAF_REFIT_SAVE_SUFFIX_TOKEN = "_leaf_refit_full_train"
+
+
+def leaf_refit_eval_save_suffix(base_suffix: str | None) -> str | None:
+    """Return ``save_suffix`` for ``evaluate_binary_oct`` after leaf refit (or None if base is None)."""
+    if base_suffix is None:
+        return None
+    return f"{base_suffix}{LEAF_REFIT_SAVE_SUFFIX_TOKEN}"
+
+
+def evaluate_binary_oct_with_leaf_refit_on_train(
+    iai_model,
+    X_train_full_df,
+    y_train_full,
+    X_test_df,
+    y_test,
+    preprocessor,
+    feature_names,
+    results_dir=None,
+    save_suffix=None,
+    X_val_df=None,
+    y_val=None,
+    *,
+    print_diagnostics: bool = True,
+    leaf_prob_fallback: str = "global_rate",
+):
+    """
+    Refit leaf positive rates on a full (typically imbalanced) training set, then evaluate.
+
+    Use when the model was trained on a balanced/resampled subset: pass the **same** feature
+    columns as ``finetune_oct`` saw, but ``X_train_full_df`` / ``y_train_full`` from the **full**
+    train split. Pass ``save_suffix`` without the refit token; this helper appends
+    ``LEAF_REFIT_SAVE_SUFFIX_TOKEN`` so legacy prediction paths stay distinct.
+
+    Returns
+    -------
+    Same dict as ``evaluate_binary_oct``, plus keys ``refit_result`` (from
+    ``refit_leaf_probabilities_on_dataset``) and ``save_suffix_used``.
+    """
+    refit_result = refit_leaf_probabilities_on_dataset(
+        iai_model,
+        X_train_full_df,
+        y_train_full,
+        preprocessor,
+        feature_names,
+        fallback=leaf_prob_fallback,
+    )
+    leaf_prob_map = refit_result["leaf_prob_map"]
+    save_used = leaf_refit_eval_save_suffix(save_suffix)
+
+    if print_diagnostics:
+        print(
+            f"[leaf_refit] Mapped {len(leaf_prob_map)} leaves from "
+            f"n_train={refit_result['stats']['n_samples_refit']:,} "
+            f"(global_pos_rate={refit_result['fallback_probability']:.4f})"
+        )
+        if X_val_df is not None:
+            try:
+                Xv = _transform_for_iai(preprocessor, X_val_df, feature_names)
+                val_leaves = np.asarray(iai_model.apply(Xv), dtype=int)
+                missing_val = int(
+                    np.sum(~np.isin(val_leaves, list(leaf_prob_map.keys())))
+                )
+                print(f"[leaf_refit] Val rows with leaf not in refit map: {missing_val}")
+            except Exception as e:
+                print(f"[leaf_refit] Val diagnostics skipped: {e}")
+        try:
+            Xt = _transform_for_iai(preprocessor, X_test_df, feature_names)
+            test_leaves = np.asarray(iai_model.apply(Xt), dtype=int)
+            missing_test = int(
+                np.sum(~np.isin(test_leaves, list(leaf_prob_map.keys())))
+            )
+            print(f"[leaf_refit] Test rows with leaf not in refit map: {missing_test}")
+        except Exception as e:
+            print(f"[leaf_refit] Test diagnostics skipped: {e}")
+
+    metrics = evaluate_binary_oct(
+        iai_model,
+        X_test_df,
+        y_test,
+        preprocessor,
+        feature_names,
+        results_dir=results_dir,
+        save_suffix=save_used,
+        X_val_df=X_val_df,
+        y_val=y_val,
+        leaf_probability_map=leaf_prob_map,
+        leaf_prob_fallback=leaf_prob_fallback,
+    )
+    metrics = dict(metrics)
+    metrics["refit_result"] = refit_result
+    metrics["save_suffix_used"] = save_used
+    return metrics
+
+
 def evaluate_binary_oct(
     iai_model,
     X_test_df,
